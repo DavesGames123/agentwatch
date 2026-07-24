@@ -20,6 +20,7 @@ mod clip;
 mod codex;
 mod handoff;
 mod model;
+mod orc;
 mod scan;
 mod scene;
 mod store;
@@ -52,6 +53,10 @@ const TICK: Duration = Duration::from_millis(2000);
 // buffer and writes only changed cells, so an idle frame -- the Eye holding
 // still -- costs nothing on the wire.
 const FRAME: Duration = Duration::from_millis(100);
+/// How many cold targets the picker offers. The list is ranked, so anything past
+/// the first screenful or two is noise -- and the cap keeps the per-frame copy of
+/// it into the view cheap on a repository with thousands of source files.
+const PICK_LIMIT: usize = 40;
 
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -60,6 +65,9 @@ pub struct Row {
     pub name: String,
     pub branch: Option<String>,
     pub last_activity: i64,
+    /// When the current turn (the "task") began, epoch millis. Zero when unknown.
+    /// Drives the elapsed timer and local start-time on the card and detail pane.
+    pub turn_started: i64,
     pub status: Status,
     pub blocked_reason: Option<BlockedReason>,
     /// The recorded failure behind `Status::Errored`, for the detail line.
@@ -94,6 +102,14 @@ struct App {
     saved_until: Option<Instant>,
     /// Transient "copied" banner deadline.
     copied_until: Option<Instant>,
+    /// The agent whose sessions are being watched -- also the one a newly
+    /// spawned pane runs.
+    agent: Agent,
+    /// Result of the last pane spawn and its banner deadline. Success and
+    /// failure share the slot: both are the answer to a key just pressed, and
+    /// only the last one matters.
+    spawn_msg: Option<(String, bool)>,
+    spawn_until: Option<Instant>,
     /// Per-frame list geometry, refreshed each draw, so a mouse click can be
     /// mapped back to the row under it. Heights and row-mapping run parallel to
     /// the items the list widget draws, in the same order.
@@ -101,6 +117,27 @@ struct App {
     frame_item_rows: Vec<Option<usize>>,
     list_top: u16,
     list_height: u16,
+    /// The machine's UTC offset in seconds, read once at launch so task start
+    /// times render on the local wall clock without re-shelling `date` per frame.
+    local_offset: i64,
+    /// The cold-target picker, while it is open over the board. `Some` swallows
+    /// the normal keymap, so j/k/Enter mean "inside the picker" and nothing can
+    /// be acked by accident while choosing a file.
+    orc_pick: Option<OrcPick>,
+}
+
+/// The open cold-target picker: what an orc could be loosed on right now, and
+/// what was ruled out. Rebuilt each time it opens rather than cached, because
+/// the whole point of dispatching from the TUI is that the hot set is *live* --
+/// a launch-time snapshot is exactly what made `--orcs N` unable to answer
+/// "what is safe now".
+struct OrcPick {
+    cold: Vec<orc::Target>,
+    /// Candidates excluded because a live session is editing them.
+    hot: usize,
+    /// Candidates excluded because git reports them dirty.
+    dirty: usize,
+    selected: usize,
 }
 
 impl App {
@@ -123,10 +160,15 @@ impl App {
             repo_label,
             saved_until: None,
             copied_until: None,
+            agent,
+            spawn_msg: None,
+            spawn_until: None,
             frame_item_heights: Vec::new(),
             frame_item_rows: Vec::new(),
             list_top: 0,
             list_height: 0,
+            local_offset: model::local_offset_secs(),
+            orc_pick: None,
         };
         app.refresh();
         app.focus_first_actionable();
@@ -241,6 +283,7 @@ impl App {
             name: s.display_name(),
             branch: s.branch.clone(),
             last_activity: s.last_activity,
+            turn_started: s.turn_started_ms,
             status,
             blocked_reason,
             error: s.error,
@@ -369,6 +412,150 @@ impl App {
             self.sync_list_state();
             self.copied_until = Some(Instant::now() + Duration::from_millis(1600));
         }
+    }
+
+    /// The last pane-spawn result, while its banner is still up.
+    fn spawn_flash(&self) -> Option<(&str, bool)> {
+        let live = self.spawn_until.map(|t| Instant::now() < t).unwrap_or(false);
+        live.then_some(self.spawn_msg.as_ref())
+            .flatten()
+            .map(|(m, ok)| (m.as_str(), *ok))
+    }
+
+    /// Open one more agent pane in the workspace's left column, running a fresh
+    /// agent at the repo root. Focus stays here, so the key can be held down to
+    /// widen the swarm by several panes at once.
+    fn spawn_agent(&mut self) {
+        let cmd = format!(
+            "cd {} && {}",
+            self.scanner.repo_root().display(),
+            self.agent.label()
+        );
+        self.spawn(cmd, false, format!("new {} pane", self.agent.label()));
+    }
+
+    /// Reopen the selected session in a new left-column pane, resumed. This is
+    /// the counterpart to closing a pane you were done with: the session itself
+    /// outlives its terminal, and this is how it gets one back. Focus follows,
+    /// because you opened a named session in order to talk to it.
+    fn spawn_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let (id, name) = (row.id.clone(), model::collapse_ws(&row.name));
+        let cmd = format!(
+            "cd {} && {}",
+            self.scanner.repo_root().display(),
+            self.agent.resume_cmd(&id)
+        );
+        let label: String = name.chars().take(32).collect();
+        self.spawn(cmd, true, format!("opened {label}"));
+    }
+
+    fn spawn(&mut self, cmd: String, focus: bool, ok_msg: String) {
+        let (msg, ok) = match workspace::spawn_left_pane(&cmd, focus) {
+            Ok(()) => (ok_msg, true),
+            Err(why) => (why, false),
+        };
+        self.flash_spawn(msg, ok);
+    }
+
+    // --- orcs ---
+
+    /// Repo-relative paths a live session is touching. An orc must steer clear
+    /// of every one of them, or its refactor collides with a hobbit mid-edit.
+    ///
+    /// Read straight off the rows this TUI is already showing, so it is the same
+    /// hot set the user can see on screen. The launcher answers the same
+    /// question from a freshly-built `App` (`hot_files`), which is the only way
+    /// to ask it from a process that has no TUI.
+    fn hot_paths(&self) -> std::collections::BTreeSet<String> {
+        let mut hot = std::collections::BTreeSet::new();
+        for r in &self.rows {
+            if matches!(
+                r.status,
+                Status::Working | Status::Delegated | Status::Blocked | Status::NeedsTest
+            ) {
+                hot.extend(r.edits.keys().cloned());
+            }
+        }
+        hot
+    }
+
+    /// Survey the repo and open the picker. Costs a `git ls-files` plus a read
+    /// of every tracked source file, which is why it runs on the keypress rather
+    /// than every tick.
+    fn open_orc_pick(&mut self) {
+        let repo = self.scanner.repo_root().to_path_buf();
+        let mut survey = orc::survey(&repo, &self.hot_paths());
+        // Nobody scrolls past the top of a ranked list to find a refactor
+        // target, and the cap bounds both the scroll and the per-frame copy of
+        // this list into the view.
+        survey.cold.truncate(PICK_LIMIT);
+        if survey.cold.is_empty() {
+            self.flash_spawn(
+                format!(
+                    "no cold files to loose an orc on ({} hot, {} dirty)",
+                    survey.hot, survey.dirty
+                ),
+                false,
+            );
+            return;
+        }
+        self.orc_pick = Some(OrcPick {
+            cold: survey.cold,
+            hot: survey.hot,
+            dirty: survey.dirty,
+            selected: 0,
+        });
+    }
+
+    fn close_orc_pick(&mut self) {
+        self.orc_pick = None;
+    }
+
+    fn orc_pick_move(&mut self, delta: isize) {
+        let Some(p) = &mut self.orc_pick else {
+            return;
+        };
+        let last = p.cold.len().saturating_sub(1);
+        p.selected = (p.selected as isize + delta).clamp(0, last as isize) as usize;
+    }
+
+    /// Stage an orc on the picked file, in a new pane in sauron's own column.
+    ///
+    /// Staged, not run: the pane is left holding `sauron orc <file>` awaiting
+    /// Enter, the same contract `--orcs N` has at launch. Outside a workspace
+    /// window there is no pane to split, so the command goes to the clipboard
+    /// instead -- the dispatch still works, it just needs somewhere to land.
+    fn dispatch_orc(&mut self) {
+        let Some(p) = &self.orc_pick else {
+            return;
+        };
+        let Some(target) = p.cold.get(p.selected).map(|t| t.path.clone()) else {
+            return;
+        };
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sauron"));
+        let repo = self.scanner.repo_root().to_string_lossy().into_owned();
+        let cmd = orc::stage_command(&exe, &repo, &target, "");
+        self.orc_pick = None;
+
+        let (msg, ok) = match workspace::spawn_orc_pane(&cmd) {
+            Ok(()) => (format!("orc staged on {target} — press Enter in its pane"), true),
+            Err(why) if copy_to_clipboard(&cmd) => {
+                (format!("{why}; orc command copied instead"), false)
+            }
+            Err(why) => (why, false),
+        };
+        self.flash_spawn(msg, ok);
+    }
+
+    /// Put a message in the footer's spawn slot for a beat.
+    fn flash_spawn(&mut self, msg: String, ok: bool) {
+        self.spawn_msg = Some((msg, ok));
+        // Failures earn a longer read than confirmations -- they say what to fix.
+        self.spawn_until =
+            Some(Instant::now() + Duration::from_millis(if ok { 1600 } else { 3500 }));
     }
 
     /// Map a terminal cell to the row rendered under it, using the geometry
@@ -517,6 +704,14 @@ fn main() -> std::io::Result<()> {
         return workspace::run(&args[1..], explicit_agent);
     }
 
+    // `sauron orc <file>` -- loose a single-shot maintenance agent on one cold
+    // file. This is what an orc pane runs, whether the pane was staged at
+    // workspace launch or dispatched from the TUI picker; it builds the charge
+    // and execs the agent, so the pane ends up owned by the agent itself.
+    if args.first().map(|s| s.as_str()) == Some("orc") {
+        return orc::run(&args[1..], explicit_agent);
+    }
+
     let once = args.iter().any(|a| a == "--once");
     let baseline = args.iter().any(|a| a == "--baseline");
     let list_working = args.iter().any(|a| a == "--list-working");
@@ -529,15 +724,11 @@ fn main() -> std::io::Result<()> {
 
     let mut app = App::new(repo_root, agent);
 
-    if !app.scanner.log_dir().exists() {
-        eprintln!(
-            "no {} session logs for {}\n  looked in: {}",
-            agent.label(),
-            app.scanner.repo_root().display(),
-            app.scanner.log_dir().display()
-        );
-        return Ok(());
-    }
+    // A missing log directory is not an error: it is a repo no agent has run in
+    // yet, which is exactly the state you are in when you open a fresh folder
+    // and are about to start one. Bailing here meant sauron could never be left
+    // running while that first session came up. The directory is re-read every
+    // tick, so the board fills in on its own once it appears.
 
     if baseline {
         app.baseline();
@@ -590,8 +781,24 @@ fn main() -> std::io::Result<()> {
         let label = app.repo_label.clone();
         let saved = app.saved_flash();
         let copied = app.copied_flash();
+        let spawned = app.spawn_flash().map(|(m, ok)| (m.to_string(), ok));
         let mut list_state = app.list_state.clone();
         let mut geo = ui::FrameGeometry::default();
+        // Copied out of `app` rather than borrowed, for the same reason `rows`
+        // is: the view outlives the draw call, and `app` is mutated right after
+        // it. The list is capped at survey time, so this stays small.
+        let pick_cold: Vec<orc::Target> = app
+            .orc_pick
+            .as_ref()
+            .map(|p| p.cold.clone())
+            .unwrap_or_default();
+        let pick_meta = app.orc_pick.as_ref().map(|p| (p.selected, p.hot, p.dirty));
+
+        // Re-checked per frame, not cached at launch: the directory is created
+        // the moment the user starts an agent in this repo, and the empty-state
+        // hint must stop claiming otherwise as soon as that happens.
+        let log_dir = app.scanner.log_dir().to_path_buf();
+        let awaiting_log_dir = (!log_dir.exists()).then(|| log_dir.to_string_lossy().into_owned());
 
         let view = ui::View {
             rows: &rows,
@@ -603,7 +810,16 @@ fn main() -> std::io::Result<()> {
             clear_count: app.clear_count,
             show_clear: app.show_clear,
             copied,
+            spawned: spawned.as_ref().map(|(m, ok)| (m.as_str(), *ok)),
             anim_ms: anim_start.elapsed().as_millis() as u64,
+            local_offset: app.local_offset,
+            awaiting_log_dir: awaiting_log_dir.as_deref(),
+            pick: pick_meta.map(|(selected, hot, dirty)| ui::PickView {
+                cold: &pick_cold,
+                selected,
+                hot,
+                dirty,
+            }),
         };
         if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut list_state, &mut geo)) {
             break Err(e);
@@ -622,6 +838,20 @@ fn main() -> std::io::Result<()> {
         let timeout = FRAME.min(TICK.saturating_sub(last_tick.elapsed()));
         match event::poll(timeout) {
             Ok(true) => match event::read() {
+                // The picker owns the keyboard while it is up. Nothing falls
+                // through to the board keymap: j/k must not move the session
+                // cursor under a modal, and `a` must not ack an invisible row.
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press && app.orc_pick.is_some() => {
+                    match k.code {
+                        KeyCode::Char('j') | KeyCode::Down => app.orc_pick_move(1),
+                        KeyCode::Char('k') | KeyCode::Up => app.orc_pick_move(-1),
+                        KeyCode::Enter => app.dispatch_orc(),
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('O') => {
+                            app.close_orc_pick()
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('j') | KeyCode::Down => app.move_by(1),
@@ -630,6 +860,9 @@ fn main() -> std::io::Result<()> {
                     KeyCode::Char('u') => app.unack_selected(),
                     KeyCode::Char('A') => app.ack_all(),
                     KeyCode::Char('y') => app.copy_selected_continue(),
+                    KeyCode::Char('n') => app.spawn_agent(),
+                    KeyCode::Char('O') => app.open_orc_pick(),
+                    KeyCode::Enter => app.spawn_selected(),
                     KeyCode::Char('o') => {
                         app.show_all = !app.show_all;
                         app.refresh();
@@ -641,6 +874,10 @@ fn main() -> std::io::Result<()> {
                     KeyCode::Char('r') => app.refresh(),
                     _ => {}
                 },
+                // The picker is modal for the mouse too: a stray scroll must not
+                // move the session cursor underneath it, and a click must not
+                // copy a continue command for a row nobody can see.
+                Ok(Event::Mouse(_)) if app.orc_pick.is_some() => {}
                 Ok(Event::Mouse(m)) => match m.kind {
                     // Click a row to copy its continue command (and select it).
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -683,7 +920,18 @@ fn main() -> std::io::Result<()> {
 fn print_once(app: &App) {
     let now = now_ms();
     if app.rows.is_empty() {
-        println!("no sessions with repo edits");
+        // Snapshot mode exits immediately, so unlike the TUI it gets no later
+        // chance to fill in. Say which directory was empty -- a wrong repo and a
+        // never-used one print the same single line otherwise.
+        if !app.scanner.log_dir().exists() {
+            println!(
+                "no agent sessions yet for {}\n  watching: {}",
+                app.scanner.repo_root().display(),
+                app.scanner.log_dir().display()
+            );
+        } else {
+            println!("no sessions with repo edits");
+        }
         return;
     }
     let errored = app.rows.iter().filter(|r| r.status == Status::Errored).count();

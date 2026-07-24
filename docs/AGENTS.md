@@ -25,7 +25,7 @@ a repo, an `Agent` answers a handful of questions:
 | `fold(session, record, repo)` | apply one parsed log record to a `Session` |
 | `label()` | the CLI name, and the bare "open a session" pane command |
 | `resume_cmd(id)` | how a `workspace` pane resumes a session |
-| `run_cmd(prompt)` | how an orc runs a single-shot task |
+| `oneshot_argv(prompt)` | how an orc runs a single-shot task, as `(program, args)` |
 
 `fold` populates a plain `Session` (`src/model.rs`). **The status classification
 is shared** — once the `Session` fields are filled, `Session::status` decides

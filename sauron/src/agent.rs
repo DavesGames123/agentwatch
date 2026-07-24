@@ -182,12 +182,16 @@ impl Agent {
         }
     }
 
-    /// Command an orc pane runs for a single-shot, non-interactive task.
-    pub fn run_cmd(self, prompt: &str) -> String {
+    /// How an orc runs a single-shot task, as `(program, args)` for `Command`.
+    ///
+    /// This replaced a `claude '<prompt>'` *shell string*, and the argv form is
+    /// the reason the orc charge can now be long, multi-line, and full of quotes:
+    /// nothing between here and the agent parses it as shell. `codex exec` is
+    /// Codex's equivalent non-interactive one-shot mode.
+    pub fn oneshot_argv(self, prompt: &str) -> (&'static str, Vec<String>) {
         match self {
-            Agent::Claude => format!("claude '{prompt}'"),
-            // `codex exec` is Codex's non-interactive one-shot mode.
-            Agent::Codex => format!("codex exec '{prompt}'"),
+            Agent::Claude => (self.label(), vec![prompt.to_string()]),
+            Agent::Codex => (self.label(), vec!["exec".into(), prompt.to_string()]),
         }
     }
 
@@ -243,6 +247,19 @@ mod tests {
         assert_eq!(Agent::Codex.label(), "codex");
         assert_eq!(Agent::Claude.resume_cmd("abc"), "claude --resume abc");
         assert_eq!(Agent::Codex.resume_cmd("abc"), "codex resume abc");
+    }
+
+    #[test]
+    fn oneshot_argv_hands_the_prompt_over_without_a_shell() {
+        // A prompt carrying both quote kinds and a newline -- the thing the old
+        // shell-string form could not survive -- passes through untouched.
+        let nasty = "line one\nit is \"quoted\" and 'quoted'";
+        let (prog, argv) = Agent::Claude.oneshot_argv(nasty);
+        assert_eq!(prog, "claude");
+        assert_eq!(argv, vec![nasty.to_string()]);
+        let (prog, argv) = Agent::Codex.oneshot_argv(nasty);
+        assert_eq!(prog, "codex");
+        assert_eq!(argv, vec!["exec".to_string(), nasty.to_string()]);
     }
 
     #[test]

@@ -13,7 +13,8 @@
 //!     and `battle_ground` lands its flared foot on a full-width horizon where a
 //!     battle rages. Each *working* agent is one of Sauron's orcs on the field,
 //!     so the war swells -- more fighters, arrow volleys, the fallen -- as more
-//!     of the swarm runs at once.
+//!     of the swarm runs at once. From time to time Frodo, Sam, and Gollum steal
+//!     across this field too, on the same schedule they cross the compact scene.
 //!
 //! It also shows an engraving of Sindarin in runic script (real Unicode runes,
 //! U+16A0, which render out of the box -- true Tengwar lives in the private-use
@@ -27,6 +28,7 @@
 //!   fn battle           -- musters both armies and animates the melee by ms
 //!   fn eye_tower        -- the Eye sprite for a pose + pupil column
 //!   fn walker_sprites  -- Frodo / Sam / Gollum, facing left or right
+//!   fn place_walkers   -- stamp the procession onto a ground row (scene + war)
 //!   fn runic           -- latin -> Elder Futhark transliteration
 //!   const VERSES       -- the engraved Sindarin lines
 //!   enum Pose / fn idle_pose / walk timing consts
@@ -214,6 +216,40 @@ fn walker_sprites(leg: usize, right: bool) -> (&'static str, &'static str, &'sta
     }
 }
 
+/// The lead hobbit's column at walk progress `prog` (0..1) on a `w`-wide ground,
+/// heading `right` or left. The path runs from just off one edge to just off the
+/// other (a 16-cell overshoot so the procession fully enters and leaves).
+fn walk_base(w: usize, prog: f64, right: bool) -> i32 {
+    let span = (w + 16) as f64;
+    if right {
+        (-12.0 + prog * span).floor() as i32
+    } else {
+        (w as f64 + 4.0 - prog * span).floor() as i32
+    }
+}
+
+/// Stamp the procession onto one ground `row`: Frodo at `base` leading, Sam a
+/// step back, Gollum skulking further behind, the Ring glinting just ahead of
+/// Frodo -- all mirrored when the walk heads left. Drawn last so the walkers pass
+/// in front of whatever stone or war stands behind them.
+fn place_walkers(row: &mut [Cell], base: i32, right: bool, leg: usize) {
+    let (fr, sm, go) = walker_sprites(leg, right);
+    let hob = Style::default().fg(HOBBIT);
+    let gol = Style::default().fg(GOLLUM_C);
+    let ring = Style::default().fg(RING).add_modifier(Modifier::BOLD);
+    if right {
+        stamp(row, base, fr, hob);
+        stamp(row, base - 3, sm, hob);
+        stamp(row, base - 9, go, gol);
+        stamp(row, base + 2, "*", ring);
+    } else {
+        stamp(row, base, fr, hob);
+        stamp(row, base + 3, sm, hob);
+        stamp(row, base + 9, go, gol);
+        stamp(row, base - 2, "*", ring);
+    }
+}
+
 /// The idle Eye: a long, level, watchful stare with only rare, slow motion -- a
 /// couple of blinks and one held glance across the whole idle stretch, so it
 /// broods rather than darts about. `t` is the phase within `PERIOD`; the walk
@@ -307,12 +343,7 @@ pub fn scene(width: usize, ms: u64) -> Vec<Line<'static>> {
     // drawn in front of the tower foot rather than behind it.
     let mut walk: Option<(i32, bool)> = None;
     let (pose, pupil) = if let Some((prog, right)) = walk_at(t, cyc) {
-        let span = (w + 16) as f64;
-        let base = if right {
-            (-12.0 + prog * span).floor() as i32
-        } else {
-            (w as f64 + 4.0 - prog * span).floor() as i32
-        };
+        let base = walk_base(w, prog, right);
         walk = Some((base, right));
         // The Eye follows the lead hobbit and flares wide as they pass beneath.
         let frac = (base as f64 / w as f64).clamp(0.0, 1.0);
@@ -343,23 +374,7 @@ pub fn scene(width: usize, ms: u64) -> Vec<Line<'static>> {
     // The procession, in the foreground, so the hobbits pass in front of the
     // tower's foot instead of vanishing behind it.
     if let Some((base, right)) = walk {
-        let (fr, sm, go) = walker_sprites(leg, right);
-        let hob = Style::default().fg(HOBBIT);
-        let gol = Style::default().fg(GOLLUM_C);
-        let ring = Style::default().fg(RING).add_modifier(Modifier::BOLD);
-        if right {
-            // Frodo leads, Sam a step back, Gollum skulking further behind, the
-            // Ring glinting just ahead of Frodo.
-            stamp(&mut grid[4], base, fr, hob);
-            stamp(&mut grid[4], base - 3, sm, hob);
-            stamp(&mut grid[4], base - 9, go, gol);
-            stamp(&mut grid[4], base + 2, "*", ring);
-        } else {
-            stamp(&mut grid[4], base, fr, hob);
-            stamp(&mut grid[4], base + 3, sm, hob);
-            stamp(&mut grid[4], base + 9, go, gol);
-            stamp(&mut grid[4], base - 2, "*", ring);
-        }
+        place_walkers(&mut grid[4], base, right, leg);
     }
 
     // The engraving, top-left: runic script on row 1, faint gloss on row 0. Clip
@@ -463,6 +478,17 @@ pub fn battle_ground(width: usize, armies: usize, ms: u64) -> Vec<Line<'static>>
     stamp(&mut g[0], eye_left, "▟███████████▙", Style::default().fg(STONE));
 
     battle(&mut g, eye_left, armies, ms);
+
+    // From time to time -- on the same 26s schedule the compact Eye keeps -- the
+    // three of them steal across the field along the ground row, drawn last so
+    // they slip in front of the war (and any fallen) rather than into it.
+    let t = ms % PERIOD;
+    let cyc = ms / PERIOD;
+    if let Some((prog, right)) = walk_at(t, cyc) {
+        let leg = ((ms / 180) % 2) as usize;
+        let base = walk_base(w, prog, right);
+        place_walkers(&mut g[n - 1], base, right, leg);
+    }
 
     g.into_iter().map(row_to_line).collect()
 }
@@ -616,6 +642,23 @@ mod tests {
         assert!(walk.contains('ó'), "Frodo missing mid-walk: {walk}");
         assert!(walk.contains('ô'), "Sam missing mid-walk: {walk}");
         assert!(walk.contains('*'), "the Ring's glint is missing: {walk}");
+    }
+
+    #[test]
+    fn walkers_cross_the_battlefield_on_the_walk_schedule() {
+        // The ground row is the bottom of the war band.
+        let ground = |ms| line_text(&battle_ground(80, 4, ms)[BASE_H as usize - 1]);
+        // Mid-idle: the field holds only the war, no procession slips through.
+        let idle = ground(6_000);
+        assert!(!idle.contains('ó'), "hobbit crossed the war while idle: {idle}");
+        // Mid-walk (17s..24.5s): Frodo, Sam, and the Ring steal across the field,
+        // whatever the muster.
+        for &armies in &[0usize, 4, 12] {
+            let walk = line_text(&battle_ground(80, armies, 20_000)[BASE_H as usize - 1]);
+            assert!(walk.contains('ó'), "Frodo missing on the field (armies={armies}): {walk}");
+            assert!(walk.contains('ô'), "Sam missing on the field (armies={armies}): {walk}");
+            assert!(walk.contains('*'), "the Ring's glint is missing (armies={armies}): {walk}");
+        }
     }
 
     #[test]

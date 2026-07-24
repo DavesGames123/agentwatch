@@ -126,6 +126,8 @@ cp sauron/target/release/sauron sauron/target/release/clip /usr/local/bin/
 | <kbd>j</kbd> / <kbd>k</kbd> | move selection |
 | <kbd>a</kbd> | acknowledge selected session — mark its edits tested |
 | <kbd>u</kbd> | un-acknowledge |
+| <kbd>n</kbd> | **new agent pane** — split one into the workspace's left column |
+| <kbd>⏎</kbd> | **open the selected session** in a new left pane, resumed |
 | <kbd>b</kbd> | **baseline** — ack the whole historical backlog, start empty |
 | <kbd>c</kbd> | toggle cleared / idle sessions |
 | <kbd>A</kbd> | toggle the stale backlog |
@@ -211,19 +213,73 @@ commands and behavior are unchanged.
 ### 👹 orcs — the maintenance swarm
 
 `--orcs N` stages **N single-shot maintenance agents** in the right column, aimed
-at the *cold* corners of the repo — the largest source files **no active session
-is touching** and nothing has dirtied in git. Each orc gets one file with a
-focused brief: decompose it if it's oversized (**splitting it into a
-well-documented nested module/filetree** where that's the natural shape), tighten
-what remains, and clear its warnings — tests staying green.
+at the *cold* corners of the repo — source files **no active session is touching**
+and nothing has dirtied in git, ranked by **lines of code plus recent churn**
+(a file that gets reopened over and over is structurally wrong more reliably than
+a file that is merely long).
+
+Each orc is handed **one file and a ranked charge**, not a list of equal wishes:
+
+1. **Decompose** — split it into a nested module tree, one concern per file, each
+   with a header saying what it is for and the grep targets to reach its parts.
+   This **outranks the other two combined**; a correct split is a complete result.
+2. **Shrink** — cut the line count of what remains without losing behaviour or
+   documentation, and report the before/after per file.
+3. **Speed** — only where the code makes the win evident (hoist work out of a
+   loop, drop a large clone, replace a repeated scan with a lookup), each with a
+   one-line reason. Speculative micro-tuning is explicitly forbidden.
+
+Above all three sits a **hard constraint: the tree must compile and the program
+must still boot at every moment the orc is working**, not merely when it
+finishes — because a hobbit is building this repo the whole time. The charge
+spells out the discipline that makes that true: run the build *before* the first
+edit, work additive-first (create and wire in the new module, compile, *then*
+delete from the original), re-run the build after every step, revert any step
+that goes red rather than pressing on, and never touch the build manifest or
+entrypoint to make a change compile. sauron fills in the actual commands from the
+repo's manifest — including the subdirectory to run them from — and reads the
+boot check from `$SAURON_ORC_SMOKE`.
+
+> There is no ecosystem default for the boot check on purpose. Whether a program
+> *boots* is a property of the program, not the toolchain: `cargo build` passing
+> says nothing about whether `main` reaches its event loop. A guessed command
+> would have the orc certify a boot it never performed.
+>
+> ```bash
+> export SAURON_ORC_SMOKE='cargo run --quiet -- --once'   # for sauron itself
+> ```
 
 - **They don't start on their own.** The command is *typed into each orc pane but
-  not run* — you review the target and press **Enter** to loose it.
+  not run* — you review the target and press **Enter** to loose it. What gets
+  typed is short enough to actually read: `sauron orc src/big.rs`.
 - **They're marked distinct.** An orc session wears a green **`orc`** badge in the
   TUI, so you can tell sauron's own maintenance work apart from the **hobbits**
   doing your directed quests.
 - **They only take what's safe**, so they can never collide with a hobbit
-  mid-edit.
+  mid-edit — and the cold check is **re-run at dispatch**, not trusted from when
+  the list was built, so a file a hobbit grabbed in the meantime is refused.
+
+### Loosing an orc from the TUI
+
+`--orcs N` only fires at launch, which is the wrong moment: the hot/cold snapshot
+is taken before any hobbit has started, and the pane budget is fixed forever.
+Press **`O`** in the running TUI instead and you get a live picker.
+
+```
+┌ loose an orc — decompose first ──────────────────────┐
+│ ▸ sauron/src/clip/store.rs            1178 loc · 4 commits │
+│   sauron/src/clip/mod.rs               633 loc · 2 commits │
+│   12 cold · 3 hot · 9 dirty held back                │
+│   ⏎ stage orc   j/k move   esc close                 │
+└──────────────────────────────────────────────────────┘
+```
+
+It shows the evidence behind each rank rather than asking you to trust the
+ordering, and it says out loud how many candidates were **held back** — silent
+filtering reads as "there was nothing else", which is a different and false
+claim. **Enter** splits a new pane in sauron's own column and *stages* the orc
+there, same as at launch: typed, awaiting your Enter. Outside a workspace window
+there's no pane to split, so the command goes to the clipboard instead.
 
 `<project>` is a directory (path, `~`, `.`) **or** a short alias you've saved
 into workspace memory:
@@ -241,6 +297,39 @@ a right column with `sauron` on top. The panes reopen each in-flight session
 (`claude --resume`) pulled straight from the scanner — the same set the TUI
 shows — and run `sauron` itself for the watcher, by the very path you invoked, so
 a restored window keeps working. Registry lives at `~/.claude/sauron/workspaces`.
+
+### Growing the column without leaving the TUI
+
+Closing an agent you're done with was always one keystroke. Opening one back up
+was a split, a `cd`, and a typed command — so the swarm only ever shrank. Two
+keys in the watcher close that loop:
+
+| Key | Opens | Focus |
+|:---:|:--|:--|
+| <kbd>n</kbd> | a fresh agent at the repo root | **stays in sauron** — press it three times for three panes |
+| <kbd>⏎</kbd> | the *selected* session, resumed | **follows the new pane** — you opened it to talk to it |
+| <kbd>O</kbd> | the cold-file picker → a **staged orc** in sauron's own column | follows the orc pane, which is waiting on your Enter |
+
+<kbd>n</kbd> and <kbd>⏎</kbd> land in the **left column** and split whichever pane there is currently
+tallest, so the column stays even instead of one pane shrinking by half each
+time. The column is found live rather than remembered: iTerm2 enumerates a tab's
+panes in split-tree order and the layout carves the right column off as the
+second child, so *everything ahead of the sauron pane is the agent column* — a
+fact that stays true however many panes you close. This means it also works in
+workspace windows opened before this feature existed.
+
+<kbd>⏎</kbd> is the counterpart to closing a pane: the session outlives its
+terminal, so a session you shut the window on — or one that went blocked
+overnight — comes back with its history intact. It does not check whether that
+session is already open in another pane; two live panes on one session is not a
+state Claude Code guards against, so don't.
+
+If a spawn can't happen — sauron isn't running in an iTerm2 pane, there is no
+agent column left of it, or iTerm2 refuses the split because the column has hit
+its minimum pane height — the footer says which, in amber, for a few seconds.
+Panes opened this way run against the hosted API even in a `--mordor` /
+`--nostromo` workspace; the local-model env is set at launch and the watcher does
+not carry it.
 
 <details>
 <summary><b>Requirements</b></summary>
@@ -439,7 +528,8 @@ sauron/src/
   scene.rs      ·  the animated Eye
   clip/         ·  SQLite-compatible Agent Clipboard store + CLI
   handoff.rs    ·  strict opt-in clipboard pass lifecycle
-  workspace.rs  ·  the `sauron workspace` launcher (hobbits + orcs)
+  workspace.rs  ·  the `sauron workspace` launcher + iTerm pane splitting
+  orc.rs        ·  the orc charge, cold-file ranking, `sauron orc <file>`
 docs/AGENTS.md  ·  using Codex, and adding another agent
 ```
 

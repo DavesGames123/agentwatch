@@ -147,11 +147,13 @@ impl Scanner {
 pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
-        if let Some(ms) = parse_rfc3339_ms(ts) {
-            if ms > session.last_activity {
-                session.last_activity = ms;
-            }
+    let record_ms = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(parse_rfc3339_ms);
+    if let Some(ms) = record_ms {
+        if ms > session.last_activity {
+            session.last_activity = ms;
         }
     }
 
@@ -203,6 +205,15 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
             // isMeta records are harness bookkeeping (command caveats, hook
             // output), not the user or a tool actually driving the turn.
             if v.get("isMeta").and_then(|m| m.as_bool()) != Some(true) {
+                // A user record that arrives while the previous turn was complete
+                // (or before any turn has started) opens a new task -- stamp its
+                // start. Tool-result user records mid-turn leave turn_complete
+                // already false, so they do not reset the clock, which is what
+                // makes `now - turn_started_ms` the running task's real age rather
+                // than the time since its last tool call.
+                if session.turn_complete || session.turn_started_ms == 0 {
+                    session.turn_started_ms = record_ms.unwrap_or(session.last_activity);
+                }
                 session.turn_complete = false;
                 // A real user turn after a failure means the human already
                 // engaged it (a retry, a new prompt) -- the error is stale.
@@ -629,6 +640,58 @@ mod tests {
             root,
         );
         assert!(s.is_orc);
+    }
+
+    #[test]
+    fn turn_start_stamps_on_a_new_task_and_survives_mid_turn_tool_results() {
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+
+        // The user's prompt opens the task -- its timestamp is the start.
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T22:00:00.000Z",
+                    "message":{"role":"user","content":"do the thing"}}),
+            root,
+        );
+        let start = parse_rfc3339_ms("2026-07-24T22:00:00.000Z").unwrap();
+        assert_eq!(s.turn_started_ms, start);
+
+        // A tool result arrives mid-turn (turn_complete already false). It must not
+        // reset the clock, or the "running" timer would restart on every tool call.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-24T22:00:05.000Z",
+                    "message":{"stop_reason":"tool_use"}}),
+            root,
+        );
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T22:03:00.000Z",
+                    "message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t1"}]}}),
+            root,
+        );
+        assert_eq!(s.turn_started_ms, start, "mid-turn result must not restart the clock");
+
+        // The turn ends, then a fresh prompt opens a new task -- new start.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-24T22:05:00.000Z",
+                    "message":{"stop_reason":"end_turn"}}),
+            root,
+        );
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T22:10:00.000Z",
+                    "message":{"role":"user","content":"next thing"}}),
+            root,
+        );
+        assert_eq!(
+            s.turn_started_ms,
+            parse_rfc3339_ms("2026-07-24T22:10:00.000Z").unwrap(),
+            "a prompt after a completed turn starts a new task clock"
+        );
     }
 
     #[test]

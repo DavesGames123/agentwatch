@@ -13,7 +13,15 @@
 //!   fn resolve          -- a project arg (path or saved alias) -> repo dir
 //!   fn store_* / alias  -- the name->path registry (~/.claude/sauron/workspaces)
 //!   fn applescript      -- the iTerm layout script
+//!   fn spawn_left_pane  -- grow the agent column from inside the running TUI
+//!   fn spawn_script     -- the split script that does it
+//!   fn spawn_orc_pane   -- stage an orc in sauron's own column, from the TUI
+//!   fn orc_command      -- the short line an orc pane runs (`sauron orc <file>`)
 //!   fn osascript        -- pipe the script to `osascript`
+//!
+//! The orc *charge* -- what the agent is actually told to do, and which files are
+//! cold enough to hand it -- lives in `orc`, not here. This module only decides
+//! where the pane goes.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
@@ -235,11 +243,17 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
                     agent,
                     &key,
                     None,
-                    Some(&orc_prompt(target)),
+                    // The strict-lifecycle wrapper takes the charge as text, and
+                    // that text ends up inside an AppleScript string literal --
+                    // so this one path gets the flattened form.
+                    Some(&crate::orc::brief_oneline(
+                        target,
+                        &crate::orc::detect(&repo, target),
+                    )),
                     true,
                 )
             } else {
-                orc_command(&repo_s, target, agent, mordor.as_ref())
+                orc_command(&repo_s, &sauron_exe, target, agent, mordor.as_ref())
             }
         })
         .collect();
@@ -618,74 +632,252 @@ end tell
 // Cold-code detection: the safe, uncontested files an orc can be handed.
 // ---------------------------------------------------------------------------
 
-/// The largest source files no active session is touching and no uncommitted
-/// change has dirtied -- the best single-shot targets, biggest first (an
-/// oversized file is the prime thing to decompose). `hot` is the set of paths
-/// active sessions have edited; git supplies the tracked and the dirty sets.
+/// The best single-shot targets, best first: source files no active session is
+/// touching and no uncommitted change has dirtied. Ranking and the cold/hot
+/// filtering both live in `orc`, so the launcher and the TUI picker choose from
+/// exactly the same list by exactly the same rule.
 fn cold_targets(repo: &Path, hot: &BTreeSet<String>, want: usize) -> Vec<String> {
     if want == 0 {
         return Vec::new();
     }
-    let dirty: BTreeSet<String> = git_lines(repo, &["status", "--porcelain"])
-        .iter()
-        .filter_map(|l| l.get(3..).map(|s| s.trim().to_string()))
-        .collect();
-
-    let mut cands: Vec<(u64, String)> = git_lines(repo, &["ls-files"])
+    crate::orc::survey(repo, hot)
+        .cold
         .into_iter()
-        .filter(|p| is_code(p))
-        .filter(|p| !hot.contains(p) && !dirty.contains(p))
-        .filter_map(|p| std::fs::metadata(repo.join(&p)).ok().map(|m| (m.len(), p)))
-        .collect();
-    // Biggest first; ties broken by path so the order is stable.
-    cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    cands.into_iter().take(want).map(|(_, p)| p).collect()
+        .take(want)
+        .map(|t| t.path)
+        .collect()
 }
 
-/// Lines of `git -C <repo> <args>` stdout, empty on any failure.
-fn git_lines(repo: &Path, args: &[&str]) -> Vec<String> {
-    match Command::new("git").arg("-C").arg(repo).args(args).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(|s| s.to_string())
-            .collect(),
-        _ => Vec::new(),
+/// The line an orc pane is handed: `cd repo && sauron orc <file>`. It used to be
+/// `claude '<the entire brief>'`, which forced the brief to stay single-line and
+/// quote-free and buried the target in a wall of prose the user was supposed to
+/// review before pressing Enter. The charge now lives in `orc::brief` and is
+/// passed to the agent as an argv element by `sauron orc`.
+///
+/// In Mordor mode the env prefix rides ahead of the sauron word; the vars are
+/// inherited straight through to the agent that subcommand execs.
+fn orc_command(
+    repo: &str,
+    sauron_exe: &Path,
+    target: &str,
+    agent: Agent,
+    mordor: Option<&Mordor>,
+) -> String {
+    crate::orc::stage_command(sauron_exe, repo, target, &agent.local_env(mordor))
+}
+
+// ---------------------------------------------------------------------------
+// Growing the left column from inside the running TUI.
+//
+// Closing an agent pane is one keystroke of iTerm2's; opening one back up was a
+// split, a cd, and a typed command. `spawn_left_pane` is the other half of that
+// gesture, driven from sauron itself.
+//
+// Finding the left column needs no bookkeeping, because iTerm2 enumerates
+// `sessions of tab` in split-tree order and `applescript` above carves the right
+// column off as the *second* child of the root vertical split. So every
+// left-column pane sorts before the sauron pane and every right-column pane
+// (sauron, the orcs, the shells) sorts after it. sauron knows which session is
+// its own from $ITERM_SESSION_ID, so "the agent column" is exactly "everything
+// ahead of me", recomputed live -- panes you closed are simply not there any
+// more, and panes you split by hand are.
+// ---------------------------------------------------------------------------
+
+/// Open one more agent pane in the left column of the workspace window this
+/// process is running in, running `cmd`, and keep the column balanced by
+/// splitting whichever left pane is currently tallest -- the same rule the
+/// launch layout uses, and for the same reason (repeatedly splitting the newest
+/// pane drives it under iTerm2's minimum height and the split throws).
+///
+/// `focus` selects the new pane. Off for a bare spawn, so repeated presses all
+/// land in sauron; on when the user is opening a specific session to talk to it.
+///
+/// Returns the message to show on failure -- this runs inside the TUI event
+/// loop, so nothing here may print or exit.
+pub fn spawn_left_pane(cmd: &str, focus: bool) -> Result<(), String> {
+    let Some(me) = iterm_session_id() else {
+        return Err("not running in an iTerm2 pane".into());
+    };
+    let out = osascript_out(&spawn_script(&me, cmd, focus))
+        .map_err(|e| format!("osascript failed: {e}"))?;
+    match out.trim() {
+        "OK" => Ok(()),
+        "" => Err("iTerm2 did not answer".into()),
+        other => Err(other.trim_start_matches("ERR ").to_string()),
     }
 }
 
-/// Whether a path is source an orc should refactor -- a known code extension,
-/// never a lockfile.
-fn is_code(path: &str) -> bool {
-    const EXT: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "rb", "java", "kt", "kts", "swift", "c", "cc",
-        "cpp", "cxx", "h", "hpp", "hh", "cs", "php", "scala", "lua", "sh", "zig", "ml", "ex", "exs",
-    ];
-    if path.ends_with(".lock") {
-        return false;
+/// Stage an orc in the **right** column -- sauron's own column -- of the
+/// workspace window this process is running in.
+///
+/// The mirror image of [`spawn_left_pane`], and it differs in the two ways that
+/// matter. It splits the sessions *at or after* sauron rather than those ahead
+/// of it, because the launch layout carves the right column off as the second
+/// child of the root split, so the orcs live behind the Eye and the hobbits in
+/// front of it. And it types the command **without** pressing Enter: an orc is
+/// staged, never auto-run, so the target can be read and approved first. That is
+/// the same contract `--orcs N` has at launch, kept identical here so a
+/// GUI-dispatched orc is not a more dangerous thing than a launch-dispatched one.
+pub fn spawn_orc_pane(cmd: &str) -> Result<(), String> {
+    let Some(me) = iterm_session_id() else {
+        return Err("not running in an iTerm2 pane".into());
+    };
+    let out = osascript_out(&orc_spawn_script(&me, cmd))
+        .map_err(|e| format!("osascript failed: {e}"))?;
+    match out.trim() {
+        "OK" => Ok(()),
+        "" => Err("iTerm2 did not answer".into()),
+        other => Err(other.trim_start_matches("ERR ").to_string()),
     }
-    matches!(path.rsplit_once('.'), Some((_, ext)) if EXT.contains(&ext))
 }
 
-/// The single-shot task an orc runs against its cold target. Single-quoted for
-/// the shell and free of both quote kinds, so it survives the AppleScript
-/// double-quoted string it is embedded in.
-fn orc_command(repo: &str, target: &str, agent: Agent, mordor: Option<&Mordor>) -> String {
-    // In Mordor mode the env prefix redirects this orc to the local model, right
-    // before the agent word: `cd repo && ANTHROPIC_...=... claude '<prompt>'`.
+/// The right-column split script. Answers `OK`, or `ERR <why>`.
+fn orc_spawn_script(session_uuid: &str, cmd: &str) -> String {
+    let me = as_str_literal(session_uuid);
+    let cmd = as_str_literal(cmd);
     format!(
-        "cd {repo} && {}{}",
-        agent.local_env(mordor),
-        agent.run_cmd(&orc_prompt(target))
+        r#"tell application "iTerm2"
+  -- Walk to the tab holding this pane and keep this session and everything
+  -- behind it: that is exactly sauron's column. Indexed with `item k of`
+  -- throughout, because `repeat with x in` hands back a reference and
+  -- `contents of` a session reference reads its visible TEXT, not the object.
+  set rights to {{}}
+  set found to false
+  repeat with wi from 1 to (count of windows)
+    set ts to tabs of (item wi of windows)
+    repeat with ti from 1 to (count of ts)
+      set ss to sessions of (item ti of ts)
+      set idx to 0
+      repeat with k from 1 to (count of ss)
+        if (id of (item k of ss)) is "{me}" then
+          set idx to k
+          exit repeat
+        end if
+      end repeat
+      if idx > 0 then
+        set found to true
+        repeat with k from idx to (count of ss)
+          set end of rights to (item k of ss)
+        end repeat
+        exit repeat
+      end if
+    end repeat
+    if found then exit repeat
+  end repeat
+  if not found then return "ERR this pane is not in an iTerm2 window"
+
+  -- Split the tallest pane in the column, not the newest: repeatedly splitting
+  -- the newest drives it under iTerm2's minimum height and the split throws.
+  set tallest to item 1 of rights
+  repeat with k from 1 to (count of rights)
+    if (rows of (item k of rights)) > (rows of tallest) then set tallest to (item k of rights)
+  end repeat
+  try
+    tell tallest to set newP to (split horizontally with default profile)
+  on error errMsg
+    return "ERR " & errMsg
+  end try
+  -- STAGED, not run: typed in and left awaiting Enter, so the target gets read
+  -- before anything starts editing it.
+  tell newP to write text "{cmd}" newline no
+  select newP
+end tell
+return "OK"
+"#
     )
 }
 
-fn orc_prompt(target: &str) -> String {
-    // The prompt carries model::ORC_MARKER so sauron recognises the session as
-    // one of its own orcs and marks it distinct in the TUI.
+/// This pane's session UUID. iTerm2 exports `w<win>t<tab>p<pane>:<uuid>`, and
+/// the uuid tail is exactly the `id` the AppleScript session class reports.
+fn iterm_session_id() -> Option<String> {
+    let raw = std::env::var("ITERM_SESSION_ID").ok()?;
+    let uuid = raw.rsplit_once(':').map(|(_, u)| u).unwrap_or(&raw).trim();
+    (!uuid.is_empty()).then(|| uuid.to_string())
+}
+
+/// Escape a Rust string into an AppleScript string literal body.
+fn as_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The split script. Answers `OK`, or `ERR <why>` -- every failure is a message
+/// the footer can show, never a silent no-op.
+fn spawn_script(session_uuid: &str, cmd: &str, focus: bool) -> String {
+    let me = as_str_literal(session_uuid);
+    let cmd = as_str_literal(cmd);
+    let select = if focus { "  select newP\n" } else { "" };
     format!(
-        "This file is safe to refactor -- {marker}. Make one focused pass on {target}: decompose it if it is overly large -- split it into a well-organised, clearly documented nested module / filetree where that is the natural structure -- tighten what remains, and clear any compiler or linter warnings it produces. Keep behaviour identical and every test passing; confine the change to {target} and the files you split out of it.",
-        marker = crate::model::ORC_MARKER,
+        r#"tell application "iTerm2"
+  -- Walk to the tab holding this pane and keep the sessions ahead of it.
+  -- Everything here indexes with `item k of` rather than `repeat with x in`:
+  -- the loop form hands back a reference, and `contents of` a session reference
+  -- reads the session's visible TEXT (it is a real property of the class), not
+  -- the object -- which is how this first tried to compare a screenful of
+  -- scrollback against a pane height.
+  set lefts to {{}}
+  set found to false
+  repeat with wi from 1 to (count of windows)
+    set ts to tabs of (item wi of windows)
+    repeat with ti from 1 to (count of ts)
+      set ss to sessions of (item ti of ts)
+      set idx to 0
+      repeat with k from 1 to (count of ss)
+        if (id of (item k of ss)) is "{me}" then
+          set idx to k
+          exit repeat
+        end if
+      end repeat
+      if idx > 0 then
+        set found to true
+        repeat with k from 1 to (idx - 1)
+          set end of lefts to (item k of ss)
+        end repeat
+        exit repeat
+      end if
+    end repeat
+    if found then exit repeat
+  end repeat
+  if not found then return "ERR this pane is not in an iTerm2 window"
+  if (count of lefts) is 0 then return "ERR no agent column left of sauron"
+
+  -- Split the tallest left pane, not the newest, so the column stays even.
+  set tallest to item 1 of lefts
+  repeat with k from 1 to (count of lefts)
+    if (rows of (item k of lefts)) > (rows of tallest) then set tallest to (item k of lefts)
+  end repeat
+  try
+    tell tallest to set newP to (split horizontally with default profile)
+  on error errMsg
+    return "ERR " & errMsg
+  end try
+  tell newP to write text "{cmd}"
+{select}end tell
+return "OK"
+"#
     )
+}
+
+/// Pipe the AppleScript to `osascript` on stdin and hand back its stdout. Unlike
+/// `osascript`, this never prints or exits -- its caller is the TUI.
+fn osascript_out(script: &str) -> std::io::Result<String> {
+    let mut child = Command::new("osascript")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Ok(if err.is_empty() {
+            "ERR osascript refused".into()
+        } else {
+            format!("ERR {err}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pipe the AppleScript to `osascript` on stdin, exactly as the shell heredoc did.
@@ -712,6 +904,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spawn_script_targets_this_pane_and_splits_the_column_left_of_it() {
+        let s = spawn_script("UUID-1", "cd /repo && claude", false);
+        // The pane is found by its own session id, and the agent column is
+        // whatever precedes it -- collected before the id match, never after.
+        assert!(s.contains(r#"if (id of (item k of ss)) is "UUID-1""#));
+        assert!(s.contains("no agent column left of sauron"));
+        // Balanced growth: the tallest left pane is split, not the newest.
+        assert!(s.contains("if (rows of (item k of lefts)) > (rows of tallest)"));
+        assert!(s.contains("split horizontally with default profile"));
+        assert!(s.contains(r#"write text "cd /repo && claude""#));
+    }
+
+    #[test]
+    fn spawn_script_only_steals_focus_when_asked() {
+        let bare = spawn_script("UUID-1", "cd /repo && claude", false);
+        let opened = spawn_script("UUID-1", "cd /repo && claude --resume abc", true);
+        // A bare spawn leaves the keyboard in sauron so the key can be repeated;
+        // opening a named session moves you to it, which is why you opened it.
+        assert!(!bare.contains("select newP"));
+        assert!(opened.contains("select newP"));
+    }
+
+    /// The safety contract of an orc, at the script level: staged, never run.
+    /// If this ever writes the command with a newline, a GUI-dispatched orc
+    /// starts rewriting a file the instant the pane appears, with nobody having
+    /// read which file it picked.
+    #[test]
+    fn orc_spawn_script_stages_the_command_instead_of_running_it() {
+        let s = orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs");
+        assert!(
+            s.contains(r#"write text "cd /repo && /bin/sauron orc src/big.rs" newline no"#),
+            "an orc must be typed and left awaiting Enter: {s}"
+        );
+        // Focus follows, so the Enter you are about to press lands in the orc.
+        assert!(s.contains("select newP"));
+    }
+
+    #[test]
+    fn orc_spawn_script_takes_sauron_own_column_not_the_hobbits() {
+        let s = orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs");
+        // Everything from this pane onward is the right column; the left-column
+        // spawn walks the other way (`1 to (idx - 1)`), and mixing them up would
+        // stage an orc in the middle of the hobbits.
+        assert!(s.contains("repeat with k from idx to (count of ss)"));
+        assert!(!s.contains("repeat with k from 1 to (idx - 1)"));
+        // Same balance rule as everywhere else: split the tallest, not the newest.
+        assert!(s.contains("if (rows of (item k of rights)) > (rows of tallest)"));
+    }
+
+    #[test]
+    fn spawn_script_never_dereferences_a_session_with_contents_of() {
+        // `contents` is a real property of iTerm2's session class -- the visible
+        // TEXT of the pane. `contents of s` on a session reference therefore
+        // hands back a screenful of scrollback, not the object, and the height
+        // comparison below it fails with -1728. Index form is the only safe way
+        // to walk these lists, so keep the loop form out of this script.
+        let s = spawn_script("UUID-1", "cd /repo && claude", true);
+        let code: String = s
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("contents of"));
+        assert!(code.contains("item k of ss"));
+    }
+
+    #[test]
+    fn spawn_script_escapes_the_command_into_the_applescript_literal() {
+        let s = spawn_script("UUID-1", r#"cd "/re po" && claude"#, false);
+        assert!(s.contains(r#"write text "cd \"/re po\" && claude""#));
+    }
+
+    #[test]
     fn applescript_lists_one_command_per_pane() {
         let work = vec![("id-1".to_string(), "task one".to_string())];
         let s = applescript("/repo", "/bin/sauron", 3, &work, &[], Agent::Claude, None, false);
@@ -726,14 +991,20 @@ mod tests {
     #[test]
     fn applescript_stacks_orcs_beneath_sauron() {
         let work = vec![("id-1".into(), "t".into())];
-        let orcs = vec![orc_command("/repo", "src/big.rs", Agent::Claude, None)];
+        let orcs = vec![orc_command(
+            "/repo",
+            Path::new("/bin/sauron"),
+            "src/big.rs",
+            Agent::Claude,
+            None,
+        )];
         let s = applescript("/repo", "/bin/sauron", 2, &work, &orcs, Agent::Claude, None, false);
         assert!(s.contains("cd /repo && /bin/sauron --claude")); // watcher on top-right
         assert!(s.contains("claude --resume id-1")); // a hobbit on the left
         assert!(s.contains("src/big.rs")); // the orc's target
-        // The orc rides in the right column, and a shell still trails it.
-        assert!(s.contains("set rightCmds to {\"cd /repo && claude 'This file is safe"));
-        assert!(s.contains("'This file is safe to refactor"));
+        // The orc rides in the right column, carrying the short reviewable line
+        // rather than the whole charge -- the charge itself lives in `orc`.
+        assert!(s.contains("set rightCmds to {\"cd /repo && /bin/sauron orc src/big.rs\""));
         // …and it is STAGED, not run: one orc, typed in but awaiting Enter.
         assert!(s.contains("set orcCount to 1"));
         assert!(s.contains("write text (item i of rightCmds) newline no"));
@@ -742,10 +1013,18 @@ mod tests {
     #[test]
     fn codex_agent_swaps_the_spawn_commands() {
         let work = vec![("id-1".into(), "t".into())];
-        let orcs = vec![orc_command("/repo", "src/big.rs", Agent::Codex, None)];
+        let orcs = vec![orc_command(
+            "/repo",
+            Path::new("/bin/sauron"),
+            "src/big.rs",
+            Agent::Codex,
+            None,
+        )];
         let s = applescript("/repo", "/bin/sauron", 1, &work, &orcs, Agent::Codex, None, false);
         assert!(s.contains("codex resume id-1")); // hobbit resumes via codex
-        assert!(s.contains("codex exec 'This file is safe")); // orc runs codex exec
+        // The orc line is agent-agnostic now -- `sauron orc` picks the agent up
+        // itself and execs `codex exec` with the charge as an argv element.
+        assert!(s.contains("cd /repo && /bin/sauron orc src/big.rs"));
         assert!(s.contains("/bin/sauron --codex")); // watcher pane watches codex
     }
 
@@ -756,7 +1035,13 @@ mod tests {
             base_url: "http://localhost:11434".into(),
         };
         let work = vec![("id-1".into(), "t".into())];
-        let orcs = vec![orc_command("/repo", "src/big.rs", Agent::Claude, Some(&m))];
+        let orcs = vec![orc_command(
+            "/repo",
+            Path::new("/bin/sauron"),
+            "src/big.rs",
+            Agent::Claude,
+            Some(&m),
+        )];
         let s = applescript("/repo", "/bin/sauron", 2, &work, &orcs, Agent::Claude, Some(&m), false);
 
         // The hobbit pane carries the local endpoint before the `claude` word.
@@ -764,30 +1049,22 @@ mod tests {
         assert!(s.contains("ANTHROPIC_MODEL=qwen3-coder ANTHROPIC_SMALL_FAST_MODEL"));
         // …and it still resumes the working session, now through the local model.
         assert!(s.contains("ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder claude --resume id-1"));
-        // The orc too, before its single-shot prompt.
-        assert!(s.contains("=qwen3-coder claude 'This file is safe"));
+        // The orc too -- the env rides ahead of the sauron word, and `sauron orc`
+        // passes it straight through to the agent it execs.
+        assert!(s.contains("=qwen3-coder /bin/sauron orc src/big.rs"));
         // But the Eye pane never gets the env -- sauron calls no model.
         assert!(s.contains("cd /repo && /bin/sauron --claude"));
         assert!(!s.contains("ANTHROPIC_BASE_URL=http://localhost:11434 /bin/sauron"));
     }
 
     #[test]
-    fn is_code_filters_to_source_files() {
-        assert!(is_code("src/main.rs"));
-        assert!(is_code("app/components/Foo.tsx"));
-        assert!(!is_code("Cargo.lock"));
-        assert!(!is_code("README.md"));
-        assert!(!is_code("assets/logo.png"));
-        assert!(!is_code("Makefile"));
-    }
-
-    #[test]
-    fn orc_command_targets_the_file_without_double_quotes() {
-        let c = orc_command("/repo", "src/big.rs", Agent::Claude, None);
-        assert!(c.starts_with("cd /repo && claude '"));
-        assert!(c.contains("src/big.rs"));
-        // No double quotes, or it would break the AppleScript string it sits in.
+    fn orc_command_stages_a_short_reviewable_line() {
+        let c = orc_command("/repo", Path::new("/bin/sauron"), "src/big.rs", Agent::Claude, None);
+        assert_eq!(c, "cd /repo && /bin/sauron orc src/big.rs");
+        // No quotes of either kind: this sits in a shell command inside an
+        // AppleScript double-quoted string literal.
         assert!(!c.contains('"'), "orc command must be double-quote-free: {c}");
+        assert!(!c.contains('\''), "orc command must be single-quote-free: {c}");
     }
 
     #[test]

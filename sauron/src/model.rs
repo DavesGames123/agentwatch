@@ -6,8 +6,12 @@
 //!   fn Session::pending     -- write-set entries not yet acked at their current ts
 //!   fn parse_rfc3339_ms     -- ISO8601 -> epoch millis, no chrono dependency
 //!   fn ago                  -- epoch millis -> "4m" / "2h" / "3d"
+//!   fn fmt_duration         -- a task's elapsed run -> "4m 12s" / "1h 03m"
+//!   fn local_offset_secs    -- the machine's UTC offset, read once from `date`
+//!   fn local_time / fmt_clock -- epoch millis -> local "3:42 PM"
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Escape hatch for a session that died mid-turn.
@@ -177,6 +181,23 @@ impl Status {
         }
     }
 
+    /// A compact, always-visible status word for a task card -- the lowercase
+    /// counterpart to the loud section-header `label`. The section header names a
+    /// group and scrolls away; this rides on every card so a task's state reads
+    /// off the card itself, in its status colour, without leaning on the glyph or
+    /// remembering the palette.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Status::Errored => "errored",
+            Status::Blocked => "waiting",
+            Status::AwaitingAck => "your move",
+            Status::Working => "working",
+            Status::Delegated => "delegated",
+            Status::NeedsTest => "needs test",
+            Status::Clear => "clear",
+        }
+    }
+
     /// Sort rank: what should demand attention first. An errored agent outranks a
     /// blocked one because it will not recover on its own; a blocked agent (stuck
     /// on a question) outranks one merely awaiting acknowledgement, which in turn
@@ -227,6 +248,14 @@ pub struct Session {
     /// agent rather than on you -- the difference between `Delegated` and the
     /// "stopped, your move" `AwaitingInput`.
     pub agent_launched_ms: i64,
+    /// Epoch millis of when the current turn (the "task") began: the timestamp of
+    /// the user prompt that last put an idle session back in flight. Mid-turn tool
+    /// results do not move it, so `now - turn_started_ms` on a `Working` session is
+    /// how long that task has been running, and on a settled session
+    /// `last_activity - turn_started_ms` is how long it took. Zero until the first
+    /// user record is folded (a session reconstructed from a partial log may have
+    /// none), which the UI reads as "no timer to show".
+    pub turn_started_ms: i64,
     /// True once a prompt carrying `ORC_MARKER` is seen -- this session is one of
     /// sauron's own orcs (a single-shot maintenance agent), so the UI marks it
     /// distinct from the hobbits doing your directed work.
@@ -446,6 +475,121 @@ pub fn ago(then_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// A task's elapsed run, at second resolution: "12s", "4m 12s", "1h 03m".
+///
+/// Distinct from `ago` (which is a coarse one-unit age for the "last seen" tag):
+/// a running task wants a clock that visibly moves, so seconds are shown until a
+/// minute has passed and the sub-unit is kept once it has, rather than collapsing
+/// to a single figure. Negative spans (clock skew between records and `now`) clamp
+/// to zero rather than rendering a nonsense duration.
+pub fn fmt_duration(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// The machine's UTC offset in seconds, read once from `date +%z` ("-0700").
+///
+/// std exposes no local timezone, and the tool already deliberately skips chrono
+/// for a fixed-format problem, so the one datum needed to render a wall clock --
+/// the offset -- is lifted from `date`, which is present on every macOS/Linux box
+/// this runs on. Read once at startup and cached by the caller: a DST flip
+/// mid-session would shift a displayed start time by an hour, which for a clock on
+/// a live task is not worth re-shelling every frame to catch. Anything unparseable
+/// falls back to 0 (UTC), so a missing `date` degrades to a still-useful UTC clock
+/// rather than breaking the timer.
+pub fn local_offset_secs() -> i64 {
+    let out = match Command::new("date").arg("+%z").output() {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    parse_offset(s.trim())
+}
+
+/// Parse a `±HHMM` UTC offset to signed seconds. Non-conforming input -> 0.
+fn parse_offset(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() < 5 {
+        return 0;
+    }
+    let sign = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return 0,
+    };
+    let (Some(h), Some(m)) = (
+        s.get(1..3).and_then(|x| x.parse::<i64>().ok()),
+        s.get(3..5).and_then(|x| x.parse::<i64>().ok()),
+    ) else {
+        return 0;
+    };
+    sign * (h * 3600 + m * 60)
+}
+
+/// A local wall-clock breakdown of an epoch instant. Only the fields a clock and
+/// a same-day check need; no timezone name, no weekday.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub min: i64,
+    pub sec: i64,
+}
+
+/// Break an epoch-millis instant into local civil fields, given the UTC offset in
+/// seconds. Euclidean div/rem keep pre-1970 and sub-hour negative offsets correct;
+/// the civil conversion is Hinnant's, the inverse of `days_from_civil`.
+pub fn local_time(epoch_ms: i64, offset_secs: i64) -> LocalTime {
+    let total = epoch_ms.div_euclid(1000) + offset_secs;
+    let days = total.div_euclid(86_400);
+    let rem = total.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    LocalTime {
+        year,
+        month,
+        day,
+        hour: rem / 3600,
+        min: (rem % 3600) / 60,
+        sec: rem % 60,
+    }
+}
+
+/// Howard Hinnant's civil_from_days: days since 1970-01-01 -> (year, month, day).
+/// The exact inverse of `days_from_civil`, so a round-trip is lossless.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A 12-hour clock with AM/PM: "3:42 PM", "12:05 AM". The form people read a
+/// start time in, unambiguous about time-of-day where a bare 24h "15:42" makes
+/// the reader translate.
+pub fn fmt_clock(t: LocalTime) -> String {
+    let (h12, ap) = match t.hour {
+        0 => (12, "AM"),
+        1..=11 => (t.hour, "AM"),
+        12 => (12, "PM"),
+        _ => (t.hour - 12, "PM"),
+    };
+    format!("{}:{:02} {}", h12, t.min, ap)
+}
+
 pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -461,6 +605,53 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_shows_seconds_then_keeps_the_sub_unit() {
+        // Under a minute counts in seconds so a live timer visibly moves.
+        assert_eq!(fmt_duration(12_000), "12s");
+        // Past a minute the seconds stay, unlike the coarse `ago`.
+        assert_eq!(fmt_duration(4 * 60_000 + 12_000), "4m 12s");
+        // Past an hour it rolls to hours and minutes.
+        assert_eq!(fmt_duration(3_600_000 + 3 * 60_000), "1h 03m");
+        // A negative span (record clock ahead of `now`) clamps, never renders junk.
+        assert_eq!(fmt_duration(-5_000), "0s");
+    }
+
+    #[test]
+    fn offset_parses_sign_hours_and_minutes() {
+        assert_eq!(parse_offset("-0700"), -7 * 3600);
+        assert_eq!(parse_offset("+0530"), 5 * 3600 + 30 * 60);
+        assert_eq!(parse_offset("+0000"), 0);
+        // Anything malformed degrades to UTC rather than a wrong offset.
+        assert_eq!(parse_offset("garbage"), 0);
+        assert_eq!(parse_offset(""), 0);
+    }
+
+    #[test]
+    fn local_time_round_trips_against_the_forward_conversion() {
+        // Pick an instant, break it into local fields at a known offset, and check
+        // the pieces reassemble the same epoch through the forward path. This pins
+        // civil_from_days as the exact inverse of days_from_civil.
+        let epoch_ms = parse_rfc3339_ms("2026-07-24T22:42:07.000Z").unwrap();
+        let offset = -7 * 3600; // PDT
+        let lt = local_time(epoch_ms, offset);
+        assert_eq!((lt.year, lt.month, lt.day), (2026, 7, 24));
+        assert_eq!((lt.hour, lt.min, lt.sec), (15, 42, 7));
+
+        let days = days_from_civil(lt.year, lt.month, lt.day);
+        let back = ((days * 86_400 + lt.hour * 3600 + lt.min * 60 + lt.sec) - offset) * 1000;
+        assert_eq!(back, epoch_ms - (epoch_ms % 1000));
+    }
+
+    #[test]
+    fn clock_is_twelve_hour_with_meridiem() {
+        let at = |ms: i64| fmt_clock(local_time(ms, 0));
+        assert_eq!(at(parse_rfc3339_ms("2026-07-24T15:42:00Z").unwrap()), "3:42 PM");
+        assert_eq!(at(parse_rfc3339_ms("2026-07-24T00:05:00Z").unwrap()), "12:05 AM");
+        assert_eq!(at(parse_rfc3339_ms("2026-07-24T12:00:00Z").unwrap()), "12:00 PM");
+        assert_eq!(at(parse_rfc3339_ms("2026-07-24T09:07:00Z").unwrap()), "9:07 AM");
+    }
 
     #[test]
     fn parses_log_timestamp_format() {

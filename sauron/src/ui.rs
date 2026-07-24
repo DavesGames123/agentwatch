@@ -19,10 +19,10 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::model::{ago, truncate, Status};
+use crate::model::{ago, fmt_clock, fmt_duration, local_time, truncate, Status};
 use crate::Row;
 
 /// Status palette. Each state owns one hue and keeps it everywhere it appears --
@@ -86,10 +86,37 @@ pub struct View<'a> {
     pub clear_count: usize,
     pub show_clear: bool,
     pub copied: bool,
+    /// Outcome of the last `n` / Enter pane spawn while its banner is up: the
+    /// message and whether it succeeded. A failed spawn has to say so -- the new
+    /// pane is off in the workspace window, so the footer is the only place the
+    /// user finds out it never appeared.
+    pub spawned: Option<(&'a str, bool)>,
     /// Milliseconds since launch, the clock the Eye and the ring-verse animate
     /// off. Derived, not stored in App: the whole animation is a pure function
     /// of this, so nothing has to be ticked or remembered between frames.
     pub anim_ms: u64,
+    /// The machine's UTC offset in seconds, so a task's start time renders on the
+    /// local wall clock. Read once at launch and carried through unchanged.
+    pub local_offset: i64,
+    /// Set to the log directory only while that directory does not exist yet --
+    /// a repo no agent has ever run in. The board is legitimately empty rather
+    /// than broken, so the empty state says which path it is waiting on. Goes
+    /// back to None the moment the first session appears.
+    pub awaiting_log_dir: Option<&'a str>,
+    /// The cold-target picker, drawn over the board while it is open.
+    pub pick: Option<PickView<'a>>,
+}
+
+/// The cold-target picker's contents. Carries the *evidence* behind each rank --
+/// line count and churn -- because the list is asking the user to approve a file
+/// for automated refactoring, and "trust the ordering" is not an answer.
+pub struct PickView<'a> {
+    pub cold: &'a [crate::orc::Target],
+    pub selected: usize,
+    /// Candidates excluded because a live session is editing them.
+    pub hot: usize,
+    /// Candidates excluded because git reports them dirty.
+    pub dirty: usize,
 }
 
 /// Screen geometry of the last-drawn list, so a mouse click can be resolved to
@@ -142,7 +169,7 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
 
     header(f, chunks[0], v, mordor);
     list(f, list_area, v, list_state, geo);
-    detail(f, chunks[2], v.rows.get(v.selected), v.now);
+    detail(f, chunks[2], v.rows.get(v.selected), v.now, v.local_offset);
     footer(f, chunks[3], v);
 
     if mordor {
@@ -173,7 +200,100 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
             base,
         );
     }
+
+    // Last, so it sits over everything: the picker is modal and owns the
+    // keyboard while it is up, and the drawing should say so.
+    if let Some(pick) = &v.pick {
+        orc_picker(f, full, pick);
+    }
     let _ = chunks;
+}
+
+/// The cold-target picker: which file to loose an orc on, ranked, with the
+/// evidence for the ranking and an explicit count of what was ruled out.
+///
+/// The exclusion line is not decoration. Filtering silently reads as "there was
+/// nothing else to choose", which is a different and false claim -- the whole
+/// safety property of an orc is that contested files were *deliberately* held
+/// back, and that only means something if you can see it happening.
+fn orc_picker(f: &mut Frame, full: Rect, pick: &PickView) {
+    let rows = pick.cold.len().min(12) as u16;
+    let w = full.width.saturating_sub(8).min(76).max(30);
+    let h = (rows + 5).min(full.height.saturating_sub(2));
+    let area = Rect {
+        x: (full.width.saturating_sub(w)) / 2,
+        y: (full.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, area);
+
+    let inner_w = area.width.saturating_sub(2) as usize;
+    // Keep the selection on screen with a simple window that follows the cursor.
+    let visible = rows as usize;
+    let top = pick.selected.saturating_sub(visible.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, t) in pick.cold.iter().enumerate().skip(top).take(visible) {
+        let here = i == pick.selected;
+        // Churn is the part a user cannot see for themselves at a glance, so it
+        // is spelled out rather than folded into the score.
+        let stat = if t.churn > 0 {
+            format!("{} loc · {} commits", t.loc, t.churn)
+        } else {
+            format!("{} loc", t.loc)
+        };
+        let room = inner_w.saturating_sub(stat.chars().count() + 4);
+        let path = truncate(&t.path, room.max(8));
+        let pad = inner_w
+            .saturating_sub(path.chars().count() + stat.chars().count() + 3)
+            .max(1);
+        let style = if here {
+            Style::default().fg(INK).bg(ORC).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FILE)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if here { " ▸ " } else { "   " }, style),
+            Span::styled(path, style),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(
+                stat,
+                if here {
+                    style
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} cold · {} hot · {} dirty held back",
+            pick.cold.len(),
+            pick.hot,
+            pick.dirty
+        ),
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("  ⏎", Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        Span::styled(" stage orc   ", Style::default().fg(DIM)),
+        Span::styled("j/k", Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        Span::styled(" move   ", Style::default().fg(DIM)),
+        Span::styled("esc", Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        Span::styled(" close", Style::default().fg(DIM)),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ORC))
+        .title(Span::styled(
+            " loose an orc — decompose first ",
+            Style::default().fg(ORC).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool) {
@@ -400,8 +520,24 @@ fn list(f: &mut Frame, area: Rect, v: &View, list_state: &mut ListState, geo: &m
     geo.item_rows.clear();
 
     if v.rows.is_empty() && v.clear_count == 0 {
-        let empty = Paragraph::new("No sessions with repo edits yet.")
-            .style(Style::default().fg(DIM));
+        // Two distinct empty boards: this repo has logs but nothing outstanding,
+        // versus no agent has ever run here. The second one looks identical and
+        // is the one people mistake for a bug, so it names the path being
+        // watched -- the tool stays up and fills in when a session starts.
+        let text = match v.awaiting_log_dir {
+            Some(dir) => vec![
+                Line::raw("No agent sessions here yet — watching for the first one."),
+                Line::raw(""),
+                Line::styled(format!("  {dir}"), Style::default().fg(DIM)),
+            ],
+            None => vec![Line::raw("No sessions with repo edits yet.")],
+        };
+        // Wrapped, not clipped: the whole point of printing the path is that the
+        // user can compare it against the repo they meant, and an encoded project
+        // dir is longer than the list pane is wide.
+        let empty = Paragraph::new(text)
+            .style(Style::default().fg(DIM))
+            .wrap(Wrap { trim: false });
         f.render_widget(empty, area);
         return;
     }
@@ -427,7 +563,7 @@ fn list(f: &mut Frame, area: Rect, v: &View, list_state: &mut ListState, geo: &m
         if i == v.selected {
             selected_item = items.len();
         }
-        push(&mut items, card(r, i == v.selected, v.now, width), Some(i));
+        push(&mut items, card(r, i == v.selected, v.now, v.local_offset, width), Some(i));
     }
 
     // Idle sessions carry no action, so they collapse to one line unless asked
@@ -482,7 +618,38 @@ fn section_header(status: Status, count: usize, width: usize) -> ListItem<'stati
     ])
 }
 
-fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> {
+/// The task-timing line: "running 4m 12s  ·  started 3:42 PM" while an agent is
+/// mid-turn, "took 4m 12s  ·  started 3:42 PM" once it has stopped. The elapsed
+/// span is measured from the turn's start to `now` for a live task (so it ticks
+/// each refresh) or to its last activity for a settled one. Returns None when no
+/// turn start was ever recorded, so a session reconstructed from a partial log
+/// simply shows no clock rather than a bogus one.
+fn timing_line(row: &Row, now: i64, offset: i64) -> Option<Line<'static>> {
+    if row.turn_started <= 0 {
+        return None;
+    }
+    let running = row.status == Status::Working;
+    let end = if running { now } else { row.last_activity };
+    let dur = fmt_duration(end.saturating_sub(row.turn_started));
+    let (verb, dur_style) = if running {
+        (
+            "running",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("took", Style::default().fg(SAID))
+    };
+    let clock = fmt_clock(local_time(row.turn_started, offset));
+    Some(Line::from(vec![
+        Span::raw("     "),
+        Span::styled(format!("{} ", verb), Style::default().fg(DIM)),
+        Span::styled(dur, dur_style),
+        Span::styled("  ·  started ", Style::default().fg(DIM)),
+        Span::styled(clock, Style::default().fg(SAID)),
+    ]))
+}
+
+fn card(row: &Row, selected: bool, now: i64, offset: i64, width: usize) -> ListItem<'static> {
     let color = color_of(row.status);
 
     let marker = if selected {
@@ -510,16 +677,23 @@ fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> 
     };
 
     let age = ago(row.last_activity, now);
+    // The status word rides on every card, in the state's own colour, so a task's
+    // status reads off the card itself -- the section header that names the group
+    // scrolls away, the glyph alone means nothing until the palette is learned.
+    let tag = row.status.tag();
     // A green "orc" badge marks sauron's own maintenance agents, distinct from
     // the hobbits. It sits ahead of the name so it never gets truncated away.
     let orc_room = if row.is_orc { 6 } else { 0 };
+    // Both the tag and the orc badge are protected from truncation -- only the
+    // name gives up columns when the card is narrow.
     let name_room = width
-        .saturating_sub(age.chars().count() + 12 + orc_room)
+        .saturating_sub(age.chars().count() + 12 + orc_room + tag.chars().count() + 1)
         .max(12);
 
     let mut first_spans = vec![
         marker.clone(),
         Span::styled(format!("{} ", glyph_of(row.status)), Style::default().fg(color)),
+        Span::styled(format!("{} ", tag), Style::default().fg(color)),
     ];
     if row.is_orc {
         first_spans.push(Span::styled(
@@ -576,10 +750,18 @@ fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> 
         )
     };
 
+    // The task clock, right under the name: how long this turn has run (live for a
+    // Working agent, settled for one that has stopped) and the local wall-clock time
+    // it began. This is the "how long has it been going, and since when" a
+    // supervisor asks of every active card, which the age tag alone never answered.
+    let mut lines = vec![first];
+    if let Some(t) = timing_line(row, now, offset) {
+        lines.push(t);
+    }
+
     // Quote the last thing you told this session, up to three lines, right under
     // its name -- the quickest way to reload what you had in mind for it without
     // switching to its terminal.
-    let mut lines = vec![first];
     if let Some(prompt) = &row.last_prompt {
         for pl in wrap_prompt(prompt, width.saturating_sub(7), 3) {
             lines.push(Line::from(vec![
@@ -712,7 +894,7 @@ fn wrap_prompt(prompt: &str, width: usize, max_lines: usize) -> Vec<String> {
     out
 }
 
-fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64) {
+fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64, offset: i64) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(DIM))
@@ -745,6 +927,29 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64) {
             Style::default().fg(DIM),
         ),
     ])];
+
+    // The task clock in full: elapsed run (live for a working agent, settled once
+    // stopped) and the local time it began, mirroring the card's timing line.
+    if row.turn_started > 0 {
+        let running = row.status == Status::Working;
+        let end = if running { now } else { row.last_activity };
+        let dur = fmt_duration(end.saturating_sub(row.turn_started));
+        let clock = fmt_clock(local_time(row.turn_started, offset));
+        let verb = if running { "running for" } else { "took" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", verb), Style::default().fg(DIM)),
+            Span::styled(
+                dur,
+                if running {
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(SAID)
+                },
+            ),
+            Span::styled("  ·  started ", Style::default().fg(DIM)),
+            Span::styled(clock, Style::default().fg(SAID)),
+        ]));
+    }
 
     match row.status {
         Status::Errored => {
@@ -840,39 +1045,72 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64) {
     );
 }
 
+/// The key hints and, at the right edge, the flash from the last action.
+///
+/// The line does not wrap, so it is fitted rather than emitted whole: the flash
+/// is measured first and its room set aside, then hints are taken in priority
+/// order until the width runs out. A sauron pane in a workspace is often 52-70
+/// columns, which is narrower than the full hint list -- laying it out
+/// unconditionally silently ate whatever came last, and what comes last is the
+/// message telling you whether the pane you just asked for actually opened.
 fn footer(f: &mut Frame, area: Rect, v: &View) {
-    let key = |k: &'static str, what: &'static str| {
-        vec![
-            Span::styled(k, Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {}  ", what), Style::default().fg(DIM)),
-        ]
+    // Right edge first: it is the reason the fit exists, so it never gets cut.
+    let flash: Option<(String, Color)> = if let Some((msg, ok)) = v.spawned {
+        // The spawn result outranks the rest of the corner: it is the only one
+        // that reports on something outside this pane, and the only one that
+        // can be bad news.
+        Some((msg.to_string(), if ok { GREEN } else { AMBER }))
+    } else if v.copied {
+        Some(("continue command copied".into(), GREEN))
+    } else if v.saved {
+        Some(("saved".into(), GREEN))
+    } else {
+        None
     };
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(key("j/k", "move"));
-    spans.extend(key("a", "ack/dismiss"));
-    spans.extend(key("u", "undo"));
-    spans.extend(key("A", "ack all"));
-    spans.extend(key("y", "copy continue"));
-    spans.extend(key("c", if v.show_clear { "hide clear" } else { "show clear" }));
-    spans.extend(key("q", "quit"));
 
+    // Priority order, not display convenience: the keys that act come before the
+    // keys that toggle a view, and `q` is last because nobody needs telling.
+    let mut hints: Vec<(&str, String)> = vec![
+        ("j/k", "move".into()),
+        ("a", "ack/dismiss".into()),
+        ("n", "new pane".into()),
+        ("⏎", "open pane".into()),
+        ("O", "orc".into()),
+        ("y", "copy".into()),
+        ("u", "undo".into()),
+        ("A", "ack all".into()),
+        (
+            "c",
+            if v.show_clear { "hide clear" } else { "show clear" }.into(),
+        ),
+        ("q", "quit".into()),
+    ];
     if v.hidden_stale > 0 {
+        hints.push(("o", format!("+{} older", v.hidden_stale)));
+    }
+
+    let budget = area.width as usize;
+    let mut used = 1 + flash.as_ref().map_or(0, |(m, _)| m.chars().count());
+    let mut spans = vec![Span::raw(" ")];
+    for (k, what) in &hints {
+        let w = k.chars().count() + 1 + what.chars().count() + 2;
+        if used + w > budget {
+            continue; // a wide hint drops out; a later narrow one may still fit
+        }
+        used += w;
         spans.push(Span::styled(
-            format!("+{} older (o)  ", v.hidden_stale),
+            *k,
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}  ", what),
             Style::default().fg(DIM),
         ));
     }
-    // The copied flash wins the corner when both fire -- it is the action the
-    // user just took and wants confirmed.
-    if v.copied {
+    if let Some((msg, colour)) = flash {
         spans.push(Span::styled(
-            "continue command copied",
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-        ));
-    } else if v.saved {
-        spans.push(Span::styled(
-            "saved",
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            msg,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -987,6 +1225,123 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_footer_keeps_the_spawn_result_and_the_keys_that_act() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // 52 columns -- the width of a sauron pane in a four-agent workspace, and
+        // narrower than the full hint list.
+        let mut terminal = Terminal::new(TestBackend::new(52, 24)).unwrap();
+        let view = View {
+            rows: &[],
+            selected: 0,
+            now: 0,
+            repo: "demo",
+            saved: false,
+            hidden_stale: 0,
+            clear_count: 0,
+            show_clear: false,
+            copied: false,
+            spawned: Some(("no agent column left of sauron", false)),
+            anim_ms: 0,
+            local_offset: 0,
+            awaiting_log_dir: None,
+            pick: None,
+        };
+        let mut ls = ListState::default();
+        let mut geo = FrameGeometry::default();
+        terminal
+            .draw(|f| draw(f, &view, &mut ls, &mut geo))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut line = String::new();
+        for x in 0..52u16 {
+            line.push_str(buf[(x, 23)].symbol());
+        }
+        // The failure message is why the fit exists -- it survives whole.
+        assert!(
+            line.contains("no agent column left of sauron"),
+            "spawn result was truncated away: {line:?}"
+        );
+        // And the hints that fit are the ones that do something, not `q quit`.
+        assert!(line.contains("j/k"), "footer lost the move hint: {line:?}");
+        assert!(!line.contains("quit"), "footer kept a low-priority hint over the flash: {line:?}");
+    }
+
+    /// The picker is the whole GUI dispatch surface, so it gets drawn for real
+    /// rather than trusted. Two things have to survive: the ranking evidence, and
+    /// the count of what was held back -- a picker that silently hides contested
+    /// files reads as "there was nothing else", which is a different claim.
+    #[test]
+    fn the_orc_picker_shows_its_ranking_evidence_and_what_it_held_back() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let cold = vec![
+            crate::orc::Target {
+                path: "sauron/src/clip/store.rs".into(),
+                loc: 1178,
+                churn: 4,
+                score: 1338,
+            },
+            crate::orc::Target {
+                path: "sauron/src/clip/mod.rs".into(),
+                loc: 633,
+                churn: 0,
+                score: 633,
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let view = View {
+            rows: &[],
+            selected: 0,
+            now: 0,
+            repo: "demo",
+            saved: false,
+            hidden_stale: 0,
+            clear_count: 0,
+            show_clear: false,
+            copied: false,
+            spawned: None,
+            anim_ms: 0,
+            local_offset: 0,
+            awaiting_log_dir: None,
+            pick: Some(PickView {
+                cold: &cold,
+                selected: 0,
+                hot: 3,
+                dirty: 9,
+            }),
+        };
+        let mut ls = ListState::default();
+        let mut geo = FrameGeometry::default();
+        terminal.draw(|f| draw(f, &view, &mut ls, &mut geo)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..30u16 {
+            for x in 0..90u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("store.rs"), "picker lost the target: {screen}");
+        // The evidence, not just the ordering.
+        assert!(screen.contains("1178 loc"), "picker lost the line count");
+        assert!(screen.contains("4 commits"), "picker lost the churn evidence");
+        // A quiet file says loc only -- no misleading "0 commits".
+        assert!(!screen.contains("0 commits"));
+        // …and the exclusions are stated out loud.
+        assert!(
+            screen.contains("3 hot") && screen.contains("9 dirty"),
+            "picker hid what it filtered: {screen}"
+        );
+        // The charge's priority is on the frame, so the dispatch says what it does.
+        assert!(screen.contains("decompose first"));
+    }
+
+    #[test]
     fn header_engraves_the_verse_and_burns_the_eye() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1002,7 +1357,11 @@ mod tests {
             clear_count: 0,
             show_clear: false,
             copied: false,
+            spawned: None,
+            pick: None,
             anim_ms: 0, // clock phase 0 -> Eye centred, verse on its first line
+            local_offset: 0,
+            awaiting_log_dir: None,
         };
         let mut ls = ListState::default();
         let mut geo = FrameGeometry::default();
@@ -1020,6 +1379,118 @@ mod tests {
         assert!(
             rule.contains('‹') && rule.contains('▮') && rule.contains('›'),
             "Eye missing: {rule:?}"
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_logs_yet_still_renders_and_names_what_it_watches() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Opening sauron in a fresh folder: no rows, no log directory. It must
+        // draw a board rather than refuse to start, and the empty state has to
+        // say which path it is waiting on -- otherwise "watching the wrong repo"
+        // and "nothing has run here yet" look identical.
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let view = View {
+            rows: &[],
+            selected: 0,
+            now: 0,
+            repo: "fresh",
+            saved: false,
+            hidden_stale: 0,
+            clear_count: 0,
+            show_clear: false,
+            copied: false,
+            spawned: None,
+            pick: None,
+            anim_ms: 0,
+            local_offset: 0,
+            awaiting_log_dir: Some("/home/u/.claude/projects/-tmp-fresh"),
+        };
+        let mut ls = ListState::default();
+        let mut geo = FrameGeometry::default();
+        terminal
+            .draw(|f| draw(f, &view, &mut ls, &mut geo))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("watching for the first one"),
+            "empty state missing: {screen}"
+        );
+        assert!(
+            screen.contains("/home/u/.claude/projects/-tmp-fresh"),
+            "watched path missing: {screen}"
+        );
+        // Nothing selected, so the detail pane must not have been asked for a row.
+        assert_eq!(ls.selected(), None);
+    }
+
+    #[test]
+    fn each_card_carries_its_status_word() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // A NeedsTest task should print its tag ("needs test") on the card, so the
+        // status reads off the card itself and not only off the section header.
+        let row = Row {
+            id: "abcd1234".into(),
+            id_short: "abcd1234".into(),
+            name: "wire up the token store".into(),
+            branch: Some("main".into()),
+            last_activity: 0,
+            turn_started: 0,
+            status: Status::NeedsTest,
+            blocked_reason: None,
+            error: None,
+            pending: vec!["src/a.rs".into()],
+            total_edits: 1,
+            last_prompt: None,
+            is_orc: false,
+            continue_cmd: "claude --resume abcd1234".into(),
+            edits: std::collections::BTreeMap::new(),
+            previews: std::collections::BTreeMap::new(),
+        };
+        let view = View {
+            rows: std::slice::from_ref(&row),
+            selected: 0,
+            now: 0,
+            repo: "demo",
+            saved: false,
+            hidden_stale: 0,
+            clear_count: 0,
+            show_clear: false,
+            copied: false,
+            spawned: None,
+            pick: None,
+            anim_ms: 0,
+            local_offset: 0,
+            awaiting_log_dir: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut ls = ListState::default();
+        let mut geo = FrameGeometry::default();
+        terminal.draw(|f| draw(f, &view, &mut ls, &mut geo)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("needs test"),
+            "card is missing its status word:\n{screen}"
         );
     }
 
