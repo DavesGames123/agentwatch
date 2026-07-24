@@ -138,7 +138,12 @@ impl App {
     /// Runs once at startup; later refreshes preserve the selection by id, so the
     /// cursor is not yanked around as statuses churn.
     fn focus_first_actionable(&mut self) {
-        let order = [Status::Blocked, Status::Working, Status::NeedsTest];
+        let order = [
+            Status::Blocked,
+            Status::AwaitingAck,
+            Status::Working,
+            Status::NeedsTest,
+        ];
         for want in order {
             if let Some(i) = self.rows.iter().position(|r| r.status == want) {
                 self.selected = i;
@@ -205,10 +210,12 @@ impl App {
         let mut blocked_reason = s.blocked_reason(now, acked);
         let pending: Vec<String> = s.pending(acked, now).into_iter().map(String::from).collect();
 
-        // A dismissed "waiting on you" session drops off the board until the
-        // agent does something new. Compared against last_activity, not a flag,
-        // so a fresh turn (which advances last_activity) re-surfaces it.
-        if status == Status::Blocked {
+        // A dismissed "waiting on you" / "awaiting acknowledgement" session drops
+        // off the board until the agent does something new. Compared against
+        // last_activity, not a flag, so a fresh turn (which advances
+        // last_activity) re-surfaces it. Both waiting states share the gesture:
+        // dismissing is exactly "I have acknowledged this".
+        if matches!(status, Status::Blocked | Status::AwaitingAck) {
             if let Some(d) = self.store.dismissed_at(&s.id) {
                 if s.last_activity <= d {
                     status = Status::Clear;
@@ -270,14 +277,15 @@ impl App {
         self.sync_list_state();
     }
 
-    /// `a` is context-sensitive: on a waiting session it dismisses that waiting
-    /// state; on an untested session it acks the write-set. Both mean "I have
-    /// handled this", and both re-surface if the agent does something new.
+    /// `a` is context-sensitive: on a waiting session (Blocked or AwaitingAck) it
+    /// dismisses that waiting state; on an untested session it acks the write-set.
+    /// Both mean "I have handled this", and both re-surface if the agent does
+    /// something new.
     fn ack_selected(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        if row.status == Status::Blocked {
+        if matches!(row.status, Status::Blocked | Status::AwaitingAck) {
             let (id, ts) = (row.id.clone(), row.last_activity);
             self.store.dismiss(&id, ts);
         } else {
@@ -294,7 +302,7 @@ impl App {
         };
         let id = row.id.clone();
         // Undo whichever suppression applies to this row.
-        if row.status == Status::Blocked {
+        if matches!(row.status, Status::Blocked | Status::AwaitingAck) {
             self.store.undismiss(&id);
         } else {
             self.store.unack(&id);
@@ -680,6 +688,7 @@ fn print_once(app: &App) {
     }
     let errored = app.rows.iter().filter(|r| r.status == Status::Errored).count();
     let blocked = app.rows.iter().filter(|r| r.status == Status::Blocked).count();
+    let ack = app.rows.iter().filter(|r| r.status == Status::AwaitingAck).count();
     let needs = app.rows.iter().filter(|r| r.status == Status::NeedsTest).count();
     let mut banner = Vec::new();
     if errored > 0 {
@@ -687,6 +696,9 @@ fn print_once(app: &App) {
     }
     if blocked > 0 {
         banner.push(format!("{} WAITING ON YOU", blocked));
+    }
+    if ack > 0 {
+        banner.push(format!("{} to acknowledge", ack));
     }
     if needs > 0 {
         banner.push(format!("{} to test", needs));
@@ -697,6 +709,7 @@ fn print_once(app: &App) {
         let glyph = match r.status {
             Status::Errored => "✖",
             Status::Blocked => "▲",
+            Status::AwaitingAck => "❯",
             Status::NeedsTest => "█",
             Status::Working => "◐",
             Status::Delegated => "◇",

@@ -30,7 +30,8 @@ use crate::Row;
 /// the state without reading the label.
 const MAGENTA: Color = Color::Rgb(240, 90, 200); // errored — dead, needs rescue
 const RED: Color = Color::Rgb(255, 92, 110); // blocked on your answer
-const AMBER: Color = Color::Rgb(255, 176, 66); // awaiting acknowledgement
+const AMBER: Color = Color::Rgb(255, 176, 66); // awaiting acknowledgement — a glance and a reply
+const GOLD: Color = Color::Rgb(226, 202, 96); // awaiting testing — untested writes to run and verify
 const CYAN: Color = Color::Rgb(86, 205, 226); // agent still working
 const GREEN: Color = Color::Rgb(126, 200, 120); // nothing outstanding
 const INDIGO: Color = Color::Rgb(150, 140, 235); // delegated to a background agent
@@ -54,7 +55,8 @@ pub fn color_of(status: Status) -> Color {
     match status {
         Status::Errored => MAGENTA,
         Status::Blocked => RED,
-        Status::NeedsTest => AMBER,
+        Status::AwaitingAck => AMBER,
+        Status::NeedsTest => GOLD,
         Status::Working => CYAN,
         Status::Delegated => INDIGO,
         Status::Clear => DIM,
@@ -65,6 +67,8 @@ fn glyph_of(status: Status) -> &'static str {
     match status {
         Status::Errored => "✖",
         Status::Blocked => "▲",
+        // A prompt chevron: the agent is idle at the prompt, awaiting your reply.
+        Status::AwaitingAck => "❯",
         Status::NeedsTest => "█",
         Status::Working => "◐",
         Status::Delegated => "◇",
@@ -174,6 +178,7 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
 
 fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool) {
     let awaiting = v.rows.iter().filter(|r| r.status == Status::NeedsTest).count();
+    let ack = v.rows.iter().filter(|r| r.status == Status::AwaitingAck).count();
     let working = v.rows.iter().filter(|r| r.status == Status::Working).count();
     let delegated = v.rows.iter().filter(|r| r.status == Status::Delegated).count();
 
@@ -214,19 +219,32 @@ fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool) {
         top.push(Span::raw("  "));
     }
 
-    // The awaiting count is the whole reason the window is open, so it is a
-    // filled badge rather than another line of coloured text.
-    if awaiting > 0 {
+    // Agents stopped at the prompt wanting only a nod/reply -- amber, ahead of
+    // untested work: a stopped agent is idling a slot while a testable one is done.
+    if ack > 0 {
         top.push(Span::styled(
-            format!(" {} AWAITING YOU ", awaiting),
+            format!(" {} AWAITING ACK ", ack),
             Style::default()
                 .fg(INK)
                 .bg(AMBER)
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if blocked == 0 && errored == 0 {
+        top.push(Span::raw("  "));
+    }
+
+    // The untested-writes count is the whole reason the window is open, so it is
+    // a filled badge rather than another line of coloured text.
+    if awaiting > 0 {
+        top.push(Span::styled(
+            format!(" {} AWAITING TEST ", awaiting),
+            Style::default()
+                .fg(INK)
+                .bg(GOLD)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if ack == 0 && blocked == 0 && errored == 0 {
         // Only claim this when nothing at all wants a human -- saying "all
-        // caught up" beside a stalled or dead agent would be a lie.
+        // caught up" beside a stalled, idle, or dead agent would be a lie.
         top.push(Span::styled(
             " all caught up ",
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -443,7 +461,8 @@ fn section_header(status: Status, count: usize, width: usize) -> ListItem<'stati
     let (label, color) = match status {
         Status::Errored => ("ERRORED", MAGENTA),
         Status::Blocked => ("WAITING ON YOU", RED),
-        Status::NeedsTest => ("AWAITING ACKNOWLEDGEMENT", AMBER),
+        Status::AwaitingAck => ("AWAITING ACKNOWLEDGEMENT", AMBER),
+        Status::NeedsTest => ("AWAITING TESTING", GOLD),
         Status::Working => ("WORKING", CYAN),
         Status::Delegated => ("RUNNING A BACKGROUND AGENT", INDIGO),
         Status::Clear => ("CLEAR", DIM),
@@ -477,6 +496,9 @@ fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> 
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
         Status::Blocked => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        Status::AwaitingAck => Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
         Status::NeedsTest => Style::default()
@@ -518,7 +540,8 @@ fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> 
 
     let detail_color = match row.status {
         Status::Errored => MAGENTA,
-        Status::NeedsTest => AMBER,
+        Status::AwaitingAck => AMBER,
+        Status::NeedsTest => GOLD,
         Status::Delegated => INDIGO,
         _ => DIM,
     };
@@ -534,6 +557,12 @@ fn card(row: &Row, selected: bool, now: i64, width: usize) -> ListItem<'static> 
         row.blocked_reason
             .map(|r| r.short())
             .unwrap_or("waiting on you")
+            .to_string()
+    } else if row.status == Status::AwaitingAck {
+        // Idle at the prompt with nothing to test -- it wants a reply, not a run.
+        row.blocked_reason
+            .map(|r| r.short())
+            .unwrap_or("stopped — your move")
             .to_string()
     } else if row.status == Status::Delegated {
         "background agent running — resumes on its own".to_string()
@@ -738,6 +767,16 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64) {
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
             ));
         }
+        Status::AwaitingAck => {
+            let text = match row.blocked_reason {
+                Some(r) => format!("{} — reply in its terminal, or a to acknowledge", r.detail()),
+                None => "stopped at the prompt — waiting on your reply".to_string(),
+            };
+            lines.push(Line::styled(
+                text,
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
         Status::Working => lines.push(Line::styled(
             "agent is mid-turn — files still moving, do not test yet",
             Style::default().fg(CYAN),
@@ -753,7 +792,7 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64) {
         Status::NeedsTest => {
             lines.push(Line::styled(
                 format!("{} untested write(s) — press a when checked", row.pending.len()),
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
             ));
         }
     }
@@ -918,6 +957,12 @@ mod tests {
         // Errored must not read as Blocked -- the whole point is that a dead
         // agent is a different thing from a polite "waiting on you".
         assert_ne!(color_of(Status::Errored), color_of(Status::Blocked));
+        // Awaiting acknowledgement (a reply) and awaiting testing (a run) are the
+        // distinction this board exists to draw -- they must not share a hue, nor
+        // a glyph, and neither may read as the "stuck on a question" Blocked.
+        assert_ne!(color_of(Status::AwaitingAck), color_of(Status::NeedsTest));
+        assert_ne!(color_of(Status::AwaitingAck), color_of(Status::Blocked));
+        assert_ne!(glyph_of(Status::AwaitingAck), glyph_of(Status::NeedsTest));
     }
 
     #[test]

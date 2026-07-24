@@ -138,17 +138,27 @@ pub enum Status {
     /// and it was previously indistinguishable from a polite "waiting on you".
     Errored,
     /// Asked a question (AskUserQuestion / ExitPlanMode) that has no tool_result
-    /// yet. The agent has stopped and is burning wall-clock waiting on a human.
+    /// yet, or an unresolved tool call gone quiet (a probable permission prompt).
+    /// The agent has stopped and *cannot proceed* until a human answers it.
     /// Ranks above everything else: nothing else on screen is costing time right
     /// now the way this is.
     Blocked,
+    /// The turn ended cleanly and the agent is idle at the prompt with *nothing to
+    /// test* -- it wrote no repo edits this turn, it simply handed the conversation
+    /// back and is waiting for your reply or your nod. Distinct from `Blocked` (a
+    /// question or approval that has it genuinely stuck) and from `NeedsTest`
+    /// (edits to verify): this one wants only acknowledgement -- a glance and a
+    /// reply -- so a supervisor triaging the board can tell "look at this" apart
+    /// from "run and verify this".
+    AwaitingAck,
     /// Mid-turn -- the agent is computing.
     Working,
     /// The turn ended, but the session spun up a background agent and is waiting
     /// on *it*, not on you. It resumes on its own when the agent reports back, so
     /// it must never be mistaken for the "stopped, your move" that wants a human.
     Delegated,
-    /// Idle, and has repo edits you have not acked at their current timestamp.
+    /// Idle, and has repo edits you have not acked at their current timestamp --
+    /// work a human still has to run and verify.
     NeedsTest,
     /// Idle with nothing outstanding.
     Clear,
@@ -159,25 +169,29 @@ impl Status {
         match self {
             Status::Errored => "ERRORED",
             Status::Blocked => "WAITING ON YOU",
+            Status::AwaitingAck => "AWAITING ACK",
             Status::Working => "working",
             Status::Delegated => "running a background agent",
-            Status::NeedsTest => "NEEDS TEST",
+            Status::NeedsTest => "AWAITING TEST",
             Status::Clear => "clear",
         }
     }
 
     /// Sort rank: what should demand attention first. An errored agent outranks a
-    /// blocked one because it will not recover on its own; a blocked agent
-    /// outranks untested work because it is stalled until you act. Delegated work
+    /// blocked one because it will not recover on its own; a blocked agent (stuck
+    /// on a question) outranks one merely awaiting acknowledgement, which in turn
+    /// outranks untested work -- both are stalled on you, but a stopped agent is
+    /// burning a slot while done-but-untested work simply sits. Delegated work
     /// wants nothing from you, so it sits below everything actionable.
     pub fn rank(self) -> u8 {
         match self {
             Status::Errored => 0,
             Status::Blocked => 1,
-            Status::NeedsTest => 2,
-            Status::Working => 3,
-            Status::Delegated => 4,
-            Status::Clear => 5,
+            Status::AwaitingAck => 2,
+            Status::NeedsTest => 3,
+            Status::Working => 4,
+            Status::Delegated => 5,
+            Status::Clear => 6,
         }
     }
 }
@@ -335,13 +349,19 @@ impl Session {
             return Status::Errored;
         }
         if let Some(reason) = self.blocked_reason(now, acked) {
-            // A background agent it spawned is still out working: the turn ends
-            // the same way an idle-at-prompt turn does, but nothing is on you --
-            // it resumes itself when the agent reports back. Only that ambiguous
-            // AwaitingInput is reinterpreted; a real Question or a pending
-            // approval still means a human is genuinely needed.
-            if reason == BlockedReason::AwaitingInput && self.agent_launched_ms > 0 {
-                return Status::Delegated;
+            // An idle-at-prompt turn (AwaitingInput) is not "stuck": it ended
+            // clean with nothing to test and simply wants your attention. Split
+            // three ways by what that attention actually is:
+            //   * spun up a background agent -> waiting on *it*, not you (Delegated);
+            //     it resumes itself when the agent reports back.
+            //   * otherwise -> AwaitingAck: a supervisor need only glance and reply.
+            // A real Question or a probable approval is different in kind -- the
+            // agent cannot proceed until a human answers -- so it stays Blocked.
+            if reason == BlockedReason::AwaitingInput {
+                if self.agent_launched_ms > 0 {
+                    return Status::Delegated;
+                }
+                return Status::AwaitingAck;
             }
             return Status::Blocked;
         }
@@ -543,7 +563,9 @@ mod tests {
     fn idle_at_prompt_after_a_finished_turn_is_surfaced() {
         // The warpcore-dossier case: turn ended, no edits, no pending tool. The
         // agent is sitting at the prompt waiting for a typed reply, and the old
-        // model dropped this as Clear.
+        // model dropped this as Clear. It wants only a glance and a reply, so it
+        // is AwaitingAck -- not Blocked (which is reserved for an agent that
+        // cannot proceed until a human answers).
         let now = 1_000_000_000i64;
         let mut s = Session::default();
         s.turn_complete = true;
@@ -553,7 +575,7 @@ mod tests {
             s.blocked_reason(now, None),
             Some(BlockedReason::AwaitingInput)
         );
-        assert_eq!(s.status(now, None), Status::Blocked);
+        assert_eq!(s.status(now, None), Status::AwaitingAck);
 
         // But an ancient finished session is not "waiting" -- it is history, and
         // must fall through to Clear so it does not clog the attention band.
@@ -563,18 +585,42 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_ack_and_needs_test_are_distinct_supervisor_states() {
+        // The whole point of the split: a supervisor triaging the board must be
+        // able to tell "the agent stopped and wants a reply" apart from "the
+        // agent left code I have to run and verify".
+        let now = 1_000_000_000i64;
+
+        // Turn ended, NO edits -> just wants acknowledgement.
+        let mut idle = Session::default();
+        idle.turn_complete = true;
+        idle.last_activity = now - 5_000;
+        assert_eq!(idle.status(now, None), Status::AwaitingAck);
+
+        // Same finished turn, but it WROTE a file -> that is testing, not acking.
+        let mut wrote = idle.clone();
+        wrote.edits.insert("src/a.rs".into(), now - 5_000);
+        assert_eq!(wrote.status(now, None), Status::NeedsTest);
+
+        // The two are genuinely different states, and the tester ranks below the
+        // ack -- a stopped agent burns a slot, done-but-untested work only sits.
+        assert_ne!(idle.status(now, None), wrote.status(now, None));
+        assert!(Status::AwaitingAck.rank() < Status::NeedsTest.rank());
+    }
+
+    #[test]
     fn a_spawned_background_agent_is_delegated_not_your_move() {
         let now = 1_000_000_000i64;
         let mut s = Session::default();
         s.turn_complete = true;
         s.last_activity = now - 5_000;
 
-        // Without a launch, an idle finished turn is the ambiguous "your move".
+        // Without a launch, an idle finished turn just wants a nod (AwaitingAck).
         assert_eq!(
             s.blocked_reason(now, None),
             Some(BlockedReason::AwaitingInput)
         );
-        assert_eq!(s.status(now, None), Status::Blocked);
+        assert_eq!(s.status(now, None), Status::AwaitingAck);
 
         // Having spun up a background agent, the session is waiting on the agent,
         // not on you -- it resumes itself, so it must not read as "your move".
