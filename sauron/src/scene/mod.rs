@@ -28,28 +28,40 @@
 //! across the room without reading a word, and a scene that only got slower
 //! would not manage that -- slow still reads as watching.
 //!
+//! **The header says which repo it is watching, in letters you can read from
+//! across the room.** That is the header's first job -- sauron is normally run
+//! several at a time, one pane per repo, and a board that identifies itself in
+//! nine dim cells is a board you can act on believing it is a different one.
+//! So the project's name goes up in three-row block letters ([`sign`]) with its
+//! path faint above, and everything else on the header lays out around it: the
+//! mountain yields its columns to the name, and the engraved verse only appears
+//! in whatever room is left over.
+//!
 //! grep targets:
 //!   struct World       -- what the agents are doing; every drawing takes one
+//!   struct Watching    -- which project the board is on; the header's headline
 //!   fn scene           -- the compact five-line header (no tower below)
 //!   fn crown           -- the header when the whole tower is drawn below it
 //!   fn tower_shaft     -- the descending stone shaft (right column of the list)
 //!   fn battle_ground   -- the flared foot and the full-width war at its base
 //!   fn doom_left       -- where the mountain fits, and when it does not
 //!   fn place_eye       -- stamp the Eye sprite into a header grid
-//!   fn place_verse     -- the engraving, clipped to whatever room is left
-//!   mod eye / doom / cast / war / runes / paint
+//!   fn place_watching  -- the project name, its path, and any leftover verse
+//!   mod eye / doom / cast / war / runes / sign / paint
 
 mod cast;
 mod doom;
 mod eye;
 mod paint;
 mod runes;
+mod sign;
 mod war;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 
-use crate::ui::{DIM, EMBER, FLAME, FLARE, RUNE};
+use crate::model::truncate_left;
+use crate::ui::{BLUE, DIM, EMBER, FLAME, FLARE, RUNE};
 use cast::Lane;
 use doom::DOOM_W;
 use eye::Pose;
@@ -76,17 +88,8 @@ const EYE_MARGIN: usize = 15;
 /// Columns between the mountain and the Eye. Enough that they read as two things
 /// on a skyline rather than one silhouette.
 const DOOM_GAP: i32 = 3;
-/// Columns the engraving needs before the mountain is worth drawing at all:
-/// enough for the longest line -- "the doors of durin, lord of moria" -- to
-/// render whole. In practice that puts the mountain on terminals 70 columns and
-/// wider.
-///
-/// The mountain takes its columns from the verse, so a smaller number here does
-/// not buy a mountain on a narrow terminal -- it buys a mountain next to
-/// "speak, friend, and", which reads as a bug in the engraving rather than as a
-/// deliberately compact header. A test pins this against `runes::VERSES`, so
-/// adding a longer line moves the threshold instead of silently truncating one.
-const MIN_VERSE: i32 = 33;
+/// Columns kept clear at the left edge before the name starts.
+const SIGN_X: i32 = 1;
 
 /// What the agents are doing, which is the only input the scene has besides the
 /// clock.
@@ -147,14 +150,30 @@ const SPIDER: Color = Color::Rgb(126, 104, 116); // Shelob
 
 // --- layout --------------------------------------------------------------------
 
+/// Which project this board is watching -- the header's headline.
+///
+/// Two fields because the name alone is ambiguous exactly where it matters
+/// most: two checkouts of the same repo, or two worktrees of it, have the same
+/// directory name, and those are precisely the pair of boards a user is most
+/// likely to confuse. The name is what you read from across the room; the path
+/// is what you check when the answer surprises you.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Watching<'a> {
+    /// The repo's directory name. Goes up in block letters.
+    pub name: &'a str,
+    /// Its path, home-shortened, faint above the name.
+    pub path: &'a str,
+}
+
 /// Where Orodruin sits in a `w`-wide header, or `None` if it does not fit.
 ///
-/// The mountain takes its columns from the engraving, so on a narrow terminal
-/// something has to give, and it is the mountain: a verse clipped to five runes
-/// reads as a rendering bug, while no mountain at all reads as no mountain.
-fn doom_left(eye_left: i32) -> Option<i32> {
+/// `need` is the columns the project's name has already claimed, and the
+/// mountain only gets what is left over. That ordering is the point: the name
+/// is the one thing on this header that is information, so a terminal too
+/// narrow for both loses the mountain, never a letter of the name.
+fn doom_left(eye_left: i32, need: i32) -> Option<i32> {
     let left = eye_left - DOOM_GAP - DOOM_W as i32;
-    (left >= MIN_VERSE + 2).then_some(left)
+    (left >= need + SIGN_X + 2).then_some(left)
 }
 
 /// Stamp the Eye into a five-row header grid with its left edge at `eye_left`.
@@ -180,14 +199,84 @@ fn place_eye(grid: &mut [Vec<Cell>], eye_left: i32, pose: Pose, pupil: usize, ms
     }
 }
 
-/// The engraving, top-left: runic script on row 1, faint gloss on row 0. Clipped
-/// at whatever stands to its right -- the mountain when there is one, the Eye
-/// when there is not -- so it never runs into either.
-fn place_verse(grid: &mut [Vec<Cell>], ms: u64, stop: i32) {
-    let room = (stop.max(2) as usize).saturating_sub(2);
-    let (words, gloss) = runes::verse(ms);
-    stamp(&mut grid[1], 1, &clip(&runes::runic(words), room), Style::default().fg(RUNE));
-    stamp(&mut grid[0], 1, &clip(gloss, room), Style::default().fg(DIM));
+/// How the header intends to write the project's name, decided before anything
+/// is drawn because the mountain's columns depend on the answer.
+enum Sign {
+    /// Three rows of block letters -- the whole point of the header. Carries
+    /// the kerning it was measured at, so the drawing cannot disagree with the
+    /// width the mountain was laid out around.
+    Block { w: usize, kern: usize },
+    /// No room for that, so one row of capitals instead. Still the name, still
+    /// the brightest thing on the left of the header; just not shoutable.
+    Plain(usize),
+}
+
+impl Sign {
+    /// Columns it will claim.
+    fn width(&self) -> i32 {
+        match *self {
+            Sign::Block { w, .. } | Sign::Plain(w) => w as i32,
+        }
+    }
+}
+
+/// Pick the largest form of `name` that fits the columns left of the Eye:
+/// block letters airy, then block letters tight, then small capitals.
+///
+/// Measured against `eye_left` -- the room available with *no* mountain --
+/// rather than against the room beside one, so a name that only fits on a bare
+/// header still gets its block letters and the mountain is what goes.
+fn plan_sign(name: &str, eye_left: i32) -> Sign {
+    let room = (eye_left - SIGN_X - 1).max(1) as usize;
+    for kern in sign::KERNS {
+        let w = sign::width(name, kern);
+        if w <= room {
+            return Sign::Block { w, kern };
+        }
+    }
+    Sign::Plain(name.chars().count().min(room))
+}
+
+/// Write the project's name across the left of the header, its path faint above
+/// it, and -- only in whatever room is left over on the path's row -- a line of
+/// the engraving.
+///
+/// The verse used to own rows 0 and 1 outright. It is flavour, and it was
+/// sitting in the only part of the header wide enough to say which repo this
+/// is, so it now takes what is left rather than what it wants. It is dropped
+/// whole rather than clipped: half an engraving reads as a rendering fault,
+/// where no engraving reads as a narrow terminal.
+fn place_watching(grid: &mut [Vec<Cell>], w: &Watching, plan: &Sign, ms: u64, stop: i32) {
+    let room = (stop - SIGN_X).max(1) as usize;
+
+    // Row 0: the path, dim, then the engraving right-aligned in the slack. The
+    // path is cut from the *front* -- its tail is the part that distinguishes
+    // two checkouts, and "/Users/somebody/co…" distinguishes nothing.
+    let path = truncate_left(w.path, room);
+    let used = path.chars().count();
+    stamp(&mut grid[0], SIGN_X, &path, Style::default().fg(DIM));
+    let verse = runes::runic(runes::verse(ms).0);
+    let vw = verse.chars().count();
+    if room >= used + vw + 3 {
+        let x = SIGN_X + (room - vw) as i32;
+        stamp(&mut grid[0], x, &verse, Style::default().fg(RUNE));
+    }
+
+    // Rows 1-3: the name itself.
+    let style = Style::default().fg(BLUE);
+    match *plan {
+        Sign::Block { kern, .. } => {
+            for (r, row) in sign::render(w.name, kern).iter().enumerate() {
+                stamp(&mut grid[r + 1], SIGN_X, row, style);
+            }
+        }
+        // Bold, because at one row it is competing with the mountain beside it
+        // for the eye and it has to win.
+        Sign::Plain(_) => {
+            let flat = clip(&w.name.to_uppercase(), room);
+            stamp(&mut grid[2], SIGN_X, &flat, style.add_modifier(Modifier::BOLD));
+        }
+    }
 }
 
 /// The Eye's pose when nothing in particular is crossing beneath it: banked and
@@ -203,7 +292,7 @@ fn resting_pose(ms: u64, world: World) -> (Pose, usize) {
 // --- the compact header --------------------------------------------------------
 
 /// Compose the five header lines for a terminal `width` at time `ms`.
-pub fn scene(width: usize, ms: u64, world: World) -> Vec<Line<'static>> {
+pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
     let w = width.max(20);
     let mut grid: Vec<Vec<Cell>> = (0..5).map(|_| blank_row(w)).collect();
     let eye_left = w.saturating_sub(EYE_MARGIN) as i32;
@@ -215,9 +304,10 @@ pub fn scene(width: usize, ms: u64, world: World) -> Vec<Line<'static>> {
         *cell = ('▁', ground_style);
     }
 
-    // Orodruin, behind everything: the Eye is clipped over it, the verse stops
+    // Orodruin, behind everything: the Eye is clipped over it, the name stops
     // short of it, and anyone crossing walks in front of its foot.
-    let doom_x = doom_left(eye_left);
+    let plan = plan_sign(watching.name, eye_left);
+    let doom_x = doom_left(eye_left, plan.width());
     if let Some(x) = doom_x {
         doom::draw(&mut grid, x, ms, world);
     }
@@ -253,7 +343,7 @@ pub fn scene(width: usize, ms: u64, world: World) -> Vec<Line<'static>> {
         }
     }
 
-    place_verse(&mut grid, ms, doom_x.unwrap_or(eye_left));
+    place_watching(&mut grid, &watching, &plan, ms, doom_x.unwrap_or(eye_left));
     grid.into_iter().map(row_to_line).collect()
 }
 
@@ -263,19 +353,20 @@ pub fn scene(width: usize, ms: u64, world: World) -> Vec<Line<'static>> {
 /// the verse exactly as [`scene`] builds them, but with the flared foot swapped
 /// for a shaft segment so the stone keeps descending into [`tower_shaft`]
 /// instead of stopping. No ground and no company here -- those live at the foot.
-pub fn crown(width: usize, ms: u64, world: World) -> Vec<Line<'static>> {
+pub fn crown(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
     let w = width.max(20);
     let mut grid: Vec<Vec<Cell>> = (0..5).map(|_| blank_row(w)).collect();
     let eye_left = w.saturating_sub(EYE_MARGIN) as i32;
 
-    let doom_x = doom_left(eye_left);
+    let plan = plan_sign(watching.name, eye_left);
+    let doom_x = doom_left(eye_left, plan.width());
     if let Some(x) = doom_x {
         doom::draw(&mut grid, x, ms, world);
     }
 
     let (pose, pupil) = resting_pose(ms, world);
     place_eye(&mut grid, eye_left, pose, pupil, ms, world.repose, false);
-    place_verse(&mut grid, ms, doom_x.unwrap_or(eye_left));
+    place_watching(&mut grid, &watching, &plan, ms, doom_x.unwrap_or(eye_left));
     grid.into_iter().map(row_to_line).collect()
 }
 
@@ -345,6 +436,18 @@ mod tests {
     const PAUSED: World = World { working: 0, repose: false };
     const REPOSE: World = World { working: 0, repose: true };
 
+    /// The board most of these tests are watching. Shadows `super::scene` /
+    /// `super::crown` so a test that does not care which repo is on the header
+    /// does not have to say -- the ones that do care call through explicitly.
+    const DEMO: Watching = Watching { name: "demo", path: "~/src/demo" };
+
+    fn scene(w: usize, ms: u64, world: World) -> Vec<Line<'static>> {
+        super::scene(w, ms, world, DEMO)
+    }
+    fn crown(w: usize, ms: u64, world: World) -> Vec<Line<'static>> {
+        super::crown(w, ms, world, DEMO)
+    }
+
     fn line_width(l: &Line) -> usize {
         l.spans.iter().map(|s| s.content.chars().count()).sum()
     }
@@ -377,52 +480,110 @@ mod tests {
     }
 
     #[test]
-    fn the_mountain_shows_when_there_is_room_and_yields_to_the_verse_when_not() {
-        // Wide: cone and plume both present.
+    fn the_mountain_shows_when_there_is_room_and_yields_to_the_name_when_not() {
+        // Wide: cone and plume both present beside a short name.
         let wide = text(&scene(100, 0, VIGIL));
         assert!(wide.contains('▟'), "no mountain on a wide header");
         assert!(wide.contains('▓') || wide.contains('▒'), "no plume: {wide}");
-        // Narrow: the mountain is what goes, and the engraving survives.
-        assert_eq!(doom_left(20), None);
+        // A long name on that same 100 columns takes the mountain's ground: the
+        // name is information and the mountain is scenery, so this is the order
+        // they lose in.
+        let long = Watching { name: "agentwatch-frontend", path: "~/src/x" };
+        let crowded = text(&super::scene(100, 0, VIGIL, long));
+        // The plume, not the cone: the cone's glyphs are shared with the tower's
+        // flared foot, which is drawn either way.
+        assert!(
+            !crowded.contains('▓') && !crowded.contains('▒') && !crowded.contains('░'),
+            "the mountain crowded out the name: {crowded}"
+        );
+        // ...and the name is all there, not clipped to fit around it.
+        assert!(crowded.contains(&sign::render("agentwatch-frontend", 1)[1]));
+        // Narrow: the mountain is what goes there too.
         let narrow = text(&scene(40, 0, VIGIL));
         assert!(!narrow.contains('▒') && !narrow.contains('░'), "smoke on a narrow header");
-        assert!(narrow.contains('ᛗ') || narrow.contains('ᛖ'), "the verse was lost: {narrow}");
+    }
+
+    /// The header's whole job. A board that cannot be told from the board in the
+    /// next pane is worse than no board, because it is one you will act on.
+    #[test]
+    fn the_header_writes_the_project_name_large_and_says_where_it_lives() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        for build in [super::scene, super::crown] {
+            let head = text(&build(120, 0, VIGIL, w));
+            // Three rows of block letters, each row present in full.
+            for row in sign::render("agentwatch", 1) {
+                assert!(head.contains(&row), "the name is not in block letters: {head}");
+            }
+            // And the path, which is the half that disambiguates two checkouts.
+            assert!(head.contains("~/Downloads/agentwatch"), "no path: {head}");
+        }
+    }
+
+    /// A sauron pane in a four-agent workspace is 52 columns. That is the width
+    /// this tool is used at most of the time, and it is exactly where the airy
+    /// setting stops fitting -- so it is the one width the block letters have to
+    /// survive, and the condensed rung of the ladder exists for it.
+    #[test]
+    fn the_name_stays_in_block_letters_at_a_workspace_pane_width() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        let pane = text(&super::scene(52, 0, VIGIL, w));
+        assert!(
+            pane.contains(&sign::render("agentwatch", 0)[1]),
+            "the name dropped out of block letters at 52 columns: {pane}"
+        );
+    }
+
+    /// Every terminal wide enough to run this tool names its repo somewhere on
+    /// the header -- in capitals when there is no room for the block form, but
+    /// never nowhere.
+    #[test]
+    fn a_narrow_header_shrinks_the_name_rather_than_dropping_it() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        let narrow = text(&super::scene(40, 0, VIGIL, w));
+        assert!(!narrow.contains(&sign::render("agentwatch", 0)[0]), "block letters fit at 40?");
+        assert!(narrow.contains("AGENTWATCH"), "the name vanished at 40 columns: {narrow}");
+        // Small enough that even the capitals have to be cut -- what survives is
+        // still the front of the name, not nothing.
+        let tiny = text(&super::scene(24, 0, VIGIL, w));
+        assert!(tiny.contains("AGEN"), "nothing left of the name at 24 columns: {tiny}");
     }
 
     #[test]
-    fn the_mountains_threshold_still_clears_the_longest_verse() {
-        // MIN_VERSE is the promise that a header showing a mountain also shows a
-        // whole engraving. Adding a longer line has to move the threshold, and
-        // this is the only thing that will say so.
-        for (words, gloss) in runes::VERSES {
-            assert!(
-                gloss.chars().count() as i32 <= MIN_VERSE,
-                "gloss {gloss:?} is longer than MIN_VERSE"
-            );
-            assert!(
-                runes::runic(words).chars().count() as i32 <= MIN_VERSE,
-                "runes for {words:?} are longer than MIN_VERSE"
-            );
+    fn the_engraving_takes_what_is_left_over_and_is_never_half_drawn() {
+        // Wide header, short name and path: room for the verse beside them.
+        let roomy = Watching { name: "ab", path: "~/x" };
+        let wide = text(&super::scene(120, 0, VIGIL, roomy));
+        assert!(
+            wide.contains(&runes::runic(runes::VERSES[0].0)),
+            "the engraving was cut short instead of dropped: {wide}"
+        );
+        // A path long enough to fill the row drops the verse whole rather than
+        // clipping it -- half an engraving reads as a rendering fault.
+        let hog = Watching { name: "ab", path: "~/a/very/long/checkout/path/that/eats/the/row" };
+        let tight = text(&super::scene(80, 0, VIGIL, hog));
+        for ch in tight.chars() {
+            assert!(!('ᚠ'..='ᛰ').contains(&ch), "a stray rune survived: {tight}");
         }
     }
 
     #[test]
-    fn the_verse_never_runs_into_the_mountain() {
-        // The engraving is clipped at the mountain's left edge, not the Eye's.
+    fn nothing_on_the_left_of_the_header_runs_into_the_mountain() {
+        // Name, path and verse are all clipped at the mountain's left edge, not
+        // the Eye's -- the mountain is drawn first and everything else must stop
+        // short of it.
         let eye_left = 100i32 - EYE_MARGIN as i32;
-        let doom_x = doom_left(eye_left).expect("100 columns fits a mountain");
+        let plan = plan_sign(DEMO.name, eye_left);
+        let doom_x = doom_left(eye_left, plan.width()).expect("100 columns fits a mountain");
         for ms in [0u64, 30_000, 60_000] {
-            for row in scene(100, ms, VIGIL).iter().take(2) {
-                let cells: Vec<char> = line_text(row).chars().collect();
-                for (i, ch) in cells.iter().enumerate() {
-                    if *ch != ' ' && (i as i32) < doom_x {
+            for row in scene(100, ms, VIGIL).iter().take(4) {
+                for (i, ch) in line_text(row).chars().enumerate() {
+                    if (i as i32) < doom_x || ch == ' ' {
                         continue;
                     }
-                    // Past the mountain's left edge nothing of the verse remains:
-                    // runes are the only thing the verse draws.
+                    // Past that edge, only the mountain and the Eye draw.
                     assert!(
-                        !('ᚠ'..='ᛰ').contains(ch),
-                        "a rune at column {i} collides with the mountain at ms={ms}"
+                        !('ᚠ'..='ᛰ').contains(&ch) && !ch.is_ascii_alphanumeric(),
+                        "the left of the header spills into the mountain at column {i}, ms={ms}"
                     );
                 }
             }

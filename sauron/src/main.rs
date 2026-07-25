@@ -557,6 +557,7 @@ fn main() -> std::io::Result<()> {
         let rows = app.board.rows.clone();
         let selected = app.selected;
         let label = app.board.repo_label.clone();
+        let repo_path = model::tilde(app.board.repo_root());
         let saved = app.saved_flash();
         let copied = app.copied_flash();
         let spawned = app.spawn_flash().map(|(m, ok)| (m.to_string(), ok));
@@ -583,6 +584,7 @@ fn main() -> std::io::Result<()> {
             selected,
             now,
             repo: &label,
+            repo_path: &repo_path,
             saved,
             hidden_stale: app.board.hidden_stale,
             clear_count: app.board.clear_count,

@@ -137,6 +137,32 @@ cp sauron/target/release/sauron sauron/target/release/clip /usr/local/bin/
 
 ---
 
+## 🏷 Which repo am I looking at
+
+The header answers that before it reports anything else. The project's name is
+set in three rows of block letters across the top left, with its path — home
+collapsed to `~` — faint above it:
+
+```
+ ~/Downloads/agentwatch                        ᛈᛖᛞᛟ᛬ᛗᛖᛚᛚᛟᚾ᛬ᚨ᛬ᛗᛁᚾᚾᛟ    · ▓▒ ▒░░░
+ ╔═╗ ╔═╗ ╔═╗ ╔╗╔ ╔╦╗ ╦ ╦ ╦ ╔═╗ ╔╦╗ ╔═╗ ╦ ╦                            ▗▟▀▙▖
+ ╠═╣ ║ ╦ ║╣  ║║║  ║  ║ ║ ║ ╠═╣  ║  ║   ╠═╣                          ▗▟█████▙▖
+ ╩ ╩ ╚═╝ ╚═╝ ╝╚╝  ╩  ╚═╩═╝ ╩ ╩  ╩  ╚═╝ ╩ ╩                        ▗▟█╲████╱███▙▖
+```
+
+Sauron is normally run several at a time, one pane per project, and the name
+used to be nine dim cells beside the word `sauron`. A board you can misread at a
+glance is a board you will act on believing it is a different one — and the two
+boards easiest to confuse are two checkouts of the same repo, which is why the
+path is printed under the name rather than instead of it.
+
+It shrinks in steps rather than disappearing: airy block letters, then condensed
+block letters (which is what fits a 52-column workspace pane), then small
+capitals, then the front of the name. There is no width at which the header
+declines to say which repo it is on.
+
+---
+
 ## 🌋 The skyline — Mordor answers to the board
 
 The chrome is a gauge, not decoration. Everything above and below the session
@@ -183,10 +209,13 @@ is reproducible in a test — and no company ever shows up twice in a row.
 > lidded Eye above an amber `AWAITING ACK` badge would be the chrome calling the
 > badge a liar, and you'd have no way to tell which one to believe.
 
-The mountain needs 70 columns to appear; below that the engraving keeps the
-space, because a verse clipped mid-word reads as a bug and a missing mountain
-reads as a missing mountain. Below 24 rows the header collapses to a one-line
-Eye, and the tower and its war are only drawn when the terminal can spare them.
+Everything on the header lays out around the project's name, in this order: the
+name first, the mountain in whatever columns are left, the engraving in whatever
+is left after that. The mountain is the one that goes on a narrow terminal —
+it is scenery, and the name is the only thing up there that is information.
+Below 24 rows the header collapses to a one-line Eye and the name moves into a
+filled badge on the status line; the tower and its war are only drawn when the
+terminal can spare them.
 
 ---
 
@@ -587,6 +616,7 @@ sauron/src/
     cast.rs     ·    who crosses the plain, and on which of the two schedules
     war.rs      ·    the melee at the tower's foot, sized by the working count
     runes.rs    ·    the engraved Sindarin and its transliteration
+    sign.rs     ·    the block-letter font the project's name is set in
     paint.rs    ·    cell grid, transparent sprite stamping, span collapse
   clip/         ·  SQLite-compatible Agent Clipboard store + CLI
   handoff.rs    ·  strict opt-in clipboard pass lifecycle

@@ -594,12 +594,41 @@ pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A path with the user's home collapsed to `~`. Purely for display: the header
+/// prints the watched repo's path so two same-named checkouts can be told
+/// apart, and `/Users/somebody/` at the front of it is the part that never
+/// distinguishes anything while costing the most columns.
+pub fn tilde(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let home = crate::scan::home();
+    let home = home.to_string_lossy();
+    match s.strip_prefix(home.as_ref()) {
+        Some(rest) if !home.is_empty() && home != "." => format!("~{rest}"),
+        _ => s.into_owned(),
+    }
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
     let head: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", head.trim_end())
+}
+
+/// [`truncate`], from the other end: keeps the tail and marks the cut in front.
+///
+/// For paths, which is the only thing that uses it. The front of a path is the
+/// part every path on the machine has in common, so cutting from the back --
+/// `~/Documents/checkou…` -- throws away the only characters that were telling
+/// two boards apart.
+pub fn truncate_left(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n + 1 - max.max(1)).collect();
+    format!("…{tail}")
 }
 
 #[cfg(test)]
@@ -898,5 +927,25 @@ mod tests {
             s.status(1_000_000 + STUCK_AFTER_MS + 1, None),
             Status::NeedsTest
         );
+    }
+
+    /// The header prints the watched repo's path so two same-named checkouts can
+    /// be told apart -- which only works if the end of the path is what
+    /// survives the cut.
+    #[test]
+    fn a_clipped_path_keeps_the_end_that_identifies_it() {
+        assert_eq!(truncate_left("~/src/demo", 20), "~/src/demo");
+        assert_eq!(truncate_left("~/work/clients/acme/api", 12), "…ts/acme/api");
+        // Never wider than asked, whatever it had to throw away.
+        for max in 1..30 {
+            assert!(truncate_left("~/a/very/long/path/indeed", max).chars().count() <= max.max(1));
+        }
+    }
+
+    #[test]
+    fn tilde_collapses_home_and_leaves_everything_else_alone() {
+        let home = crate::scan::home();
+        assert_eq!(tilde(&home.join("src/demo")), "~/src/demo");
+        assert_eq!(tilde(std::path::Path::new("/opt/demo")), "/opt/demo");
     }
 }

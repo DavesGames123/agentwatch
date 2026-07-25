@@ -6,9 +6,15 @@
 //! lines regardless of state, so fifteen idle sessions buried the one that
 //! needed a human.
 //!
+//! The header answers a question before it reports anything: *which repo is
+//! this?* Sauron is run several at a time, one pane per project, so a board
+//! that names itself quietly is a board you will act on believing it is a
+//! different one. The name goes up in block letters when the terminal can spare
+//! the rows (see `scene::Watching`), and in a filled badge when it cannot.
+//!
 //! grep targets:
 //!   fn draw            -- top-level layout
-//!   fn header          -- repo name and the status tally
+//!   fn header          -- the status tally, and how the repo gets named
 //!   fn section_header  -- coloured rule introducing each status group
 //!   fn card            -- one session -> multi-line ListItem
 //!   fn wrap_prompt     -- first lines of your last ask, wrapped for a card
@@ -36,7 +42,7 @@ const CYAN: Color = Color::Rgb(86, 205, 226); // agent still working
 const GREEN: Color = Color::Rgb(126, 200, 120); // nothing outstanding
 const INDIGO: Color = Color::Rgb(150, 140, 235); // delegated to a background agent
 const ORC: Color = Color::Rgb(122, 158, 74); // one of sauron's own maintenance orcs
-const BLUE: Color = Color::Rgb(120, 170, 255); // chrome / repo identity
+pub(crate) const BLUE: Color = Color::Rgb(120, 170, 255); // chrome / repo identity
 pub(crate) const DIM: Color = Color::Rgb(88, 94, 104);
 const INK: Color = Color::Rgb(18, 20, 24); // text on a filled badge
 const SAID: Color = Color::Rgb(158, 166, 178); // your last words, quoted back on a card
@@ -80,7 +86,13 @@ pub struct View<'a> {
     pub rows: &'a [Row],
     pub selected: usize,
     pub now: i64,
+    /// The watched repo's directory name -- the header's headline, drawn in
+    /// block letters when the terminal is tall enough for the full crown.
     pub repo: &'a str,
+    /// Its path, home-shortened. Two worktrees of one repo share a name, and
+    /// the pair of boards a user is most likely to mix up is exactly that pair,
+    /// so the name never appears without the path under it.
+    pub repo_path: &'a str,
     pub saved: bool,
     pub hidden_stale: usize,
     pub clear_count: usize,
@@ -324,14 +336,24 @@ fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool, world: crate::scene
     let working = v.rows.iter().filter(|r| r.status == Status::Working).count();
     let delegated = v.rows.iter().filter(|r| r.status == Status::Delegated).count();
 
-    let mut top = vec![
-        Span::styled(
-            format!(" {} ", v.repo),
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("sauron", Style::default().fg(DIM)),
-        Span::raw("   "),
-    ];
+    // Whether the crown -- and with it the name in block letters -- is drawn
+    // below this line. When it is, repeating the name here in small type would
+    // be the same word twice in five rows; when it is not, this line is the
+    // only place the repo is named, so it gets a filled badge rather than the
+    // dim text it used to carry.
+    let signed = area.height > crate::scene::HEIGHT;
+    let mut top = Vec::new();
+    if signed {
+        top.push(Span::styled("sauron", Style::default().fg(DIM)));
+    } else {
+        top.push(Span::styled(
+            format!(" {} ", v.repo.to_uppercase()),
+            Style::default().fg(INK).bg(BLUE).add_modifier(Modifier::BOLD),
+        ));
+        top.push(Span::raw(" "));
+        top.push(Span::styled("sauron", Style::default().fg(DIM)));
+    }
+    top.push(Span::raw("   "));
 
     // An errored agent is dead until rescued and will not recover on its own, so
     // it sits leftmost of all -- ahead even of the blocked badge.
@@ -418,11 +440,16 @@ fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool, world: crate::scene
     // stone descends into the list region); otherwise the self-contained five-line
     // scene, and when there is no room at all the one-line Eye engraved in a rule.
     let mut lines = vec![Line::from(top)];
-    if area.height > crate::scene::HEIGHT {
+    if signed {
+        let watching = crate::scene::Watching {
+            name: v.repo,
+            path: v.repo_path,
+        };
+        let w = area.width as usize;
         if mordor {
-            lines.extend(crate::scene::crown(area.width as usize, v.anim_ms, world));
+            lines.extend(crate::scene::crown(w, v.anim_ms, world, watching));
         } else {
-            lines.extend(crate::scene::scene(area.width as usize, v.anim_ms, world));
+            lines.extend(crate::scene::scene(w, v.anim_ms, world, watching));
         }
     } else {
         lines.push(engraved_rule(area.width as usize, v.anim_ms));
@@ -1259,6 +1286,7 @@ mod tests {
             selected: 0,
             now: 0,
             repo: "demo",
+            repo_path: "~/src/demo",
             saved: false,
             hidden_stale: 0,
             clear_count: 0,
@@ -1320,6 +1348,7 @@ mod tests {
             selected: 0,
             now: 0,
             repo: "demo",
+            repo_path: "~/src/demo",
             saved: false,
             hidden_stale: 0,
             clear_count: 0,
@@ -1374,6 +1403,7 @@ mod tests {
             selected: 0,
             now: 0,
             repo: "demo",
+            repo_path: "~/src/demo",
             saved: false,
             hidden_stale: 0,
             clear_count: 0,
@@ -1402,6 +1432,21 @@ mod tests {
             rule.contains('‹') && rule.contains('▮') && rule.contains('›'),
             "Eye missing: {rule:?}"
         );
+
+        // A collapsed header has no room for the block-letter name, so the
+        // status line has to carry it -- and carry it as a filled badge, which
+        // is the only thing on that row loud enough to be read at a glance from
+        // the next pane over.
+        let mut top = String::new();
+        for x in 0..80u16 {
+            top.push_str(buf[(x, 0)].symbol());
+        }
+        assert!(top.starts_with(" DEMO "), "the short header buried the repo: {top:?}");
+        assert_eq!(
+            buf[(1u16, 0u16)].bg,
+            BLUE,
+            "the repo name is not on a filled badge"
+        );
     }
 
     #[test]
@@ -1419,6 +1464,7 @@ mod tests {
             selected: 0,
             now: 0,
             repo: "fresh",
+            repo_path: "~/src/fresh",
             saved: false,
             hidden_stale: 0,
             clear_count: 0,
@@ -1486,6 +1532,7 @@ mod tests {
             selected: 0,
             now: 0,
             repo: "demo",
+            repo_path: "~/src/demo",
             saved: false,
             hidden_stale: 0,
             clear_count: 0,
