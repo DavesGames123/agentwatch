@@ -498,6 +498,10 @@ mod tests {
     }
 
     #[test]
+    // The `* 0` is the point: both sides are written as the same formula so the
+    // difference between them is visibly the commit count and nothing else.
+    // Folding it to `650` would state the number instead of deriving it.
+    #[allow(clippy::erasing_op)]
     fn churn_lifts_a_smaller_but_much_edited_file_over_a_bigger_quiet_one() {
         // The ranking rule, exercised directly: 300 lines touched 10 times beats
         // 650 lines nobody has reopened. Bytes-based ranking got this backwards.

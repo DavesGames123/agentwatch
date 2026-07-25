@@ -9,27 +9,15 @@
 //!   sauron                  # watch the repo containing the cwd
 //!   sauron /path/to/repo    # watch a specific repo
 //!
+//! The watching itself lives in the library (`board::Board`), shared with the
+//! `muthur` multi-project front end; this file is the terminal around it.
+//!
 //! grep targets:
-//!   struct Row          -- one session flattened for rendering
-//!   struct App          -- scanner + ack store + selection
-//!   fn App::refresh     -- rescan logs and rebuild rows
+//!   struct App          -- a Board plus this window's cursor and banners
+//!   fn App::refresh     -- rebuild rows, keeping the cursor on its session
+//!   fn App::resync      -- refresh that also picks up another process's acks
 //!   fn main             -- terminal lifecycle and event loop
 
-mod agent;
-mod clip;
-mod codex;
-mod handoff;
-mod model;
-mod orc;
-mod scan;
-mod scene;
-mod store;
-mod ui;
-mod workspace;
-
-use agent::Agent;
-
-use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -41,9 +29,10 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::widgets::ListState;
 
-use model::{now_ms, BlockedReason, ErrorKind, Session, Status, DORMANT_AFTER_MS, STALE_HORIZON_MS};
-use scan::Scanner;
-use store::AckStore;
+use sauron::agent::Agent;
+use sauron::board::Board;
+use sauron::model::{self, now_ms, Status};
+use sauron::{clip, git_root, handoff, orc, ui, workspace};
 
 /// How often the logs are re-tailed. Only appended bytes are parsed, so this is
 /// cheap even with 10MB session files.
@@ -58,53 +47,20 @@ const FRAME: Duration = Duration::from_millis(100);
 /// it into the view cheap on a repository with thousands of source files.
 const PICK_LIMIT: usize = 40;
 
-#[derive(Debug, Clone)]
-pub struct Row {
-    pub id: String,
-    pub id_short: String,
-    pub name: String,
-    pub branch: Option<String>,
-    pub last_activity: i64,
-    /// When the current turn (the "task") began, epoch millis. Zero when unknown.
-    /// Drives the elapsed timer and local start-time on the card and detail pane.
-    pub turn_started: i64,
-    pub status: Status,
-    pub blocked_reason: Option<BlockedReason>,
-    /// The recorded failure behind `Status::Errored`, for the detail line.
-    pub error: Option<ErrorKind>,
-    /// Repo paths written but not acked at their current timestamp.
-    pub pending: Vec<String>,
-    pub total_edits: usize,
-    pub last_prompt: Option<String>,
-    /// One of sauron's own orcs (a single-shot maintenance agent), not a hobbit.
-    pub is_orc: bool,
-    /// `cd <cwd> && claude --resume <id>` -- reattach a dropped thread.
-    pub continue_cmd: String,
-    pub edits: BTreeMap<String, i64>,
-    /// Repo-relative path -> the most recent lines of text written to it, for the
-    /// selected card's per-file preview. Keyed like `pending`.
-    pub previews: BTreeMap<String, Vec<String>>,
-}
-
+/// The TUI's state: a `Board` plus everything about *this window* -- where the
+/// cursor is, which banners are still up, where the last frame drew its rows.
+///
+/// The split is deliberate. Everything that answers "what is the state of this
+/// repo" lives in `board`, so `muthur` can ask the same questions without a
+/// terminal; everything here is unshareable by construction, because a second
+/// front end has its own cursor and its own geometry.
 struct App {
-    scanner: Scanner,
-    store: AckStore,
-    /// Rows past the staleness horizon, kept out of `rows` but counted.
-    rows: Vec<Row>,
-    hidden_stale: usize,
-    /// Clear sessions are counted but kept out of `rows` unless `show_clear`.
-    clear_count: usize,
-    show_clear: bool,
-    show_all: bool,
+    board: Board,
     list_state: ListState,
     selected: usize,
-    repo_label: String,
     saved_until: Option<Instant>,
     /// Transient "copied" banner deadline.
     copied_until: Option<Instant>,
-    /// The agent whose sessions are being watched -- also the one a newly
-    /// spawned pane runs.
-    agent: Agent,
     /// Result of the last pane spawn and its banner deadline. Success and
     /// failure share the slot: both are the answer to a key just pressed, and
     /// only the last one matters.
@@ -142,25 +98,12 @@ struct OrcPick {
 
 impl App {
     fn new(repo_root: PathBuf, agent: Agent) -> Self {
-        let repo_label = repo_root
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
-
         let mut app = Self {
-            scanner: Scanner::new(repo_root, agent),
-            store: AckStore::load(),
-            rows: Vec::new(),
-            hidden_stale: 0,
-            clear_count: 0,
-            show_clear: false,
-            show_all: false,
+            board: Board::new(repo_root, agent),
             list_state: ListState::default(),
             selected: 0,
-            repo_label,
             saved_until: None,
             copied_until: None,
-            agent,
             spawn_msg: None,
             spawn_until: None,
             frame_item_heights: Vec::new(),
@@ -170,7 +113,6 @@ impl App {
             local_offset: model::local_offset_secs(),
             orc_pick: None,
         };
-        app.refresh();
         app.focus_first_actionable();
         app
     }
@@ -187,7 +129,7 @@ impl App {
             Status::NeedsTest,
         ];
         for want in order {
-            if let Some(i) = self.rows.iter().position(|r| r.status == want) {
+            if let Some(i) = self.board.rows.iter().position(|r| r.status == want) {
                 self.selected = i;
                 self.sync_list_state();
                 return;
@@ -195,116 +137,40 @@ impl App {
         }
     }
 
+    /// Rebuild the board and put the cursor back on the same session.
+    ///
+    /// Selection is re-found by id, never by index: rows reorder as statuses
+    /// change, and moving the cursor out from under the user is the fastest way
+    /// to make them ack the wrong thing.
     fn refresh(&mut self) {
-        let now = now_ms();
-        let sessions = self.scanner.refresh();
+        let anchor = self.selected_id();
+        self.board.refresh();
+        self.reanchor(anchor);
+    }
 
-        // Preserve the selected session across rebuilds -- rows reorder as
-        // statuses change, and moving the cursor out from under the user is the
-        // fastest way to make them ack the wrong thing.
-        let anchor = self.rows.get(self.selected).map(|r| r.id.clone());
+    /// A refresh that also picks up acks made elsewhere -- a muthur board, or a
+    /// second sauron on the same repo. Runs on the tick rather than on a keypress
+    /// because the whole point is that nobody pressed anything here.
+    fn resync(&mut self) {
+        let anchor = self.selected_id();
+        self.board.resync();
+        self.reanchor(anchor);
+    }
 
-        let mut rows: Vec<Row> = sessions
-            .into_iter()
-            .filter_map(|s| self.to_row(s, now))
-            .collect();
+    fn selected_id(&self) -> Option<String> {
+        self.board.rows.get(self.selected).map(|r| r.id.clone())
+    }
 
-        rows.sort_by(|a, b| {
-            a.status
-                .rank()
-                .cmp(&b.status.rank())
-                // Within the blocked band, a certain question outranks a guessed
-                // approval outranks a plain idle-stop (BlockedReason is ordered).
-                .then(a.blocked_reason.cmp(&b.blocked_reason))
-                .then(b.last_activity.cmp(&a.last_activity))
-        });
-
-        // Collapse the historical backlog. Sessions from days ago were tested
-        // (or abandoned) by whatever process preceded this tool; listing them as
-        // outstanding buries today's actual work.
-        let before = rows.len();
-        if !self.show_all {
-            rows.retain(|r| {
-                r.status != Status::NeedsTest
-                    || now.saturating_sub(r.last_activity) <= STALE_HORIZON_MS
-            });
-        }
-        self.hidden_stale = before - rows.len();
-
-        // Idle sessions carry no action. Counting them is useful; giving each
-        // one three lines of the window is not.
-        self.clear_count = rows.iter().filter(|r| r.status == Status::Clear).count();
-        if !self.show_clear {
-            rows.retain(|r| r.status != Status::Clear);
-        }
-
-        self.rows = rows;
+    fn reanchor(&mut self, anchor: Option<String>) {
         self.selected = anchor
-            .and_then(|id| self.rows.iter().position(|r| r.id == id))
+            .and_then(|id| self.board.rows.iter().position(|r| r.id == id))
             .unwrap_or(0)
-            .min(self.rows.len().saturating_sub(1));
+            .min(self.board.rows.len().saturating_sub(1));
         self.sync_list_state();
     }
 
-    fn to_row(&self, s: Session, now: i64) -> Option<Row> {
-        let acked = self.store.for_session(&s.id);
-        let mut status = s.status(now, acked);
-        let mut blocked_reason = s.blocked_reason(now, acked);
-        let pending: Vec<String> = s.pending(acked, now).into_iter().map(String::from).collect();
-
-        // A dismissed "waiting on you" / "awaiting acknowledgement" session drops
-        // off the board until the agent does something new. Compared against
-        // last_activity, not a flag, so a fresh turn (which advances
-        // last_activity) re-surfaces it. Both waiting states share the gesture:
-        // dismissing is exactly "I have acknowledged this".
-        if matches!(status, Status::Blocked | Status::AwaitingAck) {
-            if let Some(d) = self.store.dismissed_at(&s.id) {
-                if s.last_activity <= d {
-                    status = Status::Clear;
-                    blocked_reason = None;
-                }
-            }
-        }
-
-        // A session with no repo edits still matters while it is live -- it is
-        // holding an agent slot, and if it is blocked on a question the delay is
-        // yours to clear. Only drop it once it has gone quiet with nothing to
-        // show, which is what a finished chat-only session looks like.
-        if s.edits.is_empty() && status == Status::Clear {
-            return None;
-        }
-        if status == Status::Clear && now.saturating_sub(s.last_activity) > DORMANT_AFTER_MS {
-            return None;
-        }
-
-        Some(Row {
-            id: s.id.clone(),
-            id_short: s.short_id().to_string(),
-            name: s.display_name(),
-            branch: s.branch.clone(),
-            last_activity: s.last_activity,
-            turn_started: s.turn_started_ms,
-            status,
-            blocked_reason,
-            error: s.error,
-            pending,
-            total_edits: s.edits.len(),
-            last_prompt: s.last_prompt.clone(),
-            is_orc: s.is_orc,
-            continue_cmd: s.continue_command(),
-            // Drop the per-file timestamp here -- it did its job ordering the
-            // previews during the fold; the card only needs the lines.
-            previews: s
-                .previews
-                .into_iter()
-                .map(|(path, (_, lines))| (path, lines))
-                .collect(),
-            edits: s.edits,
-        })
-    }
-
     fn sync_list_state(&mut self) {
-        if self.rows.is_empty() {
+        if self.board.rows.is_empty() {
             self.list_state.select(None);
         } else {
             self.list_state.select(Some(self.selected));
@@ -312,10 +178,10 @@ impl App {
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if self.board.rows.is_empty() {
             return;
         }
-        let last = self.rows.len() - 1;
+        let last = self.board.rows.len() - 1;
         self.selected = (self.selected as isize + delta).clamp(0, last as isize) as usize;
         self.sync_list_state();
     }
@@ -325,69 +191,32 @@ impl App {
     /// Both mean "I have handled this", and both re-surface if the agent does
     /// something new.
     fn ack_selected(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(id) = self.selected_id() else {
             return;
         };
-        if matches!(row.status, Status::Blocked | Status::AwaitingAck) {
-            let (id, ts) = (row.id.clone(), row.last_activity);
-            self.store.dismiss(&id, ts);
-        } else {
-            let (id, edits) = (row.id.clone(), row.edits.clone());
-            self.store.ack(&id, &edits);
-        }
-        self.persist();
-        self.refresh();
+        self.board.ack(&id);
+        self.flash_saved();
+        self.reanchor(Some(id));
     }
 
     fn unack_selected(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(id) = self.selected_id() else {
             return;
         };
-        let id = row.id.clone();
-        // Undo whichever suppression applies to this row.
-        if matches!(row.status, Status::Blocked | Status::AwaitingAck) {
-            self.store.undismiss(&id);
-        } else {
-            self.store.unack(&id);
-        }
-        self.persist();
-        self.refresh();
-    }
-
-    /// Ack every outstanding session, including ones hidden by the horizon.
-    /// This is the cold-start move: declare the historical backlog tested so the
-    /// queue starts empty and only new agent work appears.
-    fn baseline(&mut self) {
-        let saved = self.show_all;
-        self.show_all = true;
-        self.refresh();
-        self.ack_all();
-        self.show_all = saved;
-        self.refresh();
+        self.board.unack(&id);
+        self.flash_saved();
+        self.reanchor(Some(id));
     }
 
     fn ack_all(&mut self) {
-        let all: Vec<(String, BTreeMap<String, i64>)> = self
-            .rows
-            .iter()
-            .filter(|r| r.status == Status::NeedsTest)
-            .map(|r| (r.id.clone(), r.edits.clone()))
-            .collect();
-        for (id, edits) in all {
-            self.store.ack(&id, &edits);
-        }
-        self.persist();
-        self.refresh();
+        let anchor = self.selected_id();
+        self.board.ack_all();
+        self.flash_saved();
+        self.reanchor(anchor);
     }
 
-    fn persist(&mut self) {
-        if self.store.save().is_ok() {
-            self.saved_until = Some(Instant::now() + Duration::from_millis(1200));
-        }
-    }
-
-    fn store_len(&self) -> usize {
-        self.store.session_count()
+    fn flash_saved(&mut self) {
+        self.saved_until = Some(Instant::now() + Duration::from_millis(1200));
     }
 
     fn saved_flash(&self) -> bool {
@@ -404,7 +233,7 @@ impl App {
     }
 
     fn copy_continue_for(&mut self, idx: usize) {
-        let Some(row) = self.rows.get(idx) else {
+        let Some(row) = self.board.rows.get(idx) else {
             return;
         };
         if copy_to_clipboard(&row.continue_cmd) {
@@ -428,10 +257,10 @@ impl App {
     fn spawn_agent(&mut self) {
         let cmd = format!(
             "cd {} && {}",
-            self.scanner.repo_root().display(),
-            self.agent.label()
+            self.board.repo_root().display(),
+            self.board.agent().label()
         );
-        self.spawn(cmd, false, format!("new {} pane", self.agent.label()));
+        self.spawn(cmd, false, format!("new {} pane", self.board.agent().label()));
     }
 
     /// Reopen the selected session in a new left-column pane, resumed. This is
@@ -439,14 +268,14 @@ impl App {
     /// outlives its terminal, and this is how it gets one back. Focus follows,
     /// because you opened a named session in order to talk to it.
     fn spawn_selected(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.board.rows.get(self.selected) else {
             return;
         };
         let (id, name) = (row.id.clone(), model::collapse_ws(&row.name));
         let cmd = format!(
             "cd {} && {}",
-            self.scanner.repo_root().display(),
-            self.agent.resume_cmd(&id)
+            self.board.repo_root().display(),
+            self.board.agent().resume_cmd(&id)
         );
         let label: String = name.chars().take(32).collect();
         self.spawn(cmd, true, format!("opened {label}"));
@@ -462,32 +291,12 @@ impl App {
 
     // --- orcs ---
 
-    /// Repo-relative paths a live session is touching. An orc must steer clear
-    /// of every one of them, or its refactor collides with a hobbit mid-edit.
-    ///
-    /// Read straight off the rows this TUI is already showing, so it is the same
-    /// hot set the user can see on screen. The launcher answers the same
-    /// question from a freshly-built `App` (`hot_files`), which is the only way
-    /// to ask it from a process that has no TUI.
-    fn hot_paths(&self) -> std::collections::BTreeSet<String> {
-        let mut hot = std::collections::BTreeSet::new();
-        for r in &self.rows {
-            if matches!(
-                r.status,
-                Status::Working | Status::Delegated | Status::Blocked | Status::NeedsTest
-            ) {
-                hot.extend(r.edits.keys().cloned());
-            }
-        }
-        hot
-    }
-
     /// Survey the repo and open the picker. Costs a `git ls-files` plus a read
     /// of every tracked source file, which is why it runs on the keypress rather
     /// than every tick.
     fn open_orc_pick(&mut self) {
-        let repo = self.scanner.repo_root().to_path_buf();
-        let mut survey = orc::survey(&repo, &self.hot_paths());
+        let repo = self.board.repo_root().to_path_buf();
+        let mut survey = orc::survey(&repo, &self.board.hot_paths());
         // Nobody scrolls past the top of a ranked list to find a refactor
         // target, and the cap bounds both the scroll and the per-frame copy of
         // this list into the view.
@@ -536,7 +345,7 @@ impl App {
             return;
         };
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sauron"));
-        let repo = self.scanner.repo_root().to_string_lossy().into_owned();
+        let repo = self.board.repo_root().to_string_lossy().into_owned();
         let cmd = orc::stage_command(&exe, &repo, &target, "");
         self.orc_pick = None;
 
@@ -642,37 +451,6 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// The in-flight sessions for a repo -- mid-turn (`Working`) or waiting on a
-/// background agent it spawned (`Delegated`) -- as `(session_id, display_name)`.
-/// The same set `--list-working` prints and the TUI shows, so `sauron workspace`
-/// reopens exactly the sessions the tool counts as live.
-fn in_flight_tasks(repo_root: PathBuf, agent: Agent) -> Vec<(String, String)> {
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    App::new(repo_root, agent)
-        .rows
-        .iter()
-        .filter(|r| matches!(r.status, Status::Working | Status::Delegated))
-        .map(|r| (r.id.clone(), model::collapse_ws(&r.name)))
-        .collect()
-}
-
-/// Repo-relative paths an *active* session is touching -- working, delegated,
-/// blocked, or holding untested edits. This is the "hot" set an orc must steer
-/// clear of, so its single-shot refactor never collides with a hobbit's work.
-fn hot_files(repo_root: PathBuf, agent: Agent) -> std::collections::BTreeSet<String> {
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let mut hot = std::collections::BTreeSet::new();
-    for r in &App::new(repo_root, agent).rows {
-        if matches!(
-            r.status,
-            Status::Working | Status::Delegated | Status::Blocked | Status::NeedsTest
-        ) {
-            hot.extend(r.edits.keys().cloned());
-        }
-    }
-    hot
-}
-
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -731,10 +509,10 @@ fn main() -> std::io::Result<()> {
     // tick, so the board fills in on its own once it appears.
 
     if baseline {
-        app.baseline();
+        app.board.baseline();
         println!(
             "baselined: {} session(s) marked tested. Only new agent work will appear from here.",
-            app.store_len()
+            app.board.store_len()
         );
         return Ok(());
     }
@@ -745,7 +523,7 @@ fn main() -> std::io::Result<()> {
     // background agent it spawned (`Delegated`) -- both are live tasks the user
     // would want reopened; reusing App::rows keeps the definition from drifting.
     if list_working {
-        for r in &app.rows {
+        for r in &app.board.rows {
             if matches!(r.status, Status::Working | Status::Delegated) {
                 println!("{}\t{}", r.id, model::collapse_ws(&r.name));
             }
@@ -776,9 +554,9 @@ fn main() -> std::io::Result<()> {
 
     let result = loop {
         let now = now_ms();
-        let rows = app.rows.clone();
+        let rows = app.board.rows.clone();
         let selected = app.selected;
-        let label = app.repo_label.clone();
+        let label = app.board.repo_label.clone();
         let saved = app.saved_flash();
         let copied = app.copied_flash();
         let spawned = app.spawn_flash().map(|(m, ok)| (m.to_string(), ok));
@@ -797,7 +575,7 @@ fn main() -> std::io::Result<()> {
         // Re-checked per frame, not cached at launch: the directory is created
         // the moment the user starts an agent in this repo, and the empty-state
         // hint must stop claiming otherwise as soon as that happens.
-        let log_dir = app.scanner.log_dir().to_path_buf();
+        let log_dir = app.board.log_dir().to_path_buf();
         let awaiting_log_dir = (!log_dir.exists()).then(|| log_dir.to_string_lossy().into_owned());
 
         let view = ui::View {
@@ -806,9 +584,9 @@ fn main() -> std::io::Result<()> {
             now,
             repo: &label,
             saved,
-            hidden_stale: app.hidden_stale,
-            clear_count: app.clear_count,
-            show_clear: app.show_clear,
+            hidden_stale: app.board.hidden_stale,
+            clear_count: app.board.clear_count,
+            show_clear: app.board.show_clear,
             copied,
             spawned: spawned.as_ref().map(|(m, ok)| (m.as_str(), *ok)),
             anim_ms: anim_start.elapsed().as_millis() as u64,
@@ -864,11 +642,11 @@ fn main() -> std::io::Result<()> {
                     KeyCode::Char('O') => app.open_orc_pick(),
                     KeyCode::Enter => app.spawn_selected(),
                     KeyCode::Char('o') => {
-                        app.show_all = !app.show_all;
+                        app.board.show_all = !app.board.show_all;
                         app.refresh();
                     }
                     KeyCode::Char('c') => {
-                        app.show_clear = !app.show_clear;
+                        app.board.show_clear = !app.board.show_clear;
                         app.refresh();
                     }
                     KeyCode::Char('r') => app.refresh(),
@@ -897,7 +675,10 @@ fn main() -> std::io::Result<()> {
         }
 
         if last_tick.elapsed() >= TICK {
-            app.refresh();
+            // resync, not refresh: this also re-reads the ack file, so work you
+            // acked in a muthur board or another sauron stops reading as
+            // untested here without a relaunch.
+            app.resync();
             last_tick = Instant::now();
 
             // Rebuilt on disk? Re-exec so the running window becomes the new
@@ -919,25 +700,25 @@ fn main() -> std::io::Result<()> {
 /// Plain-text snapshot for `--once`.
 fn print_once(app: &App) {
     let now = now_ms();
-    if app.rows.is_empty() {
+    if app.board.rows.is_empty() {
         // Snapshot mode exits immediately, so unlike the TUI it gets no later
         // chance to fill in. Say which directory was empty -- a wrong repo and a
         // never-used one print the same single line otherwise.
-        if !app.scanner.log_dir().exists() {
+        if !app.board.log_dir().exists() {
             println!(
                 "no agent sessions yet for {}\n  watching: {}",
-                app.scanner.repo_root().display(),
-                app.scanner.log_dir().display()
+                app.board.repo_root().display(),
+                app.board.log_dir().display()
             );
         } else {
             println!("no sessions with repo edits");
         }
         return;
     }
-    let errored = app.rows.iter().filter(|r| r.status == Status::Errored).count();
-    let blocked = app.rows.iter().filter(|r| r.status == Status::Blocked).count();
-    let ack = app.rows.iter().filter(|r| r.status == Status::AwaitingAck).count();
-    let needs = app.rows.iter().filter(|r| r.status == Status::NeedsTest).count();
+    let errored = app.board.rows.iter().filter(|r| r.status == Status::Errored).count();
+    let blocked = app.board.rows.iter().filter(|r| r.status == Status::Blocked).count();
+    let ack = app.board.rows.iter().filter(|r| r.status == Status::AwaitingAck).count();
+    let needs = app.board.rows.iter().filter(|r| r.status == Status::NeedsTest).count();
     let mut banner = Vec::new();
     if errored > 0 {
         banner.push(format!("{} ERRORED", errored));
@@ -953,7 +734,7 @@ fn print_once(app: &App) {
     }
     println!("{}\n", if banner.is_empty() { "all caught up".into() } else { banner.join("  ·  ") });
 
-    for r in &app.rows {
+    for r in &app.board.rows {
         let glyph = match r.status {
             Status::Errored => "✖",
             Status::Blocked => "▲",
@@ -1012,20 +793,6 @@ fn reload() -> std::io::Error {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sauron"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::Command::new(exe).args(args).exec()
-}
-
-/// Walk up from the cwd looking for a .git entry, so the tool works from any
-/// subdirectory of the repo.
-fn git_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 #[cfg(test)]
