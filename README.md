@@ -79,7 +79,9 @@ The terminal sidecar. One question, answered live:
 - Collapses the historical backlog so *today's* work stays visible
 - Quotes your **last message** to each session, and previews the **recent
   edits** of the selected one — re-brief at a glance
-- And a lidless **Eye** keeps watch up top, in runes, while hobbits scurry past
+- And a lidless **Eye** keeps watch up top, Mount Doom smoking beside it — both
+  gauged to the swarm. Idle, the Eye **lids**, the war ends, and the Fellowship
+  (and Gandalf, and the Eagles…) get the plain to themselves
 
 </td>
 <td width="50%" valign="top">
@@ -132,6 +134,59 @@ cp sauron/target/release/sauron sauron/target/release/clip /usr/local/bin/
 | <kbd>c</kbd> | toggle cleared / idle sessions |
 | <kbd>A</kbd> | toggle the stale backlog |
 | <kbd>q</kbd> | quit |
+
+---
+
+## 🌋 The skyline — Mordor answers to the board
+
+The chrome is a gauge, not decoration. Everything above and below the session
+list is a pure function of two numbers: how many agents are **working**, and
+whether anything at all is **outstanding**.
+
+**While the swarm runs.** The Eye burns and tracks whatever crosses beneath it.
+**Orodruin** smokes on the skyline beside it — one degree of heat per working
+agent, from a thin wisp to a thick plume, a white-hot vent, embers thrown clear
+of the cone and lava running down its flanks. At the tower's foot the **war**
+musters on the same count: more fighters, faster feet, arrow volleys past three,
+the fallen past five. The tower's arrow-slits are lit. Once every twenty-six
+seconds Frodo, Sam, and Gollum steal across the field, and the Eye follows them.
+
+**When nothing is running and nothing wants you** — the state the header calls
+*all caught up* — the board doesn't merely go quiet, it changes state:
+
+- the **Eye banks and lids**: the flame crown gutters to a bed of coals and the
+  lid closes over the fire, cracking open once a cycle for a slow look around
+- the tower's **slit-windows go dark**
+- the **mountain cools** — two tones of dead rock, a dull seam at the vent
+- the **war stops entirely**. Not one bored orc left keeping the gate: an empty
+  field is the only way to say *nothing is happening* that a shuffling sentry
+  does not contradict
+- and the plain fills up. **A different company crosses every fourteen seconds**,
+  rotating through the whole cast:
+
+  | | company | |
+  |:--|:--|:--|
+  | `ó╱ ô╱ o╮ *` | Frodo, Sam, Gollum, and the Ring | on foot |
+  | `╲╱╤ó ·` | Gandalf on Shadowfax | the fastest thing on the ground |
+  | `╱▄╲` | a Nazgûl on its fell beast | *in the air* |
+  | `ó) °╕` | Legolas and Gimli | bow and axe |
+  | `Ψ╱` | Treebeard | twelve seconds to cross |
+  | `╱╲ ╲╱ ╱╲` | Gwaihir and his kin | *in the air* |
+  | `ô╱ ~` | Tom Bombadil | singing |
+  | `╳o╳` | Shelob | skittering |
+
+The rotation is driven by the clock, not a random number, so every frame of it
+is reproducible in a test — and no company ever shows up twice in a row.
+
+> The idle state is deliberately strict: it needs **nothing working, nothing
+> delegated, and nothing errored, blocked, awaiting ack, or awaiting test**. A
+> lidded Eye above an amber `AWAITING ACK` badge would be the chrome calling the
+> badge a liar, and you'd have no way to tell which one to believe.
+
+The mountain needs 70 columns to appear; below that the engraving keeps the
+space, because a verse clipped mid-word reads as a bug and a missing mountain
+reads as a missing mountain. Below 24 rows the header collapses to a one-line
+Eye, and the tower and its war are only drawn when the terminal can spare them.
 
 ---
 
@@ -525,7 +580,14 @@ sauron/src/
   codex.rs      ·  the Codex rollout reader
   model.rs      ·  session model, status classification (agent-agnostic)
   ui.rs         ·  the TUI
-  scene.rs      ·  the animated Eye
+  scene/        ·  Mordor: the Eye, Orodruin, the tower, the war, the cast
+    mod.rs      ·    World (what the agents are doing) + the four compositors
+    eye.rs      ·    the Eye's poses — burning, and banked when idle
+    doom.rs     ·    Mount Doom: cone, vent, and a plume that tracks the swarm
+    cast.rs     ·    who crosses the plain, and on which of the two schedules
+    war.rs      ·    the melee at the tower's foot, sized by the working count
+    runes.rs    ·    the engraved Sindarin and its transliteration
+    paint.rs    ·    cell grid, transparent sprite stamping, span collapse
   clip/         ·  SQLite-compatible Agent Clipboard store + CLI
   handoff.rs    ·  strict opt-in clipboard pass lifecycle
   workspace.rs  ·  the `sauron workspace` launcher + iTerm pane splitting

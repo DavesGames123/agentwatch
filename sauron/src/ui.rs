@@ -132,6 +132,27 @@ pub struct FrameGeometry {
     pub item_rows: Vec<Option<usize>>,
 }
 
+/// What Mordor is told about the board.
+///
+/// `repose` is deliberately the *same* condition the header states in words as
+/// "all caught up", widened by "and nothing is running or delegated either".
+/// Deriving it here, once, from the rows is what keeps the two from drifting
+/// apart -- a lidded Eye sitting above an amber AWAITING ACK badge would be the
+/// chrome calling the badge a liar, and whichever one the user believed, one of
+/// them would be wrong.
+fn world_of(rows: &[Row]) -> crate::scene::World {
+    let count = |s: Status| rows.iter().filter(|r| r.status == s).count();
+    let working = count(Status::Working);
+    let outstanding = count(Status::Errored)
+        + count(Status::Blocked)
+        + count(Status::AwaitingAck)
+        + count(Status::NeedsTest);
+    crate::scene::World {
+        working,
+        repose: working == 0 && count(Status::Delegated) == 0 && outstanding == 0,
+    }
+}
+
 pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut FrameGeometry) {
     // The full five-line Eye earns its keep only when the terminal is tall
     // enough to spare the rows; below that the header collapses to the compact
@@ -167,7 +188,8 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
         list_area.height = list_area.height.saturating_sub(base_h);
     }
 
-    header(f, chunks[0], v, mordor);
+    let world = world_of(v.rows);
+    header(f, chunks[0], v, mordor, world);
     list(f, list_area, v, list_state, geo);
     detail(f, chunks[2], v.rows.get(v.selected), v.now, v.local_offset);
     footer(f, chunks[3], v);
@@ -183,12 +205,12 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
             height: chunks[1].height.saturating_sub(base_h),
         };
         f.render_widget(
-            Paragraph::new(crate::scene::tower_shaft(shaft.height as usize, v.anim_ms)),
+            Paragraph::new(crate::scene::tower_shaft(shaft.height as usize, v.anim_ms, world)),
             shaft,
         );
         // The war at the foot, full width along the bottom of the list region. Its
-        // size tracks the count of agents currently working -- each is one orc.
-        let armies = v.rows.iter().filter(|r| r.status == Status::Working).count();
+        // size tracks the count of agents currently working -- each is one orc --
+        // and in repose there is no war at all, only whoever is crossing.
         let base = Rect {
             x: chunks[1].x,
             y: chunks[1].bottom() - base_h,
@@ -196,7 +218,7 @@ pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut Frame
             height: base_h,
         };
         f.render_widget(
-            Paragraph::new(crate::scene::battle_ground(full.width as usize, armies, v.anim_ms)),
+            Paragraph::new(crate::scene::battle_ground(full.width as usize, v.anim_ms, world)),
             base,
         );
     }
@@ -296,7 +318,7 @@ fn orc_picker(f: &mut Frame, full: Rect, pick: &PickView) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool) {
+fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool, world: crate::scene::World) {
     let awaiting = v.rows.iter().filter(|r| r.status == Status::NeedsTest).count();
     let ack = v.rows.iter().filter(|r| r.status == Status::AwaitingAck).count();
     let working = v.rows.iter().filter(|r| r.status == Status::Working).count();
@@ -398,9 +420,9 @@ fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool) {
     let mut lines = vec![Line::from(top)];
     if area.height > crate::scene::HEIGHT {
         if mordor {
-            lines.extend(crate::scene::crown(area.width as usize, v.anim_ms));
+            lines.extend(crate::scene::crown(area.width as usize, v.anim_ms, world));
         } else {
-            lines.extend(crate::scene::scene(area.width as usize, v.anim_ms));
+            lines.extend(crate::scene::scene(area.width as usize, v.anim_ms, world));
         }
     } else {
         lines.push(engraved_rule(area.width as usize, v.anim_ms));
