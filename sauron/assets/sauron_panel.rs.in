@@ -36,12 +36,22 @@
 //       draws on top
 //    3. optionally `sauron_panel::set_visible(bool)` from a key binding
 //
+//  PLACEMENT
+//  ---------
+//  Docked to the left margin by default. Drag the header strip to move it; the
+//  clamp keeps a grabbable piece of that strip on screen, so it can be parked
+//  half off either edge but never lost. Clicking the header folds the pane to
+//  the strip alone, which stays draggable. Neither survives a relaunch, on
+//  purpose: a debug pane that remembers being hidden is one you forget exists.
+//
 //  grep targets:
 //    fn render          -- the once-per-frame entry point
 //    fn poll            -- mtime-gated re-read
 //    fn beacon_path     -- $SAURON_BEACON, else git root -> encoded path
 //    fn parse           -- the v{{VERSION}} wire format reader
+//    fn draw_header     -- fold control and drag handle, one surface
 //    fn draw_row        -- one session card
+//    const DEFAULT_POS  -- where it docks before anyone moves it
 //    const STALE_MS     -- how old a beacon may be and still count as live
 //    struct Palette     -- every colour in one place, for retheming
 
@@ -82,6 +92,19 @@ const POLL: Duration = Duration::from_millis(500);
 
 const PANEL_W: f32 = 348.0;
 const PAD: f32 = 10.0;
+/// Header strip height. A constant rather than a measurement because the drag
+/// clamp needs it *outside* the closure that draws the header.
+const HEADER_H: f32 = 30.0;
+
+/// Where the pane sits until someone drags it: docked against the left margin,
+/// under the top edge.
+const DEFAULT_POS: [f32; 2] = [16.0, 16.0];
+
+/// How much of the header must stay on screen. Dragging is clamped to this, so
+/// the pane can be parked mostly off either edge -- useful when it is in the way
+/// of something you are actually looking at -- without ever becoming impossible
+/// to grab back.
+const GRAB_MARGIN: f32 = 56.0;
 
 /// Every colour the pane uses. Grouped so a host project can retheme by editing
 /// one block — the only edit to this file that survives a regeneration cleanly,
@@ -177,6 +200,15 @@ struct State {
     beacon: Option<Beacon>,
     /// `id_short` of rows whose file list is unfolded.
     expanded: BTreeSet<String>,
+    /// Top-left of the pane. `None` until the first frame resolves it to
+    /// `DEFAULT_POS`.
+    ///
+    /// Held here rather than left to egui's own `Area` dragging, because that
+    /// makes the *whole* pane a drag surface -- and every row in this pane is a
+    /// click target that folds a file list. Owning the position means the header
+    /// is the only thing that moves it, which is also what lets the pane be
+    /// dragged while collapsed to a single strip.
+    pos: Option<egui::Pos2>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -188,8 +220,22 @@ fn state() -> &'static Mutex<State> {
             last_mtime: None,
             beacon: None,
             expanded: BTreeSet::new(),
+            pos: None,
         })
     })
+}
+
+/// Move the pane's top-left corner. Clamped on the next frame like a drag is,
+/// so a host cannot park it somewhere unreachable.
+pub fn set_position(pos: egui::Pos2) {
+    if let Ok(mut st) = state().lock() {
+        st.pos = Some(pos);
+    }
+}
+
+/// Put the pane back in its default corner.
+pub fn reset_position() {
+    set_position(egui::pos2(DEFAULT_POS[0], DEFAULT_POS[1]));
 }
 
 /// Show or hide the pane. Independent of the collapsed state, so toggling it
@@ -397,13 +443,16 @@ pub fn render(ctx: &egui::Context) {
     // starts. egui callbacks are the classic place to re-enter a lock you are
     // still holding; copying first makes that impossible by construction, and
     // the snapshot is a few hundred bytes.
-    let (beacon, expanded) = {
+    let (beacon, expanded, pos) = {
         let Ok(mut st) = state().lock() else {
             return;
         };
         poll(&mut st);
+        let pos = *st
+            .pos
+            .get_or_insert(egui::pos2(DEFAULT_POS[0], DEFAULT_POS[1]));
         match &st.beacon {
-            Some(b) => (b.clone(), st.expanded.clone()),
+            Some(b) => (b.clone(), st.expanded.clone(), pos),
             None => return,
         }
     };
@@ -415,11 +464,16 @@ pub fn render(ctx: &egui::Context) {
     }
 
     let mut toggled: Option<String> = None;
+    let mut drag = egui::Vec2::ZERO;
 
+    // `fixed_pos` and not `anchor`: an anchored area is re-pinned to its corner
+    // every frame, so a dragged one snaps straight back. `movable(false)`
+    // because the header does the dragging -- see `State::pos`.
     egui::Area::new(egui::Id::new("sauron_beacon_panel"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+        .fixed_pos(pos)
         .order(egui::Order::Foreground)
         .movable(false)
+        .constrain(false)
         .show(ctx, |ui| {
             egui::Frame::none()
                 .fill(Palette::BG)
@@ -430,7 +484,7 @@ pub fn render(ctx: &egui::Context) {
                     ui.set_width(PANEL_W);
                     ui.spacing_mut().item_spacing.y = 0.0;
 
-                    draw_header(ui, &beacon);
+                    drag = draw_header(ui, &beacon);
                     if COLLAPSED.load(Ordering::Relaxed) {
                         return;
                     }
@@ -466,15 +520,43 @@ pub fn render(ctx: &egui::Context) {
             }
         }
     }
+
+    // Applied after the area closes, because the clamp needs the screen rect and
+    // the closure needs the position it was already given. The one-frame lag
+    // this costs is the same lag egui's own windows have -- their move is also
+    // stored at the end of the frame it was dragged in.
+    if drag != egui::Vec2::ZERO {
+        let screen = ctx.screen_rect();
+        let mut p = pos + drag;
+        p.x = p.x.clamp(
+            screen.left() - PANEL_W + GRAB_MARGIN,
+            screen.right() - GRAB_MARGIN,
+        );
+        p.y = p.y.clamp(screen.top(), screen.bottom() - HEADER_H);
+        if let Ok(mut st) = state().lock() {
+            st.pos = Some(p);
+        }
+    }
 }
 
-/// The always-visible strip: eye, title, count, caret. Clicking anywhere on it
-/// folds the pane, so the target is the full width rather than a caret glyph
-/// that has to be hunted for.
-fn draw_header(ui: &mut egui::Ui, b: &Beacon) {
+/// The always-visible strip: dot, title, count, caret. It is both the fold
+/// control and the drag handle, and returns this frame's drag delta.
+///
+/// One surface, two gestures, told apart by egui: with `click_and_drag`, a
+/// press that moved does not report `clicked()`. That is what keeps the pane
+/// from folding itself every time you finish dragging it. The rows below cannot
+/// be confused for a handle at all, because the drag lives here rather than on
+/// the area.
+fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     let collapsed = COLLAPSED.load(Ordering::Relaxed);
-    let h = 30.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(PANEL_W, HEADER_H), egui::Sense::click_and_drag());
+    let dragging = resp.dragged();
+    if dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
     let p = ui.painter();
 
     let rounding = if collapsed {
@@ -557,12 +639,19 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) {
     if resp.clicked() {
         COLLAPSED.fetch_xor(true, Ordering::Relaxed);
     }
-    resp.on_hover_text(format!(
-        "sauron pid {} watching {}\nclick to {}",
-        b.pid,
-        b.label,
-        if collapsed { "expand" } else { "collapse" }
-    ));
+
+    let delta = resp.drag_delta();
+    // No tooltip mid-drag: it would follow the cursor across the screen while
+    // the thing it describes is being moved out from under it.
+    if !dragging {
+        resp.on_hover_text(format!(
+            "sauron pid {} watching {}\nclick to {} · drag to move",
+            b.pid,
+            b.label,
+            if collapsed { "expand" } else { "collapse" }
+        ));
+    }
+    delta
 }
 
 /// The worst status present, as a colour. Drives the folded pane's one dot.
