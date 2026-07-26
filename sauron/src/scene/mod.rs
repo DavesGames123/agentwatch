@@ -32,16 +32,25 @@
 //! across the room.** That is the header's first job -- sauron is normally run
 //! several at a time, one pane per repo, and a board that identifies itself in
 //! nine dim cells is a board you can act on believing it is a different one.
-//! So the project's name goes up in three-row block letters ([`sign`]) with its
-//! path faint above, and everything else on the header lays out around it: the
-//! mountain yields its columns to the name, and the engraved verse only appears
-//! in whatever room is left over.
+//! So the project's name goes up in block letters ([`sign`]) with its path, and
+//! everything else on the header lays out around it: the mountain yields its
+//! columns to the name, and the engraved verse only appears in whatever room is
+//! left over.
+//!
+//! How large depends on the rows the terminal can spare -- [`scene_tall`] frames
+//! the name and sets it at five rows, [`scene`] is the same sign at three and no
+//! frame. Both are the *same* letters (see [`sign::Face`]); a board that shrinks
+//! must not look like a different board.
 //!
 //! grep targets:
 //!   struct World       -- what the agents are doing; every drawing takes one
 //!   struct Watching    -- which project the board is on; the header's headline
+//!   fn build           -- both headers: rows, frame, and where Mordor sits
 //!   fn scene           -- the compact five-line header (no tower below)
+//!   fn scene_tall      -- the eight-line header: name framed and set tall
 //!   fn crown           -- the header when the whole tower is drawn below it
+//!   fn crown_tall      -- the framed header, tower below
+//!   const HEIGHT_TALL  -- what the framed header costs, and TALL_MIN_H to afford it
 //!   fn tower_shaft     -- the descending stone shaft (right column of the list)
 //!   fn battle_ground   -- the flared foot and the full-width war at its base
 //!   fn doom_left       -- where the mountain fits, and when it does not
@@ -69,6 +78,19 @@ use paint::{blank_row, clip, row_to_line, stamp, Cell};
 
 /// Rows the crown occupies in the header (not counting the status line above it).
 pub const HEIGHT: u16 = 5;
+
+/// Rows the framed header occupies: the frame's lid (carrying the path), five
+/// rows of tall letters, the frame's floor, and the ground they stand on.
+///
+/// Three rows dearer than [`HEIGHT`], which is why `ui::draw` only spends it on
+/// a terminal with rows to spare -- the list is what pays, and a board that
+/// names itself beautifully while showing four sessions has traded the wrong way.
+pub const HEIGHT_TALL: u16 = 8;
+
+/// The terminal height at which the framed header becomes affordable: its nine
+/// rows (status line included), the list's minimum six, the detail pane's nine,
+/// and the footer, with a row spare so the list is not sitting at its floor.
+pub const TALL_MIN_H: u16 = 26;
 
 /// Width of the right-hand column the descending shaft claims. Equal to
 /// `EYE_MARGIN`, so the shaft rect's left edge lands exactly under the Eye and
@@ -202,59 +224,121 @@ fn place_eye(grid: &mut [Vec<Cell>], eye_left: i32, pose: Pose, pupil: usize, ms
 /// How the header intends to write the project's name, decided before anything
 /// is drawn because the mountain's columns depend on the answer.
 enum Sign {
-    /// Three rows of block letters -- the whole point of the header. Carries
-    /// the kerning it was measured at, so the drawing cannot disagree with the
-    /// width the mountain was laid out around.
-    Block { w: usize, kern: usize },
+    /// Block letters -- the whole point of the header. Carries the face and the
+    /// kerning it was measured at, so the drawing cannot disagree with the width
+    /// the mountain was laid out around.
+    Block {
+        w: usize,
+        kern: usize,
+        face: sign::Face,
+    },
     /// No room for that, so one row of capitals instead. Still the name, still
     /// the brightest thing on the left of the header; just not shoutable.
     Plain(usize),
 }
 
 impl Sign {
-    /// Columns it will claim.
-    fn width(&self) -> i32 {
-        match *self {
+    /// Columns it will claim, frame included when there is one.
+    fn width(&self, framed: bool) -> i32 {
+        let bare = match *self {
             Sign::Block { w, .. } | Sign::Plain(w) => w as i32,
-        }
+        };
+        bare + if framed { FRAME_W } else { 0 }
     }
 }
 
-/// Pick the largest form of `name` that fits the columns left of the Eye:
-/// block letters airy, then block letters tight, then small capitals.
+/// Columns a frame costs: one rule down each side. There is no padding inside
+/// it. A space either side would read better and cost two more columns, which is
+/// exactly the margin by which the longest of these boards fits at all -- and a
+/// framed name that demotes to small capitals to buy breathing room has spent
+/// the legibility it was drawn for on whitespace.
+const FRAME_W: i32 = 2;
+
+/// Pick the largest form of `name` that fits the columns left of the Eye: block
+/// letters airy, then block letters tight, then small capitals.
 ///
 /// Measured against `eye_left` -- the room available with *no* mountain --
 /// rather than against the room beside one, so a name that only fits on a bare
 /// header still gets its block letters and the mountain is what goes.
-fn plan_sign(name: &str, eye_left: i32) -> Sign {
-    let room = (eye_left - SIGN_X - 1).max(1) as usize;
+///
+/// `face` is not a fallback rung here. Both faces measure the same, so a name
+/// that will not fit tall will not fit short either; the choice between them is
+/// made from the terminal's *rows*, before this is called.
+fn plan_sign(name: &str, eye_left: i32, face: sign::Face, framed: bool) -> Sign {
+    let frame = if framed { FRAME_W } else { 0 };
+    let room = (eye_left - SIGN_X - 1 - frame).max(1) as usize;
     for kern in sign::KERNS {
-        let w = sign::width(name, kern);
+        let w = sign::width(name, kern, face);
         if w <= room {
-            return Sign::Block { w, kern };
+            return Sign::Block { w, kern, face };
         }
     }
     Sign::Plain(name.chars().count().min(room))
 }
 
-/// Write the project's name across the left of the header, its path faint above
-/// it, and -- only in whatever room is left over on the path's row -- a line of
-/// the engraving.
+/// Write the project's name across the left of the header, its path with it, and
+/// -- only in whatever room is left over on the top row -- a line of engraving.
 ///
 /// The verse used to own rows 0 and 1 outright. It is flavour, and it was
 /// sitting in the only part of the header wide enough to say which repo this
 /// is, so it now takes what is left rather than what it wants. It is dropped
 /// whole rather than clipped: half an engraving reads as a rendering fault,
 /// where no engraving reads as a narrow terminal.
-fn place_watching(grid: &mut [Vec<Cell>], w: &Watching, plan: &Sign, ms: u64, stop: i32) {
+///
+/// Framed, the path moves *into* the top rule as its title, which is what buys
+/// the extra rows back: a frame costs two rows, and hanging the path off it
+/// returns one of them.
+fn place_watching(grid: &mut [Vec<Cell>], w: &Watching, plan: &Sign, ms: u64, stop: i32, framed: bool) {
     let room = (stop - SIGN_X).max(1) as usize;
+    let dim = Style::default().fg(DIM);
+    let style = Style::default().fg(BLUE);
 
-    // Row 0: the path, dim, then the engraving right-aligned in the slack. The
-    // path is cut from the *front* -- its tail is the part that distinguishes
-    // two checkouts, and "/Users/somebody/co…" distinguishes nothing.
-    let path = truncate_left(w.path, room);
-    let used = path.chars().count();
-    stamp(&mut grid[0], SIGN_X, &path, Style::default().fg(DIM));
+    // The name, and how many columns of frame go round it. Row 0 is the path's
+    // (or the frame's lid, which carries the path), so letters start at row 1
+    // either way.
+    let inner = plan.width(false) as usize;
+    let top = 1usize;
+    let rows = match *plan {
+        Sign::Block { face, .. } => face.rows(),
+        Sign::Plain(_) => 1,
+    };
+
+    if framed {
+        // The top rule, carrying the path as its title -- cut from the *front*,
+        // because the tail is the half that distinguishes two checkouts of one
+        // repo and "/Users/somebody/co…" distinguishes nothing.
+        let span = inner + FRAME_W as usize;
+        let mut lid = String::from("╭");
+        let title_room = span.saturating_sub(5);
+        let path = truncate_left(w.path, title_room);
+        if !path.is_empty() && title_room >= 4 {
+            lid.push_str("─ ");
+            lid.push_str(&path);
+            lid.push(' ');
+        }
+        while lid.chars().count() + 1 < span {
+            lid.push('─');
+        }
+        lid.push('╮');
+        stamp(&mut grid[0], SIGN_X, &lid, dim);
+
+        let floor: String = std::iter::once('╰')
+            .chain(std::iter::repeat_n('─', span.saturating_sub(2)))
+            .chain(std::iter::once('╯'))
+            .collect();
+        stamp(&mut grid[top + rows], SIGN_X, &floor, dim);
+        for r in 0..rows {
+            stamp(&mut grid[top + r], SIGN_X, "│", dim);
+            stamp(&mut grid[top + r], SIGN_X + 1 + inner as i32, "│", dim);
+        }
+    } else {
+        // Unframed, the path keeps its own row above the name.
+        let path = truncate_left(w.path, room);
+        stamp(&mut grid[0], SIGN_X, &path, dim);
+    }
+
+    // The engraving, right-aligned in whatever the top row has left over.
+    let used = if framed { inner + FRAME_W as usize } else { truncate_left(w.path, room).chars().count() };
     let verse = runes::runic(runes::verse(ms).0);
     let vw = verse.chars().count();
     if room >= used + vw + 3 {
@@ -262,19 +346,20 @@ fn place_watching(grid: &mut [Vec<Cell>], w: &Watching, plan: &Sign, ms: u64, st
         stamp(&mut grid[0], x, &verse, Style::default().fg(RUNE));
     }
 
-    // Rows 1-3: the name itself.
-    let style = Style::default().fg(BLUE);
+    // The name itself, inside whatever was drawn round it.
+    let x = SIGN_X + if framed { 1 } else { 0 };
     match *plan {
-        Sign::Block { kern, .. } => {
-            for (r, row) in sign::render(w.name, kern).iter().enumerate() {
-                stamp(&mut grid[r + 1], SIGN_X, row, style);
+        Sign::Block { kern, face, .. } => {
+            for (r, row) in sign::render(w.name, kern, face).iter().enumerate() {
+                stamp(&mut grid[top + r], x, row, style);
             }
         }
         // Bold, because at one row it is competing with the mountain beside it
         // for the eye and it has to win.
         Sign::Plain(_) => {
-            let flat = clip(&w.name.to_uppercase(), room);
-            stamp(&mut grid[2], SIGN_X, &flat, style.add_modifier(Modifier::BOLD));
+            let flat = clip(&w.name.to_uppercase(), inner);
+            let r = if framed { top } else { 2 };
+            stamp(&mut grid[r], x, &flat, style.add_modifier(Modifier::BOLD));
         }
     }
 }
@@ -289,33 +374,51 @@ fn resting_pose(ms: u64, world: World) -> (Pose, usize) {
     }
 }
 
-// --- the compact header --------------------------------------------------------
+// --- the header ----------------------------------------------------------------
 
-/// Compose the five header lines for a terminal `width` at time `ms`.
-pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
+/// Compose the header for a terminal `width` at time `ms`.
+///
+/// `rows` is [`HEIGHT`] or [`HEIGHT_TALL`]; `ground` says whether this header
+/// stands on its own horizon (the compact scene) or hands the stone downward to
+/// [`tower_shaft`] (the crown).
+///
+/// The sky is what grows. Mordor -- Eye, mountain, anyone crossing -- is always
+/// the bottom [`HEIGHT`] rows, because those five rows are one drawing that
+/// stands on the ground: stretching it would mean stretching the Eye, and the
+/// Eye is a face. The extra rows of a tall header go *above* it, which is where
+/// the sign is, and a sign hung higher on the same skyline still reads as the
+/// same place.
+fn build(width: usize, ms: u64, world: World, watching: Watching, rows: usize, ground: bool) -> Vec<Line<'static>> {
     let w = width.max(20);
-    let mut grid: Vec<Vec<Cell>> = (0..5).map(|_| blank_row(w)).collect();
+    let mut grid: Vec<Vec<Cell>> = (0..rows).map(|_| blank_row(w)).collect();
     let eye_left = w.saturating_sub(EYE_MARGIN) as i32;
     let eye_col = eye_left + 6; // the pupil's screen column
 
-    // The ground.
-    let ground_style = Style::default().fg(GROUND);
-    for cell in grid[4].iter_mut() {
-        *cell = ('▁', ground_style);
+    // Where Mordor starts: the last five rows, whatever the header's height.
+    let sky = rows - HEIGHT as usize;
+    let framed = rows > HEIGHT as usize;
+    let face = if framed { sign::Face::Tall } else { sign::Face::Block };
+
+    if ground {
+        let ground_style = Style::default().fg(GROUND);
+        for cell in grid[rows - 1].iter_mut() {
+            *cell = ('▁', ground_style);
+        }
     }
 
     // Orodruin, behind everything: the Eye is clipped over it, the name stops
     // short of it, and anyone crossing walks in front of its foot.
-    let plan = plan_sign(watching.name, eye_left);
-    let doom_x = doom_left(eye_left, plan.width());
+    let plan = plan_sign(watching.name, eye_left, face, framed);
+    let doom_x = doom_left(eye_left, plan.width(framed));
     if let Some(x) = doom_x {
-        doom::draw(&mut grid, x, ms, world);
+        doom::draw(&mut grid[sky..], x, ms, world);
     }
 
     // Who, if anyone, is crossing -- and what the Eye makes of it. In vigil the
     // Eye follows the lead figure and flares wide as they pass beneath; banked,
     // it sleeps through the whole procession, which is the point of the state.
-    let cross = cast::crossing(ms, world.repose);
+    // A crown has no ground for anyone to cross, so nobody does.
+    let cross = ground.then(|| cast::crossing(ms, world.repose)).flatten();
     let (pose, pupil) = match &cross {
         Some(c) if !world.repose => {
             let base = cast::walk_base(w, c.prog, c.right);
@@ -325,7 +428,7 @@ pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Lin
         }
         _ => resting_pose(ms, world),
     };
-    place_eye(&mut grid, eye_left, pose, pupil, ms, world.repose, true);
+    place_eye(&mut grid[sky..], eye_left, pose, pupil, ms, world.repose, ground);
 
     // The company, in the foreground, so it passes in front of the tower's foot
     // instead of vanishing behind it. A flyer is clipped to the columns left of
@@ -335,16 +438,28 @@ pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Lin
         let base = cast::walk_base(w, c.prog, c.right);
         let leg = cast::stride(c.party, ms);
         match c.party.lane {
-            Lane::Ground => (c.party.draw)(&mut grid[4], base, c.right, leg),
+            Lane::Ground => (c.party.draw)(&mut grid[rows - 1], base, c.right, leg),
             Lane::Air => {
                 let lim = (eye_left.max(0) as usize).min(w);
-                (c.party.draw)(&mut grid[3][..lim], base, c.right, leg);
+                (c.party.draw)(&mut grid[rows - 2][..lim], base, c.right, leg);
             }
         }
     }
 
-    place_watching(&mut grid, &watching, &plan, ms, doom_x.unwrap_or(eye_left));
+    place_watching(&mut grid, &watching, &plan, ms, doom_x.unwrap_or(eye_left), framed);
     grid.into_iter().map(row_to_line).collect()
+}
+
+/// The compact header: [`HEIGHT`] rows, self-contained, standing on its own
+/// ground. The fallback when the terminal cannot spare the rows for [`scene_tall`].
+pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
+    build(width, ms, world, watching, HEIGHT as usize, true)
+}
+
+/// The framed header: [`HEIGHT_TALL`] rows, the name set tall inside a rule with
+/// its path hung on the top of it.
+pub fn scene_tall(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
+    build(width, ms, world, watching, HEIGHT_TALL as usize, true)
 }
 
 // --- the whole tower: crown, shaft, and the war at its foot --------------------
@@ -354,20 +469,13 @@ pub fn scene(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Lin
 /// for a shaft segment so the stone keeps descending into [`tower_shaft`]
 /// instead of stopping. No ground and no company here -- those live at the foot.
 pub fn crown(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
-    let w = width.max(20);
-    let mut grid: Vec<Vec<Cell>> = (0..5).map(|_| blank_row(w)).collect();
-    let eye_left = w.saturating_sub(EYE_MARGIN) as i32;
+    build(width, ms, world, watching, HEIGHT as usize, false)
+}
 
-    let plan = plan_sign(watching.name, eye_left);
-    let doom_x = doom_left(eye_left, plan.width());
-    if let Some(x) = doom_x {
-        doom::draw(&mut grid, x, ms, world);
-    }
-
-    let (pose, pupil) = resting_pose(ms, world);
-    place_eye(&mut grid, eye_left, pose, pupil, ms, world.repose, false);
-    place_watching(&mut grid, &watching, &plan, ms, doom_x.unwrap_or(eye_left));
-    grid.into_iter().map(row_to_line).collect()
+/// [`crown`] with the framed, tall-set name -- the pairing of [`scene_tall`] for
+/// a terminal that is drawing the whole tower.
+pub fn crown_tall(width: usize, ms: u64, world: World, watching: Watching) -> Vec<Line<'static>> {
+    build(width, ms, world, watching, HEIGHT_TALL as usize, false)
 }
 
 /// The tower shaft: `height` rows of Barad-dûr's stone, `TOWER_W` wide, meant for
@@ -459,6 +567,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "prints the header for eyeballing: cargo test -- --ignored --nocapture eyeball"]
+    fn eyeball_the_boards() {
+        for name in ["worldsmith", "barnes-hut", "getajob", "agentwatch"] {
+            for w in [52usize, 80] {
+                let watching = Watching { name, path: &format!("~/Downloads/{name}") };
+                println!("--- {name} at {w} columns, framed ---");
+                println!("{}\n", text(&super::scene_tall(w, 0, VIGIL, watching)));
+            }
+        }
+        let watching = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        println!("--- the compact fallback, 52 columns ---");
+        println!("{}\n", text(&super::scene(52, 0, VIGIL, watching)));
+        println!("--- framed crown (whole tower below), 80 columns ---");
+        println!("{}\n", text(&super::crown_tall(80, 0, VIGIL, watching)));
+    }
+
+    #[test]
     fn the_header_is_five_lines_and_never_overflows_width() {
         for &w in &[24usize, 40, 52, 80, 120] {
             for ms in [0u64, 6_000, 13_000, 20_000, 23_000, 46_000, 91_000, 999_999] {
@@ -497,7 +622,7 @@ mod tests {
             "the mountain crowded out the name: {crowded}"
         );
         // ...and the name is all there, not clipped to fit around it.
-        assert!(crowded.contains(&sign::render("agentwatch-frontend", 1)[1]));
+        assert!(crowded.contains(&sign::render("agentwatch-frontend", 1, sign::Face::Block)[1]));
         // Narrow: the mountain is what goes there too.
         let narrow = text(&scene(40, 0, VIGIL));
         assert!(!narrow.contains('▒') && !narrow.contains('░'), "smoke on a narrow header");
@@ -511,7 +636,7 @@ mod tests {
         for build in [super::scene, super::crown] {
             let head = text(&build(120, 0, VIGIL, w));
             // Three rows of block letters, each row present in full.
-            for row in sign::render("agentwatch", 1) {
+            for row in sign::render("agentwatch", 1, sign::Face::Block) {
                 assert!(head.contains(&row), "the name is not in block letters: {head}");
             }
             // And the path, which is the half that disambiguates two checkouts.
@@ -528,8 +653,72 @@ mod tests {
         let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
         let pane = text(&super::scene(52, 0, VIGIL, w));
         assert!(
-            pane.contains(&sign::render("agentwatch", 0)[1]),
+            pane.contains(&sign::render("agentwatch", 0, sign::Face::Block)[1]),
             "the name dropped out of block letters at 52 columns: {pane}"
+        );
+    }
+
+    /// The framed header has to hold its shape everywhere the compact one does:
+    /// a header that overflows its rect corrupts the row below it, and the row
+    /// below it is the session list.
+    #[test]
+    fn the_framed_header_is_eight_lines_and_never_overflows_width() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        for &cols in &[24usize, 40, 52, 80, 120] {
+            for ms in [0u64, 6_000, 13_000, 23_000, 91_000, 999_999] {
+                for world in [VIGIL, PAUSED, REPOSE] {
+                    for build in [super::scene_tall, super::crown_tall] {
+                        let s = build(cols, ms, world, w);
+                        assert_eq!(s.len(), HEIGHT_TALL as usize, "cols={cols} ms={ms} {world:?}");
+                        for l in &s {
+                            assert!(
+                                line_width(l) <= cols,
+                                "overflow at cols={cols} ms={ms} {world:?}: {}",
+                                line_text(l)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The frame is only worth its two rows if it actually closes: an unclosed
+    /// rule reads as a drawing that ran out of room, which is the opposite of the
+    /// "this is a sign, and it is deliberate" the frame is there to say.
+    #[test]
+    fn the_frame_closes_round_the_name_and_hangs_the_path_on_it() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        let lines = super::scene_tall(80, 0, VIGIL, w);
+        let rows: Vec<String> = lines.iter().map(line_text).collect();
+
+        // The lid carries the path, so the path costs no row of its own.
+        assert!(rows[0].contains("╭─ ~/Downloads/agentwatch "), "no titled lid: {}", rows[0]);
+        assert!(rows[0].trim_end().ends_with('╮'), "the lid never closed: {}", rows[0]);
+        // Five rows of letters, each fenced on both sides.
+        let drawn = sign::render("agentwatch", 1, sign::Face::Tall);
+        for (r, letters) in drawn.iter().enumerate() {
+            let row = &rows[1 + r];
+            assert!(row.contains(letters), "letter row {r} is not in tall letters: {row}");
+            assert_eq!(row.chars().nth(1), Some('│'), "row {r} lost its left rule: {row}");
+        }
+        // And the floor closes it.
+        let floor = &rows[1 + sign::Face::Tall.rows()];
+        assert!(floor.contains('╰') && floor.contains('╯'), "the frame has no floor: {floor}");
+    }
+
+    /// The framed form has to survive the width this tool is actually run at.
+    /// The frame costs two columns and the longest of these names has exactly two
+    /// to give -- if that stops being true, the name demotes to capitals at the
+    /// one width where it matters most, and the frame will have cost more than it
+    /// bought.
+    #[test]
+    fn the_framed_name_still_fits_a_workspace_pane() {
+        let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
+        let pane = text(&super::scene_tall(52, 0, VIGIL, w));
+        assert!(
+            pane.contains(&sign::render("agentwatch", 0, sign::Face::Tall)[2]),
+            "the framed name dropped out of block letters at 52 columns: {pane}"
         );
     }
 
@@ -540,7 +729,7 @@ mod tests {
     fn a_narrow_header_shrinks_the_name_rather_than_dropping_it() {
         let w = Watching { name: "agentwatch", path: "~/Downloads/agentwatch" };
         let narrow = text(&super::scene(40, 0, VIGIL, w));
-        assert!(!narrow.contains(&sign::render("agentwatch", 0)[0]), "block letters fit at 40?");
+        assert!(!narrow.contains(&sign::render("agentwatch", 0, sign::Face::Block)[0]), "block letters fit at 40?");
         assert!(narrow.contains("AGENTWATCH"), "the name vanished at 40 columns: {narrow}");
         // Small enough that even the capitals have to be cut -- what survives is
         // still the front of the name, not nothing.
@@ -572,8 +761,8 @@ mod tests {
         // the Eye's -- the mountain is drawn first and everything else must stop
         // short of it.
         let eye_left = 100i32 - EYE_MARGIN as i32;
-        let plan = plan_sign(DEMO.name, eye_left);
-        let doom_x = doom_left(eye_left, plan.width()).expect("100 columns fits a mountain");
+        let plan = plan_sign(DEMO.name, eye_left, sign::Face::Block, false);
+        let doom_x = doom_left(eye_left, plan.width(false)).expect("100 columns fits a mountain");
         for ms in [0u64, 30_000, 60_000] {
             for row in scene(100, ms, VIGIL).iter().take(4) {
                 for (i, ch) in line_text(row).chars().enumerate() {

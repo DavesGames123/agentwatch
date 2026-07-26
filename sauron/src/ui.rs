@@ -168,10 +168,17 @@ fn world_of(rows: &[Row]) -> crate::scene::World {
 pub fn draw(f: &mut Frame, v: &View, list_state: &mut ListState, geo: &mut FrameGeometry) {
     // The full five-line Eye earns its keep only when the terminal is tall
     // enough to spare the rows; below that the header collapses to the compact
-    // one-line Eye so the list and detail keep their space.
+    // one-line Eye so the list and detail keep their space. Taller still, the
+    // name goes up framed and set at five rows -- three rows dearer, and only
+    // out of rows the list would not have missed.
     let full = f.area();
     let tall = full.height >= 24;
-    let header_h = if tall { 1 + crate::scene::HEIGHT } else { 2 };
+    let framed = full.height >= crate::scene::TALL_MIN_H;
+    let header_h = match (tall, framed) {
+        (_, true) => 1 + crate::scene::HEIGHT_TALL,
+        (true, false) => 1 + crate::scene::HEIGHT,
+        (false, false) => 2,
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -446,11 +453,17 @@ fn header(f: &mut Frame, area: Rect, v: &View, mordor: bool, world: crate::scene
             path: v.repo_path,
         };
         let w = area.width as usize;
-        if mordor {
-            lines.extend(crate::scene::crown(w, v.anim_ms, world, watching));
-        } else {
-            lines.extend(crate::scene::scene(w, v.anim_ms, world, watching));
-        }
+        // Which of the two heights the layout above already budgeted for. Read
+        // back off the rect rather than recomputed from the terminal, so the
+        // drawing cannot claim more rows than the layout handed it. The row over
+        // the scene's own height is the status line this sits under.
+        let framed = area.height > crate::scene::HEIGHT_TALL;
+        lines.extend(match (mordor, framed) {
+            (true, true) => crate::scene::crown_tall(w, v.anim_ms, world, watching),
+            (true, false) => crate::scene::crown(w, v.anim_ms, world, watching),
+            (false, true) => crate::scene::scene_tall(w, v.anim_ms, world, watching),
+            (false, false) => crate::scene::scene(w, v.anim_ms, world, watching),
+        });
     } else {
         lines.push(engraved_rule(area.width as usize, v.anim_ms));
     }
@@ -1013,7 +1026,7 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64, offset: i64) {
         }
         Status::Blocked => {
             let text = match row.blocked_reason {
-                Some(r) => format!("{} — switch to its terminal, or a to dismiss", r.detail()),
+                Some(r) => format!("{} — switch to its terminal, or a to set aside", r.detail()),
                 None => "waiting on you".to_string(),
             };
             lines.push(Line::styled(
@@ -1121,12 +1134,15 @@ fn footer(f: &mut Frame, area: Rect, v: &View) {
     // keys that toggle a view, and `q` is last because nobody needs telling.
     let mut hints: Vec<(&str, String)> = vec![
         ("j/k", "move".into()),
-        ("a", "ack/dismiss".into()),
+        // "ack/defer", not "ack/dismiss": `D` is dismiss now, and two keys
+        // labelled with the same word is worse than a slightly stiffer one.
+        ("a", "ack/defer".into()),
         ("n", "new pane".into()),
         ("⏎", "open pane".into()),
         ("O", "orc".into()),
         ("y", "copy".into()),
         ("u", "undo".into()),
+        ("D", "dismiss".into()),
         ("A", "ack all".into()),
         (
             "c",
@@ -1271,6 +1287,61 @@ mod tests {
         for ms in [0u64, 2_500, 3_000, 8_000, 11_600, 999_999] {
             assert_eq!(eye(ms).len(), 5, "pose at {ms}ms was not five glyphs");
         }
+    }
+
+    /// The header has three rungs and the terminal's rows pick which. The frame
+    /// is the expensive one -- nine rows of header against the compact six --
+    /// and it is only correct while the list still has rows to show sessions in.
+    /// A short terminal that framed its name would have spent the list on
+    /// chrome, which is the trade this ladder exists to refuse.
+    #[test]
+    fn the_header_frames_the_name_only_on_a_terminal_that_can_spare_the_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let screen = |h: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(52, h)).unwrap();
+            let view = View {
+                rows: &[],
+                selected: 0,
+                now: 0,
+                repo: "demo",
+                repo_path: "~/src/demo",
+                saved: false,
+                hidden_stale: 0,
+                clear_count: 0,
+                show_clear: false,
+                copied: false,
+                spawned: None,
+                anim_ms: 0,
+                local_offset: 0,
+                awaiting_log_dir: None,
+                pick: None,
+            };
+            let mut ls = ListState::default();
+            let mut geo = FrameGeometry::default();
+            terminal.draw(|f| draw(f, &view, &mut ls, &mut geo)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..h)
+                .map(|y| (0..52u16).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Tall enough: the name is framed, and the path hangs on the frame.
+        let framed = screen(crate::scene::TALL_MIN_H);
+        assert!(framed.contains("╭─ ~/src/demo"), "no frame on a tall terminal: {framed}");
+
+        // A row short of that: the compact header, which still names the repo in
+        // block letters but pays no frame -- the path keeps its own row instead.
+        let compact = screen(crate::scene::TALL_MIN_H - 1);
+        assert!(!compact.contains("╭─ ~/src/demo"), "framed below the threshold: {compact}");
+        assert!(compact.contains("~/src/demo"), "the compact header lost the path: {compact}");
+
+        // Shorter still: no scene at all, and the name falls back to the badge on
+        // the status line rather than disappearing.
+        let collapsed = screen(20);
+        assert!(collapsed.contains("DEMO"), "the name vanished on a short terminal: {collapsed}");
     }
 
     #[test]
