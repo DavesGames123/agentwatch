@@ -23,11 +23,13 @@
 //!   mod model       -- session model and status classification
 //!   mod scan        -- incremental log tailer
 //!   mod store       -- ack persistence, safe against concurrent writers
+//!   mod gui         -- docking a project's own app window into the workspace
 
 pub mod agent;
 pub mod board;
 pub mod clip;
 pub mod codex;
+pub mod gui;
 pub mod handoff;
 pub mod model;
 pub mod orc;

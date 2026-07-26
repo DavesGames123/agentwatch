@@ -32,7 +32,7 @@ use ratatui::widgets::ListState;
 use sauron::agent::Agent;
 use sauron::board::Board;
 use sauron::model::{self, now_ms, Status};
-use sauron::{clip, git_root, handoff, orc, ui, workspace};
+use sauron::{clip, git_root, gui, handoff, orc, ui, workspace};
 
 /// How often the logs are re-tailed. Only appended bytes are parsed, so this is
 /// cheap even with 10MB session files.
@@ -488,6 +488,13 @@ fn main() -> std::io::Result<()> {
     // and execs the agent, so the pane ends up owned by the agent itself.
     if args.first().map(|s| s.as_str()) == Some("orc") {
         return orc::run(&args[1..], explicit_agent);
+    }
+
+    // `sauron gui [repo]` -- launch the repo's declared application and dock its
+    // window into the hole the workspace layout leaves for it. This is what the
+    // app-log pane runs, and it is inert in any repo with no `.sauron/gui.conf`.
+    if args.first().map(|s| s.as_str()) == Some("gui") {
+        return gui::run(&args[1..]);
     }
 
     let once = args.iter().any(|a| a == "--once");

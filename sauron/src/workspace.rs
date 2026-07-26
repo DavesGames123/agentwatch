@@ -13,6 +13,7 @@
 //!   fn resolve          -- a project arg (path or saved alias) -> repo dir
 //!   fn store_* / alias  -- the name->path registry (~/.claude/sauron/workspaces)
 //!   fn applescript      -- the iTerm layout script
+//!   fn gui_applescript  -- the same, with a hole in it for the project's app
 //!   fn spawn_left_pane  -- grow the agent column from inside the running TUI
 //!   fn spawn_script     -- the split script that does it
 //!   fn spawn_orc_pane   -- stage an orc in sauron's own column, from the TUI
@@ -22,6 +23,11 @@
 //! The orc *charge* -- what the agent is actually told to do, and which files are
 //! cold enough to hand it -- lives in `orc`, not here. This module only decides
 //! where the pane goes.
+//!
+//! A repo that declares a GUI (`.sauron/gui.conf`, see `gui`) gets the second
+//! layout instead: four quarter-width columns, with the middle two left as a
+//! hole for the application's own window. Every other repo takes the original
+//! path, native fullscreen and all, byte for byte.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
@@ -29,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agent::{Agent, Mordor};
+use crate::gui::Gui;
 use crate::scan::home;
 
 /// Entry point for `sauron workspace <args>` (args are everything after the
@@ -77,6 +84,11 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
     // `--nostromo[=<tag>]` is the same, but pointed at the nostromo box over
     // Tailscale instead of localhost -- a remote local-swarm in one word.
     let mut mordor: Option<Mordor> = None;
+    // GUI docking: `--gui` forces it on for a repo with no conf (taking the
+    // command inline), `--no-gui` opens the ordinary layout in a repo that has
+    // one. Neither is needed in the normal case -- the repo's conf decides.
+    let mut gui_flag: Option<Option<String>> = None;
+    let mut no_gui = false;
     let mut pos: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -119,6 +131,15 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
                     std::process::exit(2);
                 }
             }
+            i += 1;
+        } else if a == "--gui" {
+            gui_flag = Some(None);
+            i += 1;
+        } else if let Some(rest) = a.strip_prefix("--gui=") {
+            gui_flag = Some(Some(rest.to_string()));
+            i += 1;
+        } else if a == "--no-gui" {
+            no_gui = true;
             i += 1;
         } else if a == "--yes" || a == "-y" {
             yes = true;
@@ -187,6 +208,31 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
             agent.label()
         );
         mordor = None;
+    }
+
+    // Does this repo have an application to dock? Almost none do, and the ones
+    // that don't never touch the GUI layout at all. `--gui` without a command
+    // still needs the conf for the rest of its settings, so an inline command is
+    // the only way to dock a repo that has declared nothing.
+    let forced = matches!(gui_flag, Some(None));
+    let gui: Option<Gui> = if no_gui {
+        None
+    } else {
+        match gui_flag {
+            Some(Some(cmd)) => Some(Gui {
+                cmd,
+                ..Gui::default()
+            }),
+            Some(None) | None => crate::gui::config(&repo),
+        }
+    };
+    if gui.is_none() && forced {
+        eprintln!(
+            "sauron workspace: --gui, but {} declares nothing to launch.",
+            repo.join(crate::gui::CONF).display()
+        );
+        eprintln!("  pass the command inline instead:  --gui='./run.sh'");
+        std::process::exit(2);
     }
 
     let work = crate::in_flight_tasks(repo.clone(), agent);
@@ -275,22 +321,47 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
             );
         }
         println!("SAURON={}", sauron_exe.display());
+        if let Some(g) = &gui {
+            println!("GUI={}", g.cmd);
+            println!("GUI_KEEP={:?}", g.keep);
+        }
         for t in &orc_targets {
             println!("ORC={t}");
         }
         return Ok(());
     }
 
-    let script = applescript(
-        &repo_s,
-        &sauron_exe.to_string_lossy(),
-        total,
-        &work,
-        &orc_cmds,
-        agent,
-        mordor.as_ref(),
-        clipboard_handoff,
-    );
+    let script = match &gui {
+        Some(_) => gui_applescript(
+            &repo_s,
+            &sauron_exe.to_string_lossy(),
+            total,
+            &work,
+            &orc_cmds,
+            agent,
+            mordor.as_ref(),
+            clipboard_handoff,
+            &crate::gui::stage_command(&sauron_exe, &repo_s),
+        ),
+        None => applescript(
+            &repo_s,
+            &sauron_exe.to_string_lossy(),
+            total,
+            &work,
+            &orc_cmds,
+            agent,
+            mordor.as_ref(),
+            clipboard_handoff,
+        ),
+    };
+    // The layout is a program in another language, and a unit test on the string
+    // it produces is not evidence that iTerm2 accepts it. This prints the script
+    // instead of running it, so the real thing can be executed and the resulting
+    // window measured.
+    if std::env::var_os("WORKSPACE_PRINT_SCRIPT").is_some() {
+        print!("{script}");
+        return Ok(());
+    }
     osascript(&script)?;
 
     let resumed = total.min(work.len());
@@ -307,6 +378,12 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
         println!(
             "  Mordor: hobbits & orcs run the local model '{}' via Ollama ({}) — the Eye stays on the hosted API.",
             m.model, m.base_url
+        );
+    }
+    if let Some(g) = &gui {
+        println!(
+            "  GUI: the middle two columns are held open for '{}' — press Enter in the app pane to launch it.",
+            g.cmd
         );
     }
     Ok(())
@@ -512,41 +589,7 @@ fn applescript(
     mordor: Option<&Mordor>,
     clipboard_handoff: bool,
 ) -> String {
-    // Left column: resume each in-flight session, a fresh agent for the rest. In
-    // Mordor mode each hobbit carries the local-model env before the agent word;
-    // the orcs already carry theirs (built in `orc_command`), and the sauron
-    // watcher pane deliberately does not -- the Eye calls no model.
-    let env = agent.local_env(mordor);
-    let left: Vec<String> = (0..total)
-        .map(|i| match work.get(i) {
-            Some((id, _)) if clipboard_handoff => {
-                let key = crate::handoff::handoff_key(Path::new(repo), &format!("slot.{i}"));
-                crate::handoff::workspace_command(
-                    Path::new(repo),
-                    Path::new(sauron_exe),
-                    agent,
-                    &key,
-                    Some(id),
-                    None,
-                    false,
-                )
-            }
-            None if clipboard_handoff => {
-                let key = crate::handoff::handoff_key(Path::new(repo), &format!("slot.{i}"));
-                crate::handoff::workspace_command(
-                    Path::new(repo),
-                    Path::new(sauron_exe),
-                    agent,
-                    &key,
-                    None,
-                    None,
-                    false,
-                )
-            }
-            Some((id, _)) => format!("cd {repo} && {env}{}", agent.resume_cmd(id)),
-            None => format!("cd {repo} && {env}{}", agent.label()),
-        })
-        .collect();
+    let left = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
     let sauron_flag = agent.label(); // watcher pane matches the chosen agent
 
     // Right column beneath sauron: the orcs, then a shell. With no orcs, two
@@ -623,6 +666,191 @@ tell application "iTerm2"
 
   -- Land focus on the first agent pane.
   select leftTop
+end tell
+"#
+    )
+}
+
+/// The agent column's commands: resume each in-flight session, a fresh agent for
+/// the rest. In Mordor mode each hobbit carries the local-model env before the
+/// agent word; the orcs already carry theirs (built in `orc_command`), and the
+/// sauron watcher pane deliberately does not -- the Eye calls no model.
+///
+/// Shared by both layouts, because the *column* is the same thing in each; only
+/// the geometry around it differs.
+fn left_commands(
+    repo: &str,
+    sauron_exe: &str,
+    total: usize,
+    work: &[(String, String)],
+    agent: Agent,
+    mordor: Option<&Mordor>,
+    clipboard_handoff: bool,
+) -> Vec<String> {
+    let env = agent.local_env(mordor);
+    (0..total)
+        .map(|i| match work.get(i) {
+            Some((id, _)) if clipboard_handoff => {
+                let key = crate::handoff::handoff_key(Path::new(repo), &format!("slot.{i}"));
+                crate::handoff::workspace_command(
+                    Path::new(repo),
+                    Path::new(sauron_exe),
+                    agent,
+                    &key,
+                    Some(id),
+                    None,
+                    false,
+                )
+            }
+            None if clipboard_handoff => {
+                let key = crate::handoff::handoff_key(Path::new(repo), &format!("slot.{i}"));
+                crate::handoff::workspace_command(
+                    Path::new(repo),
+                    Path::new(sauron_exe),
+                    agent,
+                    &key,
+                    None,
+                    None,
+                    false,
+                )
+            }
+            Some((id, _)) => format!("cd {repo} && {env}{}", agent.resume_cmd(id)),
+            None => format!("cd {repo} && {env}{}", agent.label()),
+        })
+        .collect()
+}
+
+/// The layout for a repo that has an application of its own: three equal
+/// columns -- agents, the application, the Eye -- with the middle one held open
+/// and the app's own window docked into it by `sauron gui`.
+///
+/// Three things here are forced by iTerm2 rather than chosen:
+///
+/// **No native fullscreen.** A fullscreen Space holds exactly one window, so a
+/// natively-fullscreened workspace could never share a screen with the
+/// application. `set zoomed to true` fills the display the window opened on
+/// instead -- and it needs no screen arithmetic, which matters because
+/// `bounds of window of desktop` spans *all* displays on a multi-monitor Mac.
+///
+/// **Thirds, from equal siblings.** A divider cannot be placed: `set columns` on
+/// a split pane is accepted and does nothing, and iTerm2's windows expose no
+/// `AXSplitGroup`. What iTerm2 *does* do is redistribute a splitter evenly every
+/// time a pane joins it, so N splits off one splitter give N+1 equal panes --
+/// measured, not assumed: three vertical splits produced four 67-column panes in
+/// a 271-column window. Two splits give the thirds this layout wants, and the
+/// middle column's two splits give a hole two thirds tall over a log strip.
+///
+/// **Tagged panes.** The panes behind the app still exist and still sort ahead
+/// of the Eye, so the TUI's `n` / `Enter` / `O` would happily split one and hide
+/// an agent behind a game. Each is marked with a session variable, which --
+/// unlike a pane title -- no program's escape sequences can overwrite.
+#[allow(clippy::too_many_arguments)]
+fn gui_applescript(
+    repo: &str,
+    sauron_exe: &str,
+    total: usize,
+    work: &[(String, String)],
+    orc_cmds: &[String],
+    agent: Agent,
+    mordor: Option<&Mordor>,
+    clipboard_handoff: bool,
+    gui_cmd: &str,
+) -> String {
+    let left = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
+    let left_list = as_list(&left);
+    let orc_list = as_list(orc_cmds);
+    let sauron_flag = agent.label();
+
+    // Set the frame outright when AppKit will tell us what it is. `zoomed` is
+    // the fallback and not the default because it keeps the window's origin and
+    // only grows to the screen edge -- measured at 1462 points wide on a 1512
+    // point display, with the left column hanging off the side.
+    let fill = match crate::gui::visible_frame() {
+        Some(f) => format!(
+            "set bounds of w to {{{}, {}, {}, {}}}",
+            f.x,
+            f.y,
+            f.x + f.w,
+            f.y + f.h
+        ),
+        None => "set zoomed of w to true".to_string(),
+    };
+
+    format!(
+        r#"tell application "iTerm2"
+  activate
+  set w to (create window with default profile)
+end tell
+delay 0.6
+
+-- Fill the display this window opened on, rather than going native-fullscreen:
+-- a fullscreen Space accepts exactly one window, and this layout has to share
+-- the screen with the application it is holding a hole open for.
+tell application "iTerm2"
+  {fill}
+end tell
+delay 0.8
+
+tell application "iTerm2"
+  set t to current tab of w
+  set agentTop to current session of t
+  set leftCmds to {{{left_list}}}
+  set orcCmds to {{{orc_list}}}
+
+  -- Three equal columns: agents | the app's hole | the Eye. Both splits come
+  -- off the same splitter, and iTerm2 re-divides a splitter evenly whenever a
+  -- pane joins it, so two splits are exactly thirds.
+  tell agentTop to set hole to (split vertically with default profile)
+  tell hole to set eye to (split vertically with default profile)
+
+  -- The middle column: three equal rows. The application covers the top two,
+  -- and the bottom one stays visible -- that strip is where its own output goes.
+  tell hole to set holeMid to (split horizontally with default profile)
+  tell holeMid to set appLog to (split horizontally with default profile)
+
+  -- Mark every pane the application sits over. A session variable survives what
+  -- a pane title does not -- any program can rewrite its title with an escape
+  -- sequence -- and this mark is what lets the TUI's pane-spawning keys skip
+  -- these panes and still find the agent column.
+  set guiPanes to {{hole, holeMid, appLog}}
+  repeat with k from 1 to (count of guiPanes)
+    tell (item k of guiPanes)
+      set variable named "user.sauron_role" to "gui"
+    end tell
+  end repeat
+
+  -- The app's launcher is STAGED, not run: `run.sh` is a release build, and a
+  -- window opening is not consent to start one. Press Enter to loose it.
+  tell appLog to write text "{gui_cmd}" newline no
+
+  -- The Eye, full height in the last quarter, with any orcs stacked under it.
+  tell eye to write text "cd {repo} && {sauron_exe} --{sauron_flag}"
+  set eyePanes to {{eye}}
+  repeat with i from 1 to (count of orcCmds)
+    set tallest to item 1 of eyePanes
+    repeat with k from 1 to (count of eyePanes)
+      if (rows of (item k of eyePanes)) > (rows of tallest) then set tallest to (item k of eyePanes)
+    end repeat
+    tell tallest to set newP to (split horizontally with default profile)
+    tell newP to write text (item i of orcCmds) newline no
+    set end of eyePanes to newP
+  end repeat
+
+  -- Agent column: one pane per hobbit command, splitting the tallest each step
+  -- so the column stays even instead of halving the newest pane every time.
+  tell agentTop to write text (item 1 of leftCmds)
+  set leftPanes to {{agentTop}}
+  repeat with i from 2 to (count of leftCmds)
+    set tallest to item 1 of leftPanes
+    repeat with k from 1 to (count of leftPanes)
+      if (rows of (item k of leftPanes)) > (rows of tallest) then set tallest to (item k of leftPanes)
+    end repeat
+    tell tallest to set newP to (split horizontally with default profile)
+    tell newP to write text (item i of leftCmds)
+    set end of leftPanes to newP
+  end repeat
+
+  select agentTop
 end tell
 "#
     )
@@ -757,7 +985,9 @@ fn orc_spawn_script(session_uuid: &str, cmd: &str) -> String {
       if idx > 0 then
         set found to true
         repeat with k from idx to (count of ss)
-          set end of rights to (item k of ss)
+          -- Same exclusion as the agent column: an orc staged into a pane the
+          -- application covers would be doing its work invisibly.
+          if not (my isGuiPane(item k of ss)) then set end of rights to (item k of ss)
         end repeat
         exit repeat
       end if
@@ -783,6 +1013,8 @@ fn orc_spawn_script(session_uuid: &str, cmd: &str) -> String {
   select newP
 end tell
 return "OK"
+
+{GUI_HANDLER}
 "#
     )
 }
@@ -830,7 +1062,10 @@ fn spawn_script(session_uuid: &str, cmd: &str, focus: bool) -> String {
       if idx > 0 then
         set found to true
         repeat with k from 1 to (idx - 1)
-          set end of lefts to (item k of ss)
+          -- Skip the panes a docked application is sitting on top of: they are
+          -- ahead of sauron in split order like the agent column is, but
+          -- splitting one would file a live agent away behind a game window.
+          if not (my isGuiPane(item k of ss)) then set end of lefts to (item k of ss)
         end repeat
         exit repeat
       end if
@@ -853,9 +1088,31 @@ fn spawn_script(session_uuid: &str, cmd: &str, focus: bool) -> String {
   tell newP to write text "{cmd}"
 {select}end tell
 return "OK"
+
+{GUI_HANDLER}
 "#
     )
 }
+
+/// The one shared AppleScript handler: is this pane part of a docked
+/// application's hole?
+///
+/// Read from a session variable rather than the pane's name because any program
+/// running in a pane can rewrite its title with an escape sequence -- and the
+/// panes in question are running shells, which do exactly that on every prompt.
+/// In a workspace with no GUI nothing carries the mark, so every pane answers
+/// false and both scripts behave exactly as they did before.
+const GUI_HANDLER: &str = r#"on isGuiPane(s)
+  set paneRole to ""
+  try
+    tell application "iTerm2"
+      tell s
+        set paneRole to variable named "user.sauron_role"
+      end tell
+    end tell
+  end try
+  return (paneRole is "gui")
+end isGuiPane"#;
 
 /// Pipe the AppleScript to `osascript` on stdin and hand back its stdout. Unlike
 /// `osascript`, this never prints or exits -- its caller is the TUI.
@@ -1084,6 +1341,132 @@ mod tests {
         assert!(s.contains("--resume 'id-1'"));
         assert!(s.contains("slot.0.handoff"));
         assert!(s.contains("slot.1.handoff"));
+    }
+
+    /// The isolation contract, stated as a test: a repo with no GUI gets the
+    /// layout it always got. If this fails, the hook has leaked.
+    #[test]
+    fn a_repo_without_a_gui_gets_the_original_layout_untouched() {
+        let work = vec![("id-1".to_string(), "task one".to_string())];
+        let s = applescript("/repo", "/bin/sauron", 3, &work, &[], Agent::Claude, None, false);
+        assert!(s.contains(r#"set value of attribute "AXFullScreen" of window 1 to true"#));
+        assert!(!s.contains("set zoomed"));
+        assert!(!s.contains("user.sauron_role"));
+        assert!(!s.contains("sauron gui"));
+    }
+
+    #[test]
+    fn gui_layout_holds_the_middle_column_open_for_the_app() {
+        let work = vec![("id-1".into(), "t".into())];
+        let s = gui_applescript(
+            "/repo",
+            "/bin/sauron",
+            2,
+            &work,
+            &[],
+            Agent::Claude,
+            None,
+            false,
+            "cd /repo && /bin/sauron gui",
+        );
+        // agents | hole | eye. Two splits off one splitter, which iTerm2 then
+        // divides evenly -- that, not halving, is what makes them exact thirds,
+        // and it is why there are two splits here and not three.
+        assert!(s.contains("tell agentTop to set hole to (split vertically with default profile)"));
+        assert!(s.contains("tell hole to set eye to (split vertically with default profile)"));
+        // The middle column is three equal rows; the app covers the top two.
+        assert!(s.contains("tell hole to set holeMid to (split horizontally with default profile)"));
+        assert!(s.contains("tell holeMid to set appLog to (split horizontally with default profile)"));
+        // The Eye keeps the last column, and still watches the chosen agent.
+        assert!(s.contains("tell eye to write text \"cd /repo && /bin/sauron --claude\""));
+        // A hobbit still resumes its session in the agent column.
+        assert!(s.contains("cd /repo && claude --resume id-1"));
+    }
+
+    /// The layout and `gui::DEFAULT_RECT` describe the same rectangle in two
+    /// languages. If one moves without the other, the application lands over the
+    /// Eye or over the agent column, which is the failure that looks like a bug
+    /// in the docking rather than in the layout.
+    #[test]
+    fn the_hole_and_the_docking_rect_agree_on_thirds() {
+        let (x, y, w, h) = crate::gui::DEFAULT_RECT;
+        assert!((x - 1.0 / 3.0).abs() < 1e-9, "hole starts one column across");
+        assert!((w - 1.0 / 3.0).abs() < 1e-9, "and is one column wide");
+        assert_eq!(y, 0.0);
+        assert!((h - 2.0 / 3.0).abs() < 1e-9, "two of the column's three rows");
+        // Exactly one pane in the middle column is left uncovered, and it is the
+        // one the launcher was typed into.
+        let s = gui_applescript(
+            "/repo", "/bin/sauron", 1, &[], &[], Agent::Claude, None, false, "cd /repo && /bin/sauron gui",
+        );
+        assert!(s.contains("set guiPanes to {hole, holeMid, appLog}"));
+    }
+
+    #[test]
+    fn gui_layout_cannot_use_native_fullscreen() {
+        // A fullscreen Space holds one window. Going fullscreen here would put
+        // the application on a different Space than the workspace holding a hole
+        // open for it -- the one failure that makes the whole feature pointless.
+        let s = gui_applescript(
+            "/repo", "/bin/sauron", 1, &[], &[], Agent::Claude, None, false, "cd /repo && /bin/sauron gui",
+        );
+        assert!(!s.contains("AXFullScreen"));
+        // Either frame source is acceptable -- which one appears depends on
+        // whether AppKit answered on the machine running the test.
+        assert!(s.contains("set bounds of w to {") || s.contains("set zoomed of w to true"));
+    }
+
+    #[test]
+    fn gui_layout_tags_every_pane_the_app_covers() {
+        let s = gui_applescript(
+            "/repo", "/bin/sauron", 1, &[], &[], Agent::Claude, None, false, "cd /repo && /bin/sauron gui",
+        );
+        assert!(s.contains("set guiPanes to {hole, holeMid, appLog}"));
+        assert!(s.contains(r#"set variable named "user.sauron_role" to "gui""#));
+    }
+
+    /// Same contract as an orc, for the same reason: `run.sh` is a release
+    /// build, and opening a window is not consent to start one.
+    #[test]
+    fn gui_launcher_is_staged_not_run() {
+        let s = gui_applescript(
+            "/repo", "/bin/sauron", 1, &[], &[], Agent::Claude, None, false, "cd /repo && /bin/sauron gui",
+        );
+        assert!(
+            s.contains(r#"tell appLog to write text "cd /repo && /bin/sauron gui" newline no"#),
+            "the app launcher must be typed and left awaiting Enter: {s}"
+        );
+    }
+
+    #[test]
+    fn gui_layout_stacks_orcs_under_the_eye_not_in_the_hole() {
+        let orcs = vec![orc_command(
+            "/repo",
+            Path::new("/bin/sauron"),
+            "src/big.rs",
+            Agent::Claude,
+            None,
+        )];
+        let s = gui_applescript(
+            "/repo", "/bin/sauron", 1, &[], &orcs, Agent::Claude, None, false, "cd /repo && /bin/sauron gui",
+        );
+        assert!(s.contains("set eyePanes to {eye}"));
+        assert!(s.contains("set orcCmds to {\"cd /repo && /bin/sauron orc src/big.rs\"}"));
+        // Still staged, exactly as in the ordinary layout.
+        assert!(s.contains("tell newP to write text (item i of orcCmds) newline no"));
+    }
+
+    #[test]
+    fn both_spawn_scripts_skip_the_panes_under_a_docked_app() {
+        let left = spawn_script("UUID-1", "cd /repo && claude", false);
+        let orc = orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs");
+        for s in [&left, &orc] {
+            assert!(s.contains("my isGuiPane(item k of ss)"));
+            assert!(s.contains("on isGuiPane(s)"));
+            // Read from a session variable, not the pane title: a shell rewrites
+            // its title on every prompt, and would erase a name-based mark.
+            assert!(s.contains(r#"variable named "user.sauron_role""#));
+        }
     }
 
     #[test]

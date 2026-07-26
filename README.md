@@ -429,6 +429,104 @@ not carry it.
 
 ---
 
+## 🖥 GUI projects — the thing you're building, in the layout
+
+> **Opt-in per repo. A repo that declares nothing gets the ordinary layout, byte
+> for byte.**
+
+Most repos sauron watches are not terminal programs. When the project has an
+application of its own, the workspace holds a column open for it:
+
+```
+┌──────────────┬──────────────┬──────────────┐
+│              │              │              │
+│   agents     │   your app   │    sauron    │
+│              │  (its own    │   (the Eye)  │
+│              │   window)    │              │
+│              ├──────────────┤              │
+│              │   app log    │              │
+└──────────────┴──────────────┴──────────────┘
+```
+
+Declare it in the repo — the project is the thing that knows how it launches, and
+the declaration should travel with the checkout:
+
+```bash
+# <repo>/.sauron/gui.conf
+cmd  = ./run.sh          # required; run through `sh -c` from the repo root
+keep = app               # app | raise | off  (see below)
+rect = 0.33,0,0.33,0.66  # optional: the app's share of the window
+app  = stella-nova       # optional: only if the process tree walk misses it
+```
+
+Then `sauron workspace` lays out three equal columns instead of two, and stages
+`sauron gui` in the strip under the hole — **typed, not run**, the same contract
+an orc has. `run.sh` is a release build; a window opening is not consent to start
+one. Press Enter and the app launches, its output fills the strip, and its window
+is docked into the column above.
+
+`--gui='./run.sh'` docks a repo that has declared nothing; `--no-gui` opens the
+ordinary layout in a repo that has.
+
+### Two things macOS decides for you
+
+**A GUI workspace is not natively fullscreen.** A fullscreen Space accepts
+exactly one window, so a fullscreened workspace could never share a screen with
+the application it is holding a hole open for. The window is sized to the display
+instead — asked of AppKit, so it knows where your Dock is.
+
+**Whether the app can be moved from outside depends on how it was built.** This is
+the part worth reading before you file a bug:
+
+| Your app is… | What works | Why |
+|:--|:--|:--|
+| a bundled `.app` | `keep = raise` — sauron moves, sizes, and re-raises it, no cooperation needed | it publishes an Accessibility window hierarchy |
+| a bare binary (`cargo run`) | `keep = app` — the app places itself | it publishes **no** AX windows at all |
+
+That second row is measured, not guessed: a running winit app, `background only
+= false`, `visible = true`, frontmost — and `count of windows` still `0`. No API
+reaches that window from outside the process. So sauron hands every child the
+coordinates instead:
+
+```bash
+SAURON_DOCK_RECT=537,33,487,633   # x,y,w,h in points, the hole in this window
+SAURON_DOCK_TOP=1                 # keep = app: pin yourself above the terminal
+```
+
+…and the app spends four lines placing itself. In winit 0.30:
+
+```rust
+if let Ok(r) = std::env::var("SAURON_DOCK_RECT") {
+    let n: Vec<f64> = r.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    if let [x, y, w, h] = n[..] {
+        attrs = attrs
+            .with_position(LogicalPosition::new(x, y))
+            .with_inner_size(LogicalSize::new(w, h));
+        if std::env::var("SAURON_DOCK_TOP").as_deref() == Ok("1") {
+            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+        }
+    }
+}
+```
+
+`SAURON_DOCK_TOP` is what keeps the app visible when you click into a pane —
+macOS raises *all* of an app's windows when you activate it, so without a window
+level the terminal would bury the app every time you typed. (For bundled apps
+sauron does this from outside with `AXRaise`, which reorders a window **without**
+activating its process — the app floats up, your keystrokes stay in the terminal.)
+
+If no window ever appears in Accessibility, the app pane says so once, with the
+rect it should have used, rather than polling in silence.
+
+### The panes under the app
+
+The app's window covers real panes, which are marked with a session variable —
+not a pane title, which any program rewrites with an escape sequence on every
+prompt. <kbd>n</kbd>, <kbd>⏎</kbd>, and <kbd>O</kbd> skip the marked ones, so
+growing the agent column never files a live agent away behind a game.
+
+---
+
 ## 🌋 Mordor mode — a local swarm
 
 > **Off the grid. Your servants toil on a model of your own, on your own iron.**
@@ -621,6 +719,7 @@ sauron/src/
   clip/         ·  SQLite-compatible Agent Clipboard store + CLI
   handoff.rs    ·  strict opt-in clipboard pass lifecycle
   workspace.rs  ·  the `sauron workspace` launcher + iTerm pane splitting
+  gui.rs        ·  .sauron/gui.conf, the docked app window, `sauron gui`
   orc.rs        ·  the orc charge, cold-file ranking, `sauron orc <file>`
 docs/AGENTS.md  ·  using Codex, and adding another agent
 ```
