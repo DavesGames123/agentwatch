@@ -19,6 +19,7 @@
 //! three files move into the library without a single line changing.
 //!
 //! grep targets:
+//!   mod beacon      -- publishing the board where a watched project can read it
 //!   mod board       -- the headless per-repo watcher, shared by both front ends
 //!   mod model       -- session model and status classification
 //!   mod scan        -- incremental log tailer
@@ -27,6 +28,7 @@
 //!   mod mirror      -- drawing that window *inside* a pane, frame by frame
 
 pub mod agent;
+pub mod beacon;
 pub mod board;
 pub mod clip;
 pub mod codex;
@@ -35,6 +37,7 @@ pub mod handoff;
 pub mod mirror;
 pub mod model;
 pub mod orc;
+pub mod panel;
 pub mod scan;
 pub mod scene;
 pub mod store;

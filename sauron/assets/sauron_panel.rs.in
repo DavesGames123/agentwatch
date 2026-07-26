@@ -1,0 +1,808 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  sauron_panel.rs — GENERATED FILE. DO NOT EDIT.
+//
+//  Regenerate with:  sauron panel install {{INSTALL_ARGS}}
+//  Beacon format:    v{{VERSION}}
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  An in-app pane showing what sauron currently says needs attending to in this
+//  repo: agents that errored, agents blocked on a question, edits written but
+//  never verified. It appears only while a sauron instance is actually watching
+//  this project, and vanishes on its own when that instance goes away.
+//
+//  HOW IT KNOWS
+//  ------------
+//  sauron republishes a snapshot of its board every two seconds to
+//  ~/.claude/sauron/beacons/<repo-path-with-dashes>.beacon. This file stats that
+//  path a couple of times a second, re-reads it only when the mtime moves, and
+//  refuses to draw anything whose `written` stamp is older than six seconds.
+//
+//  That staleness gate *is* the liveness check. Nothing has to notify this
+//  process that sauron crashed, was SIGKILLed, or that the laptop lid closed —
+//  all three stop the writes, and the writes stopping is the entire signal. If
+//  the pane ever survives more than ~6s past `pkill sauron`, the gate is broken,
+//  not the format.
+//
+//  COST
+//  ----
+//  Collapsed: one `stat` at most twice a second plus a single header strip.
+//  Expanded: one text layout per visible row. Nothing is allocated on frames
+//  where the beacon has not changed.
+//
+//  WIRING
+//  ------
+//    1. `mod sauron_panel;` behind whatever feature/cfg gates your debug build
+//    2. call `sauron_panel::render(ctx)` once per frame, after your own UI so it
+//       draws on top
+//    3. optionally `sauron_panel::set_visible(bool)` from a key binding
+//
+//  grep targets:
+//    fn render          -- the once-per-frame entry point
+//    fn poll            -- mtime-gated re-read
+//    fn beacon_path     -- $SAURON_BEACON, else git root -> encoded path
+//    fn parse           -- the v{{VERSION}} wire format reader
+//    fn draw_row        -- one session card
+//    const STALE_MS     -- how old a beacon may be and still count as live
+//    struct Palette     -- every colour in one place, for retheming
+
+// A generated file cannot know which of its knobs the host wired up. Warning
+// about the ones it did not would make a clean build noisy for a debug pane.
+#![allow(dead_code)]
+
+{{EGUI_IMPORT}}
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Contract with sauron
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Wire format this file was generated against. A beacon announcing anything
+/// else is refused outright rather than parsed optimistically — a pane drawn
+/// from misaligned columns looks authoritative while being wrong, which is
+/// worse than no pane at all. Re-run `sauron panel install` on a mismatch.
+const WIRE_VERSION: u32 = {{VERSION}};
+
+/// How stale a beacon may be before sauron counts as gone. Three times its
+/// publish interval: one missed write is a slow scan, three is a dead process.
+const STALE_MS: i64 = {{STALE_MS}};
+
+/// How often the beacon file is stat'd. The data only moves every 2s, so
+/// polling faster buys nothing; polling slower makes the pane feel laggy when
+/// an agent errors.
+const POLL: Duration = Duration::from_millis(500);
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Look
+// ───────────────────────────────────────────────────────────────────────────
+
+const PANEL_W: f32 = 348.0;
+const PAD: f32 = 10.0;
+
+/// Every colour the pane uses. Grouped so a host project can retheme by editing
+/// one block — the only edit to this file that survives a regeneration cleanly,
+/// because it is contiguous.
+struct Palette;
+impl Palette {
+    const BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(10, 12, 17, 236);
+    const EDGE: egui::Color32 = egui::Color32::from_rgb(58, 66, 84);
+    const HEADER_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 24, 33, 245);
+    const TITLE: egui::Color32 = egui::Color32::from_rgb(214, 222, 236);
+    const DIM: egui::Color32 = egui::Color32::from_rgb(122, 132, 150);
+    const FAINT: egui::Color32 = egui::Color32::from_rgb(86, 94, 110);
+    const ROW_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(38, 44, 58, 120);
+    const RULE: egui::Color32 = egui::Color32::from_rgb(38, 44, 57);
+    const FILE: egui::Color32 = egui::Color32::from_rgb(146, 172, 200);
+
+    const ERRORED: egui::Color32 = egui::Color32::from_rgb(255, 92, 92);
+    const BLOCKED: egui::Color32 = egui::Color32::from_rgb(255, 178, 66);
+    const AWAITING_ACK: egui::Color32 = egui::Color32::from_rgb(150, 200, 255);
+    const NEEDS_TEST: egui::Color32 = egui::Color32::from_rgb(112, 222, 168);
+    const RUNNING: egui::Color32 = egui::Color32::from_rgb(140, 146, 168);
+}
+
+/// The wire status token -> how it is grouped, coloured and titled.
+///
+/// The order of this table is the order the groups appear, and it is sauron's
+/// own ranking: an errored agent is dead until rescued, a blocked one resumes
+/// the moment you answer, and unverified edits merely wait. Reordering these
+/// reorders the pane.
+const GROUPS: &[(&str, &str, egui::Color32)] = &[
+    ("errored", "ERRORED", Palette::ERRORED),
+    ("blocked", "WAITING ON YOU", Palette::BLOCKED),
+    ("awaiting_ack", "AWAITING ACK", Palette::AWAITING_ACK),
+    ("needs_test", "AWAITING TEST", Palette::NEEDS_TEST),
+    ("working", "RUNNING", Palette::RUNNING),
+    ("delegated", "DELEGATED", Palette::RUNNING),
+];
+
+fn group_of(status: &str) -> Option<(&'static str, egui::Color32, usize)> {
+    GROUPS
+        .iter()
+        .position(|(tok, _, _)| *tok == status)
+        .map(|i| (GROUPS[i].1, GROUPS[i].2, i))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Parsed beacon
+// ───────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+struct Row {
+    status: String,
+    id_short: String,
+    turn_started: i64,
+    last_activity: i64,
+    is_orc: bool,
+    total_edits: usize,
+    name: String,
+    detail: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Beacon {
+    label: String,
+    pid: u32,
+    written_ms: i64,
+    attention: usize,
+    working: usize,
+    clear: usize,
+    hidden_stale: usize,
+    rows: Vec<Row>,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  State
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Host-controlled master switch, so a key binding can hide the pane outright
+/// without the host having to gate the `render` call itself.
+static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// Whether the pane is folded to its header strip. Persists for the process
+/// lifetime; deliberately not written to disk, because a debug pane that
+/// remembers being closed across launches is a debug pane you forget exists.
+static COLLAPSED: AtomicBool = AtomicBool::new(false);
+
+struct State {
+    path: Option<PathBuf>,
+    /// `None` until the first poll; `Some(None)` means polled and found nothing.
+    last_poll: Option<Instant>,
+    last_mtime: Option<SystemTime>,
+    beacon: Option<Beacon>,
+    /// `id_short` of rows whose file list is unfolded.
+    expanded: BTreeSet<String>,
+}
+
+fn state() -> &'static Mutex<State> {
+    static S: OnceLock<Mutex<State>> = OnceLock::new();
+    S.get_or_init(|| {
+        Mutex::new(State {
+            path: beacon_path(),
+            last_poll: None,
+            last_mtime: None,
+            beacon: None,
+            expanded: BTreeSet::new(),
+        })
+    })
+}
+
+/// Show or hide the pane. Independent of the collapsed state, so toggling it
+/// back on returns it to whichever fold the user left it in.
+pub fn set_visible(v: bool) {
+    VISIBLE.store(v, Ordering::Relaxed);
+}
+
+pub fn is_visible() -> bool {
+    VISIBLE.load(Ordering::Relaxed)
+}
+
+pub fn toggle_visible() {
+    VISIBLE.fetch_xor(true, Ordering::Relaxed);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Locating the beacon
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `$SAURON_BEACON` if set, otherwise `~/.claude/sauron/beacons/<encoded>` for
+/// the git root above the current directory.
+///
+/// The encoding is Claude Code's: every `/` and `.` in the absolute path becomes
+/// `-`. Reusing it rather than hashing is what keeps this file dependency-free —
+/// a hash would mean pulling in sha2 to render a debug pane.
+fn beacon_path() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("SAURON_BEACON") {
+        return Some(PathBuf::from(explicit));
+    }
+    let root = git_root()?;
+    let root = root.canonicalize().unwrap_or(root);
+    let encoded = root.to_string_lossy().replace(['/', '.'], "-");
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        home.join(".claude")
+            .join("sauron")
+            .join("beacons")
+            .join(format!("{encoded}.beacon")),
+    )
+}
+
+fn git_root() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Polling
+// ───────────────────────────────────────────────────────────────────────────
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Re-read the beacon if it is time to look and the file has actually moved.
+///
+/// Two gates, not one. The clock gate bounds how often the syscall happens; the
+/// mtime gate bounds how often the parse happens. Without the second, a pane
+/// left open on an idle repo would re-parse the same bytes twice a second
+/// forever.
+fn poll(st: &mut State) {
+    let now = Instant::now();
+    if let Some(last) = st.last_poll {
+        if now.duration_since(last) < POLL {
+            return;
+        }
+    }
+    st.last_poll = Some(now);
+
+    let Some(path) = st.path.clone() else {
+        return;
+    };
+    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let Some(mtime) = mtime else {
+        // The file is gone: sauron exited cleanly and retired it. Drop what we
+        // had rather than letting the last snapshot age out over STALE_MS.
+        st.last_mtime = None;
+        st.beacon = None;
+        return;
+    };
+    if st.last_mtime == Some(mtime) && st.beacon.is_some() {
+        return;
+    }
+    st.last_mtime = Some(mtime);
+    st.beacon = std::fs::read_to_string(&path).ok().and_then(|t| parse(&t));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  The v{{VERSION}} wire format
+// ───────────────────────────────────────────────────────────────────────────
+
+fn unesc(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Wire text -> `Beacon`, or `None` on anything unrecognised.
+///
+/// Fails closed on a bad magic line, a foreign version, or a file with no
+/// trailing `end`. All three mean "do not draw".
+fn parse(text: &str) -> Option<Beacon> {
+    let mut lines = text.lines();
+    let (magic, ver) = lines.next()?.split_once('\t')?;
+    if magic != "sauron-beacon" || ver.trim().parse::<u32>().ok()? != WIRE_VERSION {
+        return None;
+    }
+
+    let mut b = Beacon::default();
+    let mut sealed = false;
+    for line in lines {
+        if line == "end" {
+            sealed = true;
+            break;
+        }
+        let Some((tag, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        match tag {
+            "label" => b.label = unesc(rest),
+            "pid" => b.pid = rest.parse().unwrap_or(0),
+            "written" => b.written_ms = rest.parse().unwrap_or(0),
+            "counts" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                b.attention = f.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+                b.working = f.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                b.clear = f.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                b.hidden_stale = f.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "row" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                if f.len() < 7 {
+                    continue;
+                }
+                b.rows.push(Row {
+                    status: f[0].to_string(),
+                    id_short: unesc(f[1]),
+                    turn_started: f[2].parse().unwrap_or(0),
+                    last_activity: f[3].parse().unwrap_or(0),
+                    is_orc: f[4] == "1",
+                    total_edits: f[5].parse().unwrap_or(0),
+                    name: unesc(f[6]),
+                    ..Row::default()
+                });
+            }
+            "detail" => {
+                if let Some(r) = b.rows.last_mut() {
+                    r.detail = unesc(rest);
+                }
+            }
+            "file" => {
+                if let Some(r) = b.rows.last_mut() {
+                    r.files.push(unesc(rest));
+                }
+            }
+            _ => {}
+        }
+    }
+    if sealed {
+        Some(b)
+    } else {
+        None
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Drawing
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Once per frame, after the host's own UI. Draws nothing — and costs nothing
+/// beyond an occasional `stat` — unless a live sauron is watching this repo.
+pub fn render(ctx: &egui::Context) {
+    if !VISIBLE.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // The whole snapshot is cloned out from under the lock before any drawing
+    // starts. egui callbacks are the classic place to re-enter a lock you are
+    // still holding; copying first makes that impossible by construction, and
+    // the snapshot is a few hundred bytes.
+    let (beacon, expanded) = {
+        let Ok(mut st) = state().lock() else {
+            return;
+        };
+        poll(&mut st);
+        match &st.beacon {
+            Some(b) => (b.clone(), st.expanded.clone()),
+            None => return,
+        }
+    };
+
+    // The liveness gate. Everything above this line runs whether or not sauron
+    // is up; nothing below it does.
+    if now_ms().saturating_sub(beacon.written_ms) >= STALE_MS {
+        return;
+    }
+
+    let mut toggled: Option<String> = None;
+
+    egui::Area::new(egui::Id::new("sauron_beacon_panel"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+        .order(egui::Order::Foreground)
+        .movable(false)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(Palette::BG)
+                .stroke(egui::Stroke::new(1.0, Palette::EDGE))
+                .rounding(egui::Rounding::same(7.0))
+                .inner_margin(egui::Margin::same(0.0))
+                .show(ui, |ui| {
+                    ui.set_width(PANEL_W);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    draw_header(ui, &beacon);
+                    if COLLAPSED.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    ui.add_space(2.0);
+
+                    let mut drew_any = false;
+                    for (token, title, colour) in GROUPS {
+                        let rows: Vec<&Row> =
+                            beacon.rows.iter().filter(|r| r.status == *token).collect();
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        drew_any = true;
+                        draw_group_header(ui, title, *colour, rows.len());
+                        for r in rows {
+                            if draw_row(ui, r, *colour, expanded.contains(&r.id_short)) {
+                                toggled = Some(r.id_short.clone());
+                            }
+                        }
+                    }
+
+                    if !drew_any {
+                        draw_all_clear(ui);
+                    }
+                    draw_footer(ui, &beacon);
+                });
+        });
+
+    if let Some(id) = toggled {
+        if let Ok(mut st) = state().lock() {
+            if !st.expanded.remove(&id) {
+                st.expanded.insert(id);
+            }
+        }
+    }
+}
+
+/// The always-visible strip: eye, title, count, caret. Clicking anywhere on it
+/// folds the pane, so the target is the full width rather than a caret glyph
+/// that has to be hunted for.
+fn draw_header(ui: &mut egui::Ui, b: &Beacon) {
+    let collapsed = COLLAPSED.load(Ordering::Relaxed);
+    let h = 30.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::click());
+    let p = ui.painter();
+
+    let rounding = if collapsed {
+        egui::Rounding::same(7.0)
+    } else {
+        egui::Rounding {
+            nw: 7.0,
+            ne: 7.0,
+            sw: 0.0,
+            se: 0.0,
+        }
+    };
+    p.rect_filled(rect, rounding, Palette::HEADER_BG);
+
+    // Severity dot: the colour of the worst thing on the board. On a folded
+    // pane this is the entire signal, so it is drawn first and never elided.
+    let worst = worst_colour(b);
+    p.circle_filled(egui::pos2(rect.left() + PAD + 3.0, rect.center().y), 4.0, worst);
+
+    p.text(
+        egui::pos2(rect.left() + PAD + 15.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "SAURON",
+        egui::FontId::proportional(12.0),
+        Palette::TITLE,
+    );
+
+    let summary = if b.attention == 0 {
+        "nothing outstanding".to_string()
+    } else if b.attention == 1 {
+        "1 needs attention".to_string()
+    } else {
+        format!("{} need attention", b.attention)
+    };
+    p.text(
+        egui::pos2(rect.left() + PAD + 74.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        summary,
+        egui::FontId::proportional(11.0),
+        if b.attention == 0 {
+            Palette::FAINT
+        } else {
+            Palette::DIM
+        },
+    );
+
+    // Caret. Drawn rather than typed so it points the right way in any font.
+    let cx = rect.right() - PAD - 4.0;
+    let cy = rect.center().y;
+    let tint = if resp.hovered() {
+        Palette::TITLE
+    } else {
+        Palette::DIM
+    };
+    let tri = if collapsed {
+        [
+            egui::pos2(cx - 5.0, cy - 3.0),
+            egui::pos2(cx + 1.0, cy),
+            egui::pos2(cx - 5.0, cy + 3.0),
+        ]
+    } else {
+        [
+            egui::pos2(cx - 6.0, cy - 2.0),
+            egui::pos2(cx, cy + 3.0),
+            egui::pos2(cx + 6.0, cy - 2.0),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(tri.to_vec(), tint, egui::Stroke::NONE));
+
+    if !collapsed {
+        p.line_segment(
+            [
+                egui::pos2(rect.left(), rect.bottom() - 0.5),
+                egui::pos2(rect.right(), rect.bottom() - 0.5),
+            ],
+            egui::Stroke::new(1.0, Palette::RULE),
+        );
+    }
+
+    if resp.clicked() {
+        COLLAPSED.fetch_xor(true, Ordering::Relaxed);
+    }
+    resp.on_hover_text(format!(
+        "sauron pid {} watching {}\nclick to {}",
+        b.pid,
+        b.label,
+        if collapsed { "expand" } else { "collapse" }
+    ));
+}
+
+/// The worst status present, as a colour. Drives the folded pane's one dot.
+fn worst_colour(b: &Beacon) -> egui::Color32 {
+    let mut best: Option<(usize, egui::Color32)> = None;
+    for r in &b.rows {
+        if let Some((_, colour, rank)) = group_of(&r.status) {
+            if best.map_or(true, |(cur, _)| rank < cur) {
+                best = Some((rank, colour));
+            }
+        }
+    }
+    best.map(|(_, c)| c).unwrap_or(Palette::FAINT)
+}
+
+fn draw_group_header(ui: &mut egui::Ui, title: &str, colour: egui::Color32, n: usize) {
+    let h = 19.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::hover());
+    let p = ui.painter();
+    p.text(
+        egui::pos2(rect.left() + PAD, rect.center().y + 1.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(9.5),
+        colour,
+    );
+    p.text(
+        egui::pos2(rect.right() - PAD, rect.center().y + 1.0),
+        egui::Align2::RIGHT_CENTER,
+        n.to_string(),
+        egui::FontId::proportional(9.5),
+        Palette::FAINT,
+    );
+}
+
+/// One session card. Returns true if it was clicked, meaning its file list
+/// should fold or unfold — the caller applies that after the borrow ends.
+fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -> bool {
+    let text_w = PANEL_W - PAD * 2.0 - 6.0 - 46.0;
+
+    // Lay the text out before allocating, so the row is exactly as tall as its
+    // contents. Measuring after allocation is what produces the classic
+    // half-clipped second line when a prompt happens to wrap.
+    let name = ui.painter().layout(
+        display_name(r),
+        egui::FontId::proportional(12.0),
+        Palette::TITLE,
+        text_w,
+    );
+    let detail = (!r.detail.is_empty()).then(|| {
+        ui.painter().layout(
+            r.detail.clone(),
+            egui::FontId::proportional(10.5),
+            Palette::DIM,
+            text_w,
+        )
+    });
+
+    let files: Vec<_> = if expanded {
+        r.files
+            .iter()
+            .map(|f| {
+                ui.painter().layout(
+                    f.clone(),
+                    egui::FontId::monospace(9.5),
+                    Palette::FILE,
+                    PANEL_W - PAD * 2.0 - 14.0,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Heights are read off the galleys now, because painting moves them.
+    let name_h = name.size().y;
+    let detail_h = detail.as_ref().map(|d| d.size().y);
+
+    let mut h = 7.0 + name_h;
+    if let Some(dh) = detail_h {
+        h += 2.0 + dh;
+    }
+    for g in &files {
+        h += 1.0 + g.size().y;
+    }
+    if expanded && !files.is_empty() {
+        h += 4.0;
+    }
+    h += 7.0;
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::click());
+    let p = ui.painter();
+
+    if resp.hovered() {
+        p.rect_filled(rect, egui::Rounding::none(), Palette::ROW_HOVER);
+    }
+    // Severity bar down the left edge — the thing that makes the pane readable
+    // at a glance without reading any of the words.
+    p.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 1.0),
+            egui::pos2(rect.left() + 2.5, rect.bottom() - 1.0),
+        ),
+        egui::Rounding::none(),
+        colour,
+    );
+
+    let x = rect.left() + PAD;
+    let mut y = rect.top() + 7.0;
+
+    p.galley(egui::pos2(x, y), name);
+
+    // Elapsed, right-aligned on the first line. Read off the turn start where
+    // there is one: for a working agent that is how long it has been busy, and
+    // for a stopped one how long it has been waiting on you.
+    let stamp = if r.turn_started > 0 {
+        r.turn_started
+    } else {
+        r.last_activity
+    };
+    if stamp > 0 {
+        p.text(
+            egui::pos2(rect.right() - PAD, y + 6.0),
+            egui::Align2::RIGHT_CENTER,
+            elapsed(now_ms().saturating_sub(stamp)),
+            egui::FontId::proportional(10.0),
+            Palette::FAINT,
+        );
+    }
+    y += 2.0 + name_h;
+
+    if let Some(d) = detail {
+        p.galley(egui::pos2(x, y), d);
+        y += detail_h.unwrap_or(0.0) + 2.0;
+    }
+
+    if expanded && !files.is_empty() {
+        y += 2.0;
+        for g in files {
+            let gh = g.size().y;
+            p.circle_filled(egui::pos2(x + 2.5, y + gh * 0.5), 1.5, Palette::FAINT);
+            p.galley(egui::pos2(x + 10.0, y), g);
+            y += gh + 1.0;
+        }
+    } else if !r.files.is_empty() {
+        p.text(
+            egui::pos2(rect.right() - PAD, y + 5.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("{} file{}", r.files.len(), plural(r.files.len())),
+            egui::FontId::proportional(9.5),
+            Palette::FAINT,
+        );
+    }
+
+    if !r.files.is_empty() {
+        resp.on_hover_text(if expanded {
+            "click to fold the file list"
+        } else {
+            "click to list the files this session wrote"
+        })
+        .clicked()
+    } else {
+        resp.clicked()
+    }
+}
+
+/// What the card calls this session. Orcs get a marker: they are sauron's own
+/// single-shot maintenance agents, and mistaking one for a task you started is
+/// how a clean file ends up looking like unexplained churn.
+fn display_name(r: &Row) -> String {
+    let edits = if r.total_edits > 0 {
+        format!("  ·  {} edit{}", r.total_edits, plural(r.total_edits))
+    } else {
+        String::new()
+    };
+    if r.is_orc {
+        format!("orc  {}{}", r.name, edits)
+    } else {
+        format!("{}{}", r.name, edits)
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn draw_all_clear(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, 34.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + PAD, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "board clear — nothing waiting on you",
+        egui::FontId::proportional(11.0),
+        Palette::FAINT,
+    );
+}
+
+fn draw_footer(ui: &mut egui::Ui, b: &Beacon) {
+    let mut bits: Vec<String> = Vec::new();
+    if b.clear > 0 {
+        bits.push(format!("{} clear", b.clear));
+    }
+    if b.hidden_stale > 0 {
+        bits.push(format!("{} stale", b.hidden_stale));
+    }
+    bits.push(b.label.clone());
+    let line = bits.join("  ·  ");
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, 20.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.line_segment(
+        [
+            egui::pos2(rect.left() + PAD, rect.top() + 0.5),
+            egui::pos2(rect.right() - PAD, rect.top() + 0.5),
+        ],
+        egui::Stroke::new(1.0, Palette::RULE),
+    );
+    p.text(
+        egui::pos2(rect.left() + PAD, rect.center().y + 1.0),
+        egui::Align2::LEFT_CENTER,
+        line,
+        egui::FontId::proportional(9.5),
+        Palette::FAINT,
+    );
+}
+
+/// `12s`, `4m12s`, `1h04m`. Compact enough to right-align on a card without
+/// pushing the name; coarse enough that it is not a stopwatch.
+fn elapsed(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    if s < 60 {
+        return format!("{s}s");
+    }
+    let m = s / 60;
+    if m < 60 {
+        return format!("{m}m{:02}s", s % 60);
+    }
+    format!("{}h{:02}m", m / 60, m % 60)
+}

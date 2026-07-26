@@ -1,0 +1,465 @@
+//! `sauron panel` -- installing the in-app attention pane into a Rust project.
+//!
+//! The pane itself is one generated file dropped into the host's `src/`. It is
+//! not a crate, and that is the whole design decision:
+//!
+//! * A path dependency on this repo would break every build on a machine that
+//!   has not checked it out -- cargo resolves optional path deps whether or not
+//!   the feature is on -- so the host would be permanently coupled to a sibling
+//!   directory on one developer's disk.
+//! * A published crate would drag its own `egui` into a graph that may already
+//!   pin one. `barnes-hut`, the first host, vendors egui and redirects it with
+//!   `[patch.crates-io]`; a second copy would not be the same type as the one
+//!   its `Context` is.
+//!
+//! So the pane is emitted as source, reads the beacon with std alone, and takes
+//! its `egui` from whatever path the host already uses. The cost is a parser
+//! living in two repos; the wire version pins them together, and a panel built
+//! against v1 refuses a v2 beacon rather than mis-reading it.
+//!
+//! grep targets:
+//!   fn run           -- subcommand dispatch
+//!   fn install       -- render the template and write it
+//!   fn egui_import   -- how the host reaches egui, detected or overridden
+//!   fn status        -- print the live beacon as text, no GUI required
+//!   const TEMPLATE   -- the file that gets installed
+
+use std::path::{Path, PathBuf};
+
+use crate::beacon;
+use crate::git_root;
+
+/// The pane, with `{{...}}` holes. Kept as an asset rather than a string
+/// literal so it stays syntax-highlighted, greppable, and diffable as Rust.
+const TEMPLATE: &str = include_str!("../assets/sauron_panel.rs.in");
+
+/// Marker on the first line of a file this tool produced. Its absence on an
+/// existing target is what makes `install` refuse to overwrite: a hand-written
+/// `sauron_panel.rs` is somebody's work, and clobbering it to save a flag would
+/// be the tool's fault, not theirs.
+const GENERATED_MARKER: &str = "GENERATED FILE. DO NOT EDIT.";
+
+const USAGE: &str = "\
+sauron panel -- an in-app pane showing what needs attending, for Rust projects
+
+  sauron panel install [DIR] [--egui PATH] [--out FILE] [--force]
+      Write the pane into DIR (default: the git root above the cwd) and print
+      the wiring. Re-run to update an existing install.
+
+        --egui PATH   how the host reaches egui, e.g. warp_core::egui.
+                      Detected from the target's Cargo.toml when omitted.
+        --out FILE    where to write it (default: <DIR>/src/sauron_panel.rs)
+        --force       overwrite a file this tool did not generate
+
+  sauron panel status [DIR]
+      Print the live beacon as text. What the pane would be showing right now,
+      without a GUI -- the way to check the plumbing before wiring any of it up.
+
+  sauron panel path [DIR]
+      Print the beacon path for DIR and whether it is live.
+";
+
+pub fn run(args: &[String]) -> std::io::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        Some("install") => install(&args[1..]),
+        Some("status") => status(&args[1..]),
+        Some("path") => path_cmd(&args[1..]),
+        Some(other) => {
+            eprintln!("sauron panel: unknown subcommand `{other}`\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        None => {
+            print!("{USAGE}");
+            Ok(())
+        }
+    }
+}
+
+/// The first non-flag argument as a directory, else the git root, else cwd.
+fn target_dir(args: &[String]) -> std::io::Result<PathBuf> {
+    let dir = match args.iter().find(|a| !a.starts_with("--")) {
+        Some(p) => PathBuf::from(p),
+        None => git_root().unwrap_or(std::env::current_dir()?),
+    };
+    Ok(dir.canonicalize().unwrap_or(dir))
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  install
+// ───────────────────────────────────────────────────────────────────────────
+
+fn install(args: &[String]) -> std::io::Result<()> {
+    let dir = target_dir(args)?;
+    let force = args.iter().any(|a| a == "--force");
+
+    let manifest = dir.join("Cargo.toml");
+    if !manifest.exists() {
+        eprintln!(
+            "sauron panel: {} has no Cargo.toml -- point this at a Rust project's root.",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let (import, how) = egui_import(&manifest, flag_value(args, "--egui"));
+    let out = match flag_value(args, "--out") {
+        Some(p) => PathBuf::from(p),
+        None => dir.join("src").join("sauron_panel.rs"),
+    };
+
+    if out.exists() && !force {
+        let existing = std::fs::read_to_string(&out).unwrap_or_default();
+        if !existing.contains(GENERATED_MARKER) {
+            eprintln!(
+                "sauron panel: {} exists and was not generated by this tool.\n\
+                 Move it aside, or pass --force to overwrite it.",
+                out.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let install_args = match flag_value(args, "--egui") {
+        Some(p) => format!("--egui {p}"),
+        None => String::new(),
+    };
+
+    let body = TEMPLATE
+        .replace("{{EGUI_IMPORT}}", &import)
+        .replace("{{VERSION}}", &beacon::VERSION.to_string())
+        .replace("{{STALE_MS}}", &format!("{}", beacon::STALE_MS))
+        .replace("{{INSTALL_ARGS}}", install_args.trim());
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out, body)?;
+
+    let crate_name = package_name(&manifest).unwrap_or_else(|| "your-crate".to_string());
+    println!("wrote {}", out.display());
+    println!("egui reached via: {how}");
+    println!();
+    println!("Wire it up:");
+    println!();
+    println!("  1. Cargo.toml -- a feature so release builds never compile it:");
+    println!();
+    println!("       [features]");
+    println!("       sauron_panel = []");
+    println!();
+    println!("  2. src/main.rs (or lib.rs) -- declare the module behind that gate.");
+    println!("     The pane reads the filesystem, so it is native-only:");
+    println!();
+    println!("       #[cfg(all(feature = \"sauron_panel\", not(target_arch = \"wasm32\")))]");
+    println!("       mod sauron_panel;");
+    println!();
+    println!("  3. Once per frame, after your own UI so it draws on top:");
+    println!();
+    println!("       #[cfg(all(feature = \"sauron_panel\", not(target_arch = \"wasm32\")))]");
+    println!("       crate::sauron_panel::render(ctx);");
+    println!();
+    println!("  4. Build and run it:");
+    println!();
+    println!("       cargo run --features sauron_panel        # {crate_name}");
+    println!();
+    println!("The pane appears only while a sauron instance is watching this repo.");
+    println!("Check that end of the plumbing first:");
+    println!();
+    println!("       sauron panel status {}", dir.display());
+    Ok(())
+}
+
+/// The `use` line the pane needs, and a human description of why.
+///
+/// Detection over configuration, because getting this wrong is a compile error
+/// with a confusing message ("failed to resolve: use of undeclared crate
+/// `egui`") in a file the user did not write. An explicit `--egui` always wins.
+fn egui_import(manifest: &Path, explicit: Option<String>) -> (String, String) {
+    if let Some(path) = explicit {
+        return (
+            format!("use {path};"),
+            format!("{path} (given with --egui)"),
+        );
+    }
+    let text = std::fs::read_to_string(manifest).unwrap_or_default();
+
+    // A direct dependency is in scope at the crate root already, so the import
+    // would be a redundant-import warning rather than a help.
+    if dep_present(&text, "egui") {
+        return (
+            "// `egui` is a direct dependency of this crate and is already in scope."
+                .to_string(),
+            "direct `egui` dependency".to_string(),
+        );
+    }
+    // Known re-exporters, in the order they are worth guessing.
+    for (dep, path) in [
+        ("warp_core", "warp_core::egui"),
+        ("eframe", "eframe::egui"),
+        ("bevy_egui", "bevy_egui::egui"),
+    ] {
+        if dep_present(&text, dep) {
+            return (
+                format!("use {path};"),
+                format!("{path} (detected `{dep}` in Cargo.toml)"),
+            );
+        }
+    }
+    (
+        "use egui;".to_string(),
+        "egui (guessed -- pass --egui PATH if this does not compile)".to_string(),
+    )
+}
+
+/// Whether `name` appears as a dependency key in a Cargo.toml.
+///
+/// Deliberately a line scan and not a TOML parse: the alternative is taking a
+/// toml dependency into a crate whose whole point is that it perturbs nothing.
+///
+/// The scan has to be section-aware, though, and the case that proves it is the
+/// first host this shipped to. `barnes-hut` vendors egui and redirects it with
+///
+/// ```toml
+/// [patch.crates-io]
+/// egui = { path = "src/warp_core/egui" }
+/// ```
+///
+/// A section-blind scan reads that `egui =` as a dependency, concludes egui is
+/// in scope at the crate root, and emits a panel that does not compile -- in a
+/// generated file, with an error naming a crate the user never wrote. Only keys
+/// under a table whose name *ends* in `dependencies` count.
+fn dep_present(manifest: &str, name: &str) -> bool {
+    let mut in_deps = false;
+    for line in manifest.lines() {
+        let l = line.trim();
+        if let Some(header) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            // `[dependencies.egui]`, `[target.'cfg(unix)'.dev-dependencies.egui]`
+            if header.ends_with(&format!("dependencies.{name}")) {
+                return true;
+            }
+            // `[dependencies]`, `[build-dependencies]`, `[target....dependencies]`
+            in_deps = header.ends_with("dependencies");
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        let key = l.split('=').next().unwrap_or("").trim();
+        if key == name {
+            return true;
+        }
+    }
+    false
+}
+
+fn package_name(manifest: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = t.strip_prefix("name") {
+                let v = rest.trim_start_matches([' ', '=']).trim();
+                return Some(v.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  status / path
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The pane's contents as text.
+///
+/// This exists so the plumbing is testable without a GPU. Every failure the
+/// installed pane can hit silently -- no beacon, stale beacon, version skew --
+/// prints a sentence here instead.
+fn status(args: &[String]) -> std::io::Result<()> {
+    let dir = target_dir(args)?;
+    let path = beacon::path_for(&dir);
+
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        println!("no beacon at {}", path.display());
+        println!("no sauron is watching {} -- the pane would be hidden.", dir.display());
+        return Ok(());
+    };
+    let Some(b) = beacon::parse(&text) else {
+        println!("beacon at {} is unreadable or a foreign version.", path.display());
+        println!("this build speaks v{}; re-run `sauron panel install`.", beacon::VERSION);
+        return Ok(());
+    };
+
+    let now = crate::model::now_ms();
+    let age = now.saturating_sub(b.written_ms);
+    if !b.is_live(now) {
+        println!(
+            "beacon is {}s old (stale past {}s) -- sauron pid {} is gone; the pane would be hidden.",
+            age / 1000,
+            beacon::STALE_MS / 1000,
+            b.pid
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}  --  {} need attention, {} running  (pid {}, {}ms old)",
+        b.label, b.attention, b.working, b.pid, age
+    );
+    if b.rows.is_empty() {
+        println!("  board clear");
+    }
+    for r in &b.rows {
+        let mark = if r.is_orc { "orc " } else { "" };
+        println!("  [{:<12}] {}{}", r.status, mark, r.name);
+        if !r.detail.is_empty() {
+            println!("      {}", r.detail);
+        }
+        for f in &r.files {
+            println!("      · {f}");
+        }
+    }
+    if b.clear > 0 || b.hidden_stale > 0 {
+        println!("  ({} clear, {} stale hidden)", b.clear, b.hidden_stale);
+    }
+    Ok(())
+}
+
+fn path_cmd(args: &[String]) -> std::io::Result<()> {
+    let dir = target_dir(args)?;
+    let path = beacon::path_for(&dir);
+    let live = beacon::read(&dir)
+        .map(|b| b.is_live(crate::model::now_ms()))
+        .unwrap_or(false);
+    println!("{}", path.display());
+    println!("{}", if live { "live" } else { "not live" });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_a_direct_egui_dependency() {
+        let m = "[dependencies]\negui = \"0.22\"\n";
+        let (import, _) = egui_import_from(m, None);
+        assert!(import.starts_with("//"), "direct dep needs no import: {import}");
+    }
+
+    #[test]
+    fn detects_a_reexporting_host() {
+        let m = "[dependencies]\nwarp_core = { path = './src/warp_core/' }\n";
+        let (import, _) = egui_import_from(m, None);
+        assert_eq!(import, "use warp_core::egui;");
+    }
+
+    #[test]
+    fn explicit_flag_beats_detection() {
+        let m = "[dependencies]\negui = \"0.22\"\n";
+        let (import, _) = egui_import_from(m, Some("my::egui".to_string()));
+        assert_eq!(import, "use my::egui;");
+    }
+
+    #[test]
+    fn unknown_host_falls_back_to_a_plain_import() {
+        let (import, how) = egui_import_from("[dependencies]\nserde = \"1\"\n", None);
+        assert_eq!(import, "use egui;");
+        assert!(how.contains("guessed"));
+    }
+
+    #[test]
+    fn dependency_tables_count_as_dependencies() {
+        assert!(dep_present("[dependencies.warp_core]\npath = \"x\"\n", "warp_core"));
+        assert!(dep_present(
+            "[target.'cfg(unix)'.dependencies.egui]\nversion = \"0.22\"\n",
+            "egui"
+        ));
+        assert!(dep_present(
+            "[target.'cfg(target_arch = \"wasm32\")'.dependencies]\negui = \"0.22\"\n",
+            "egui"
+        ));
+        // A substring of another crate's name must not match.
+        assert!(!dep_present("[dependencies]\negui_extras = \"0.22\"\n", "egui"));
+    }
+
+    #[test]
+    fn a_patch_table_is_not_a_dependency() {
+        // The regression that shipped a non-compiling panel to the first host:
+        // stella-nova names egui only to redirect it, and reaches the real crate
+        // through warp_core.
+        let m = "[dependencies]\nwarp_core = { path = './src/warp_core/' }\n\n\
+                 [patch.crates-io]\negui = { path = \"src/warp_core/egui\" }\n";
+        assert!(!dep_present(m, "egui"));
+        assert_eq!(egui_import_from(m, None).0, "use warp_core::egui;");
+    }
+
+    #[test]
+    fn reads_the_package_name() {
+        let m = "[package]\nname = \"stella-nova\"\nversion = \"0.0.1\"\n\n[dependencies]\nname = \"x\"\n";
+        assert_eq!(package_name_from(m), Some("stella-nova".to_string()));
+    }
+
+    #[test]
+    fn template_has_no_unfilled_holes() {
+        let filled = TEMPLATE
+            .replace("{{EGUI_IMPORT}}", "use egui;")
+            .replace("{{VERSION}}", "1")
+            .replace("{{STALE_MS}}", "6000")
+            .replace("{{INSTALL_ARGS}}", "");
+        assert!(
+            !filled.contains("{{"),
+            "template still has an unsubstituted hole after install"
+        );
+    }
+
+    #[test]
+    fn template_carries_the_do_not_edit_marker() {
+        // `install` refuses to overwrite a file without this string, so losing
+        // it from the template would make every re-install refuse itself.
+        assert!(TEMPLATE.contains(GENERATED_MARKER));
+    }
+
+    // Test seams: the real functions take a path so callers do not have to
+    // build a manifest in a temp dir just to ask a question about its text.
+    //
+    // The counter is load-bearing. cargo runs these in parallel threads of one
+    // process, so a path keyed on the pid alone is the *same* path in every
+    // test, and whichever wrote last decided what the others read.
+    fn scratch_manifest(text: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sauron-panel-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("Cargo.toml");
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn egui_import_from(manifest_text: &str, explicit: Option<String>) -> (String, String) {
+        let p = scratch_manifest(manifest_text);
+        let out = egui_import(&p, explicit);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        out
+    }
+
+    fn package_name_from(manifest_text: &str) -> Option<String> {
+        let p = scratch_manifest(manifest_text);
+        let out = package_name(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        out
+    }
+}
