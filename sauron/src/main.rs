@@ -30,9 +30,9 @@ use ratatui::crossterm::execute;
 use ratatui::widgets::ListState;
 
 use sauron::agent::Agent;
-use sauron::board::Board;
+use sauron::board::{Board, Dismissal};
 use sauron::model::{self, now_ms, Status};
-use sauron::{clip, git_root, gui, handoff, orc, ui, workspace};
+use sauron::{beacon, clip, git_root, gui, handoff, orc, panel, ui, workspace};
 
 /// How often the logs are re-tailed. Only appended bytes are parsed, so this is
 /// cheap even with 10MB session files.
@@ -80,6 +80,14 @@ struct App {
     /// the normal keymap, so j/k/Enter mean "inside the picker" and nothing can
     /// be acked by accident while choosing a file.
     orc_pick: Option<OrcPick>,
+    /// The session `D` last dismissed, so `U` can put it back.
+    ///
+    /// One slot, not a stack. A dismissed row is off the board, so the only way
+    /// back to it is a key that does not need a cursor -- and a *list* of them
+    /// would be a second board showing exactly what you just said you did not
+    /// want to see. One slot covers the case this is for, which is the mis-hit
+    /// you notice immediately; `--restore-dismissed` covers the rest.
+    last_dismissed: Option<String>,
 }
 
 /// The open cold-target picker: what an orc could be loosed on right now, and
@@ -112,6 +120,7 @@ impl App {
             list_height: 0,
             local_offset: model::local_offset_secs(),
             orc_pick: None,
+            last_dismissed: None,
         };
         app.focus_first_actionable();
         app
@@ -187,9 +196,9 @@ impl App {
     }
 
     /// `a` is context-sensitive: on a waiting session (Blocked or AwaitingAck) it
-    /// dismisses that waiting state; on an untested session it acks the write-set.
+    /// defers that waiting state; on an untested session it acks the write-set.
     /// Both mean "I have handled this", and both re-surface if the agent does
-    /// something new.
+    /// something new. `D` is the one that does not -- see `dismiss_selected`.
     fn ack_selected(&mut self) {
         let Some(id) = self.selected_id() else {
             return;
@@ -213,6 +222,44 @@ impl App {
         self.board.ack_all();
         self.flash_saved();
         self.reanchor(anchor);
+    }
+
+    /// `D` -- take the selected session off the board for good.
+    ///
+    /// The cursor is deliberately *not* re-anchored to the dismissed id: the row
+    /// is gone, so `reanchor` on it would fall back to index 0 and throw you to
+    /// the top of the list. It holds its position instead, which puts it on
+    /// whatever moved up into the gap -- the same thing that happens when a row
+    /// clears on its own.
+    fn dismiss_selected(&mut self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        match self.board.dismiss(&id) {
+            Dismissal::Done(name) => {
+                self.last_dismissed = Some(id);
+                self.flash_spawn(format!("dismissed {name} — U to undo"), true);
+                self.selected = self
+                    .selected
+                    .min(self.board.rows.len().saturating_sub(1));
+                self.sync_list_state();
+            }
+            Dismissal::StillRunning => {
+                self.flash_spawn("still running — dismiss is for finished work".into(), false)
+            }
+            Dismissal::NoSuchRow => {}
+        }
+    }
+
+    /// `U` -- put back whatever `D` last took away.
+    fn restore_last_dismissed(&mut self) {
+        let Some(id) = self.last_dismissed.take() else {
+            self.flash_spawn("nothing to restore".into(), false);
+            return;
+        };
+        self.board.restore(&id);
+        self.flash_spawn("restored".into(), true);
+        self.reanchor(Some(id));
     }
 
     fn flash_saved(&mut self) {
@@ -483,9 +530,18 @@ fn main() -> std::io::Result<()> {
         return gui::run(&args[1..]);
     }
 
+    // `sauron panel ...` -- install the in-app attention pane into a Rust
+    // project, or print what that pane would currently be showing. Handled
+    // before the repo/TUI path: `install` writes to a project that may have no
+    // agent logs at all, so it must not depend on a board being buildable.
+    if args.first().map(|s| s.as_str()) == Some("panel") {
+        return panel::run(&args[1..]);
+    }
+
     let once = args.iter().any(|a| a == "--once");
     let baseline = args.iter().any(|a| a == "--baseline");
     let list_working = args.iter().any(|a| a == "--list-working");
+    let restore_dismissed = args.iter().any(|a| a == "--restore-dismissed");
     let repo_root = match args.iter().find(|a| !a.starts_with("--")) {
         Some(p) => PathBuf::from(p),
         None => git_root().unwrap_or(std::env::current_dir()?),
@@ -500,6 +556,16 @@ fn main() -> std::io::Result<()> {
     // and are about to start one. Bailing here meant sauron could never be left
     // running while that first session came up. The directory is re-read every
     // tick, so the board fills in on its own once it appears.
+
+    // The way back from a dismissal made in a process that has since exited. `U`
+    // only remembers the last one and only for as long as the TUI is up, and the
+    // dismissed rows are by definition not drawn -- so without this the only
+    // recovery would be hand-editing JSON under ~/.claude.
+    if restore_dismissed {
+        let n = app.board.restore_all_dismissed();
+        println!("restored {n} dismissed session(s).");
+        return Ok(());
+    }
 
     if baseline {
         app.board.baseline();
@@ -527,6 +593,10 @@ fn main() -> std::io::Result<()> {
     // Snapshot mode: print and exit without touching the terminal. Also the only
     // way to validate the scanner against real logs without an interactive TTY.
     if once {
+        // Publish as well as print. `--once` is "take a reading"; a reading that
+        // updates the beacon is what lets a headless caller -- a git hook, CI, a
+        // script -- refresh the pane in a project nobody has a TUI open on.
+        let _ = beacon::publish(&app.board);
         print_once(&app);
         return Ok(());
     }
@@ -544,6 +614,10 @@ fn main() -> std::io::Result<()> {
     // via atomic rename, so the mtime jumps once), the loop re-execs the new
     // binary in place -- no more staring at a stale build after a rebuild.
     let launch_exe_mtime = exe_mtime();
+    // Publish before the first frame, not on the first TICK: a debug pane in the
+    // watched project should light up the moment sauron starts, not two seconds
+    // later.
+    let _ = beacon::publish(&app.board);
 
     let result = loop {
         let now = now_ms();
@@ -631,6 +705,11 @@ fn main() -> std::io::Result<()> {
                     KeyCode::Char('k') | KeyCode::Up => app.move_by(-1),
                     KeyCode::Char('a') => app.ack_selected(),
                     KeyCode::Char('u') => app.unack_selected(),
+                    // Shift-only, unlike `a`/`u`. Dismissing is the one gesture
+                    // here that nothing the agent does will undo, so it does not
+                    // sit under a bare letter next to the keys you press all day.
+                    KeyCode::Char('D') => app.dismiss_selected(),
+                    KeyCode::Char('U') => app.restore_last_dismissed(),
                     KeyCode::Char('A') => app.ack_all(),
                     KeyCode::Char('y') => app.copy_selected_continue(),
                     KeyCode::Char('n') => app.spawn_agent(),
@@ -676,6 +755,12 @@ fn main() -> std::io::Result<()> {
             app.resync();
             last_tick = Instant::now();
 
+            // Republish the beacon so the watched project's own debug pane sees
+            // this tick. Errors are swallowed: a full disk or a read-only home
+            // must not take down the watcher over a courtesy file, and a reader
+            // that stops seeing fresh writes correctly concludes sauron is gone.
+            let _ = beacon::publish(&app.board);
+
             // Rebuilt on disk? Re-exec so the running window becomes the new
             // build. exec() only returns on failure, in which case we keep
             // running the current binary and surface the error.
@@ -689,6 +774,10 @@ fn main() -> std::io::Result<()> {
 
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    // Clean exit: drop the beacon now so the watched project's pane closes with
+    // the window instead of aging out over STALE_MS. A crash skips this, which
+    // is exactly what the staleness gate is for.
+    beacon::retire(app.board.repo_root());
     result
 }
 

@@ -18,7 +18,9 @@
 //!   struct Board        -- scanner + ack store + the current row set
 //!   fn Board::refresh   -- rescan logs, rebuild and rank rows
 //!   fn Board::to_row    -- one Session -> Row, or None if it should not show
-//!   fn Board::ack       -- context-sensitive ack/dismiss by session id
+//!   fn Board::ack       -- context-sensitive ack/defer by session id
+//!   fn Board::dismiss   -- drop a finished session from the board for good
+//!   fn dismissable      -- which statuses may be dismissed, and why not the rest
 //!   fn Board::hot_paths -- paths a live session is touching, for orc safety
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +61,36 @@ pub struct Row {
     pub previews: BTreeMap<String, Vec<String>>,
 }
 
+/// What `Board::dismiss` did, so the front end can report it rather than
+/// leaving the user wondering whether the key is bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dismissal {
+    /// Gone, and the display name it went by.
+    Done(String),
+    /// Refused: the session is mid-turn. See `dismissable`.
+    StillRunning,
+    /// The id is not on the board -- a stale cursor, or a row that refreshed
+    /// away underneath the keypress.
+    NoSuchRow,
+}
+
+/// Whether a session in this state may be dismissed.
+///
+/// Everything except `Working` and `Delegated`, and the exclusion is a safety
+/// property rather than a manners one. `hot_paths` -- which is what an orc
+/// consults before it is loosed on a file -- is derived from `rows`, so a
+/// dismissed session contributes no hot files. Dismissing a session that is
+/// still writing would therefore not merely hide a row: it would tell the next
+/// orc that the files under that agent's hands are cold, and the orc would
+/// refactor a file mid-edit.
+///
+/// `Delegated` is included in the refusal for the same reason. The session
+/// itself is sitting still, but it is waiting on a sub-agent that is not, and
+/// the write-set it is holding is just as hot.
+pub fn dismissable(status: Status) -> bool {
+    !matches!(status, Status::Working | Status::Delegated)
+}
+
 pub struct Board {
     scanner: Scanner,
     store: AckStore,
@@ -80,6 +112,17 @@ impl Board {
     /// Build a board and take its first reading. The scan is incremental from
     /// here on, so this call is the expensive one.
     pub fn new(repo_root: PathBuf, agent: Agent) -> Self {
+        Self::with_store(repo_root, agent, AckStore::load())
+    }
+
+    /// `new` against a store the caller built, which in practice means one
+    /// pointed at a scratch directory by `AckStore::load_at`.
+    ///
+    /// The same seam `load_at` opened one level down, and for the same reason:
+    /// the suppression rules are the product here, and a rule that can only be
+    /// exercised against the real `~/.claude` is a rule that is tested by
+    /// running the program and squinting.
+    pub fn with_store(repo_root: PathBuf, agent: Agent, store: AckStore) -> Self {
         let repo_label = repo_root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -87,7 +130,7 @@ impl Board {
 
         let mut board = Self {
             scanner: Scanner::new(repo_root, agent),
-            store: AckStore::load(),
+            store,
             agent,
             rows: Vec::new(),
             hidden_stale: 0,
@@ -174,18 +217,27 @@ impl Board {
     }
 
     fn to_row(&self, s: Session, now: i64) -> Option<Row> {
+        // Dismissed sessions leave before any status is computed. Everything
+        // downstream of the row set -- the census, `hot_paths`, `waiting_count`,
+        // muthur's alert strip -- then agrees without being told separately,
+        // which is the whole reason this is a filter here rather than a flag on
+        // the Row that each of them would have to remember to check.
+        if self.store.is_dismissed(&s.id) {
+            return None;
+        }
+
         let acked = self.store.for_session(&s.id);
         let mut status = s.status(now, acked);
         let mut blocked_reason = s.blocked_reason(now, acked);
         let pending: Vec<String> = s.pending(acked, now).into_iter().map(String::from).collect();
 
-        // A dismissed "waiting on you" / "awaiting acknowledgement" session drops
+        // A deferred "waiting on you" / "awaiting acknowledgement" session drops
         // off the board until the agent does something new. Compared against
         // last_activity, not a flag, so a fresh turn (which advances
         // last_activity) re-surfaces it. Both waiting states share the gesture:
-        // dismissing is exactly "I have acknowledged this".
+        // deferring is exactly "I have acknowledged this".
         if matches!(status, Status::Blocked | Status::AwaitingAck) {
-            if let Some(d) = self.store.dismissed_at(&s.id) {
+            if let Some(d) = self.store.deferred_at(&s.id) {
                 if s.last_activity <= d {
                     status = Status::Clear;
                     blocked_reason = None;
@@ -231,8 +283,9 @@ impl Board {
     }
 
     /// Context-sensitive "I have handled this": on a waiting session (Blocked or
-    /// AwaitingAck) it dismisses that waiting state; on an untested session it
-    /// acks the write-set. Both re-surface if the agent does something new.
+    /// AwaitingAck) it defers that waiting state; on an untested session it acks
+    /// the write-set. Both re-surface if the agent does something new -- which is
+    /// what separates this from `dismiss`, below.
     ///
     /// Addressed by id rather than index because the row order changes under
     /// every refresh, and acking by position is how you ack the wrong session.
@@ -242,7 +295,7 @@ impl Board {
         };
         if matches!(row.status, Status::Blocked | Status::AwaitingAck) {
             let (id, ts) = (row.id.clone(), row.last_activity);
-            self.store.dismiss(&id, ts);
+            self.store.defer(&id, ts);
         } else {
             let (id, edits) = (row.id.clone(), row.edits.clone());
             self.store.ack(&id, &edits);
@@ -261,12 +314,61 @@ impl Board {
             matches!(row.status, Status::Blocked | Status::AwaitingAck),
         );
         if waiting {
-            self.store.undismiss(&id);
+            self.store.undefer(&id);
         } else {
             self.store.unack(&id);
         }
         self.persist();
         self.refresh();
+    }
+
+    /// Take a finished session off the board for good.
+    ///
+    /// The gesture `ack` is not: no timestamp, no comparison, nothing the agent
+    /// can do to bring it back. It is for the rows that are simply over -- a
+    /// thread from Tuesday, a session whose terminal is long closed -- which
+    /// `ack` handles badly, because on an untested row `ack` records the
+    /// write-set as *tested at these timestamps*, and saying "I tested it" to
+    /// clear away junk is exactly the lie the timestamped ack store exists to
+    /// make impossible.
+    ///
+    /// Returns what happened so a caller can say so. Silence would be the worst
+    /// outcome here: a key that does nothing on a running session is
+    /// indistinguishable from a key that is not bound.
+    pub fn dismiss(&mut self, id: &str) -> Dismissal {
+        let Some(row) = self.row(id) else {
+            return Dismissal::NoSuchRow;
+        };
+        if !dismissable(row.status) {
+            return Dismissal::StillRunning;
+        }
+        let (id, name) = (row.id.clone(), crate::model::collapse_ws(&row.name));
+        self.store.dismiss(&id);
+        self.persist();
+        self.refresh();
+        Dismissal::Done(name)
+    }
+
+    /// Put a dismissed session back. The row returns on the next refresh at
+    /// whatever status it now classifies as, which may not be the status it had
+    /// when it was dismissed -- the dismissal suppressed the row, it did not
+    /// freeze it.
+    pub fn restore(&mut self, id: &str) {
+        self.store.undismiss(id);
+        self.persist();
+        self.refresh();
+    }
+
+    /// Un-dismiss everything, for the `--restore-dismissed` escape hatch.
+    pub fn restore_all_dismissed(&mut self) -> usize {
+        let n = self.store.restore_all_dismissed();
+        self.persist();
+        self.refresh();
+        n
+    }
+
+    pub fn dismissed_count(&self) -> usize {
+        self.store.dismissed_count()
     }
 
     /// Ack every outstanding session, including ones hidden by the horizon.
@@ -378,4 +480,95 @@ pub fn in_flight_tasks(repo_root: PathBuf, agent: Agent) -> Vec<(String, String)
 pub fn hot_files(repo_root: PathBuf, agent: Agent) -> BTreeSet<String> {
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     Board::new(repo_root, agent).hot_paths()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal is a safety property, so it is tested against the set it
+    /// protects rather than by restating the match arm: every status that
+    /// contributes to `hot_paths` while an agent is actually writing must be
+    /// undismissable, and everything else must be dismissable -- a board you
+    /// cannot clear of dead rows is the failure this key exists to fix.
+    #[test]
+    fn only_a_session_nobody_is_writing_through_can_be_dismissed() {
+        for s in [Status::Working, Status::Delegated] {
+            assert!(!dismissable(s), "{s:?} is mid-turn; its files are still hot");
+        }
+        for s in [
+            Status::Errored,
+            Status::Blocked,
+            Status::AwaitingAck,
+            Status::NeedsTest,
+            Status::Clear,
+        ] {
+            assert!(dismissable(s), "{s:?} is exactly what the key is for");
+        }
+    }
+
+    /// `NeedsTest` is the case that matters most, and the reason `ack` is not a
+    /// substitute: it is the only dismissable status that also carries an
+    /// untested write-set, so clearing it with `ack` would record those paths as
+    /// tested. Dismissing writes nothing to the ack map at all.
+    #[test]
+    fn dismissing_untested_work_does_not_claim_it_was_tested() {
+        let dir = scratch("claim");
+        let mut store = AckStore::load_at(dir.clone());
+        store.dismiss("dead-session");
+        store.save().unwrap();
+
+        let fresh = AckStore::load_at(dir.clone());
+        assert!(fresh.is_dismissed("dead-session"));
+        assert!(
+            fresh.for_session("dead-session").is_none(),
+            "a dismissal recorded an ack it had no business recording"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The filter itself, which is the one line the whole gesture rests on.
+    ///
+    /// Driven through `to_row` rather than through a running board, because the
+    /// scanner reads logs out of `~/.claude` and a test that needed real ones
+    /// would be testing the machine it happens to run on.
+    #[test]
+    fn a_dismissed_session_never_becomes_a_row_whatever_it_is_doing() {
+        let dir = scratch("filter");
+        let mut store = AckStore::load_at(dir.clone());
+        store.dismiss("gone");
+
+        let board = Board::with_store(dir.join("repo"), Agent::Claude, store);
+        let now = now_ms();
+
+        // A session that would otherwise be the loudest thing on the board:
+        // recent, mid-turn, holding unacked edits. Dismissal outranks all of it.
+        let mut s = Session {
+            id: "gone".into(),
+            last_activity: now,
+            ..Default::default()
+        };
+        s.edits.insert("src/a.rs".into(), now);
+        assert!(board.to_row(s, now).is_none(), "a dismissed row came back");
+
+        // And the filter is keyed on the id, not on anything about the session:
+        // an identical one that was never dismissed still shows.
+        let mut kept = Session {
+            id: "kept".into(),
+            last_activity: now,
+            ..Default::default()
+        };
+        kept.edits.insert("src/a.rs".into(), now);
+        assert!(board.to_row(kept, now).is_some(), "the filter caught a bystander");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(what: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sauron-board-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }

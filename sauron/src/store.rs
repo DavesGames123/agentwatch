@@ -1,4 +1,4 @@
-//! Ack persistence.
+//! Ack persistence, and the two ways a row can be suppressed.
 //!
 //! Stores `session id -> { repo path -> edit timestamp acked }`. Storing the
 //! timestamp rather than a bare path set is load-bearing: if it stored only
@@ -7,6 +7,25 @@
 //!
 //! Lives under ~/.claude, never inside the repo -- the sidecar must not add
 //! untracked files to a working tree that is already dirty.
+//!
+//! # Defer and dismiss are not the same gesture
+//!
+//! Three suppressions live here and they differ in *when they end*, which is the
+//! only distinction that matters at the keyboard:
+//!
+//!   - **ack** -- this write-set was tested, at these timestamps. Ends when a
+//!     path is written again, per path.
+//!   - **defer** -- I have read this "waiting on you" state. Ends the moment the
+//!     session logs anything newer, which is why it stores `last_activity`
+//!     rather than a flag.
+//!   - **dismiss** -- this session is over. Ends only when a human says so.
+//!
+//! `defer` was called `dismiss` while it was the only one of the two, and the
+//! file it writes is still `dismissed.json` -- renaming it would strand every
+//! deferral already on disk to buy a tidier filename. The methods carry the
+//! honest names; `dismissed-sessions.json` is the new one, and it is a flat
+//! array of ids because there is no timestamp to compare against. A dismissal
+//! that compared against anything would be a deferral.
 //!
 //! # Many writers, one file
 //!
@@ -24,15 +43,17 @@
 //! yet, so it would resurrect it on the next save.
 //!
 //! grep targets:
-//!   struct AckStore     -- in-memory map plus its on-disk path
+//!   struct AckStore     -- in-memory maps plus their on-disk paths
 //!   enum Op             -- one journalled mutation, replayed at save time
 //!   fn AckStore::load   -- read, tolerating absent or corrupt state
 //!   fn AckStore::ack    -- record every current edit ts for one session
+//!   fn AckStore::defer  -- suppress a waiting state until the agent moves
+//!   fn AckStore::dismiss -- suppress a session outright, until a human undoes it
 //!   fn AckStore::save   -- lock, re-read, replay the journal, atomic write
 //!   fn replay           -- apply a journal to a freshly-read state
 //!   fn Lock::acquire    -- O_EXCL lockfile with a stale-lock steal
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -45,7 +66,9 @@ use crate::scan::home;
 enum Op {
     Ack(String, PathAcks),
     Unack(String),
-    Dismiss(String, i64),
+    Defer(String, i64),
+    Undefer(String),
+    Dismiss(String),
     Undismiss(String),
 }
 
@@ -54,12 +77,17 @@ pub type PathAcks = BTreeMap<String, i64>;
 pub struct AckStore {
     path: PathBuf,
     acks: BTreeMap<String, PathAcks>,
-    /// session id -> the last_activity it had when the user dismissed its
-    /// "waiting on you" state. It stays dismissed until the session logs
+    /// session id -> the last_activity it had when the user deferred its
+    /// "waiting on you" state. It stays deferred until the session logs
     /// something newer, at which point it has done fresh work and re-surfaces.
     /// Kept in a sibling file so the acks format is untouched.
+    deferred_path: PathBuf,
+    deferred: BTreeMap<String, i64>,
+    /// Sessions dismissed outright -- old, finished, or useless. No timestamp,
+    /// because there is nothing for a dismissal to be conditional on: it is the
+    /// one suppression that survives whatever the agent does next.
     dismissed_path: PathBuf,
-    dismissed: BTreeMap<String, i64>,
+    dismissed: BTreeSet<String>,
     /// Mutations made since the last successful save, in order. Replayed onto
     /// the on-disk state so a concurrent writer's acks survive ours.
     journal: Vec<Op>,
@@ -78,16 +106,23 @@ impl AckStore {
     /// merge function alone would not have caught it.
     pub fn load_at(dir: PathBuf) -> Self {
         let path = dir.join("acks.json");
-        let dismissed_path = dir.join("dismissed.json");
+        // `dismissed.json` holds *deferrals*, from before the two gestures were
+        // told apart. See the module header: the name stays so existing state
+        // keeps working.
+        let deferred_path = dir.join("dismissed.json");
+        let dismissed_path = dir.join("dismissed-sessions.json");
         // Absent on first run; corrupt means someone hand-edited it. Either way
         // an empty store is recoverable -- everything just reads as untested,
         // which is the safe direction to fail.
         let acks = read_map(&path, decode);
-        let dismissed = read_map(&dismissed_path, decode_flat);
+        let deferred = read_map(&deferred_path, decode_flat);
+        let dismissed = read_map(&dismissed_path, decode_set);
         Self {
             lock_path: dir.join(".state.lock"),
             path,
             acks,
+            deferred_path,
+            deferred,
             dismissed_path,
             dismissed,
             journal: Vec::new(),
@@ -117,19 +152,54 @@ impl AckStore {
         self.acks.remove(id);
     }
 
-    /// Dismiss a session's current "waiting on you" state. Recording the
-    /// activity timestamp -- not a bare flag -- is what makes it re-surface the
-    /// moment the agent does anything new, so a dismissed session that then asks
-    /// a fresh question is not silently hidden.
-    pub fn dismiss(&mut self, id: &str, last_activity: i64) {
-        self.journal
-            .push(Op::Dismiss(id.to_string(), last_activity));
-        self.dismissed.insert(id.to_string(), last_activity);
+    /// Defer a session's current "waiting on you" state. Recording the activity
+    /// timestamp -- not a bare flag -- is what makes it re-surface the moment
+    /// the agent does anything new, so a deferred session that then asks a fresh
+    /// question is not silently hidden.
+    pub fn defer(&mut self, id: &str, last_activity: i64) {
+        self.journal.push(Op::Defer(id.to_string(), last_activity));
+        self.deferred.insert(id.to_string(), last_activity);
+    }
+
+    pub fn undefer(&mut self, id: &str) {
+        self.journal.push(Op::Undefer(id.to_string()));
+        self.deferred.remove(id);
+    }
+
+    /// Dismiss a session for good. Unconditional by design: this is the gesture
+    /// for work that is finished or was never going anywhere, and a dismissal
+    /// that could be undone by the agent writing one more log line would be a
+    /// deferral wearing a different key.
+    pub fn dismiss(&mut self, id: &str) {
+        self.journal.push(Op::Dismiss(id.to_string()));
+        self.dismissed.insert(id.to_string());
     }
 
     pub fn undismiss(&mut self, id: &str) {
         self.journal.push(Op::Undismiss(id.to_string()));
         self.dismissed.remove(id);
+    }
+
+    pub fn is_dismissed(&self, id: &str) -> bool {
+        self.dismissed.contains(id)
+    }
+
+    pub fn dismissed_count(&self) -> usize {
+        self.dismissed.len()
+    }
+
+    /// Un-dismiss everything, returning how many came back.
+    ///
+    /// The escape hatch for a dismissal made in a session that has since exited
+    /// -- the in-app undo only remembers the last one, and a list of ids the
+    /// board deliberately does not draw is not something a cursor can reach.
+    pub fn restore_all_dismissed(&mut self) -> usize {
+        let ids: Vec<String> = self.dismissed.iter().cloned().collect();
+        for id in &ids {
+            self.journal.push(Op::Undismiss(id.clone()));
+        }
+        self.dismissed.clear();
+        ids.len()
     }
 
     /// Re-read the state files, discarding unsaved journal entries.
@@ -140,13 +210,14 @@ impl AckStore {
     /// re-read it.
     pub fn reload(&mut self) {
         self.acks = read_map(&self.path, decode);
-        self.dismissed = read_map(&self.dismissed_path, decode_flat);
+        self.deferred = read_map(&self.deferred_path, decode_flat);
+        self.dismissed = read_map(&self.dismissed_path, decode_set);
         self.journal.clear();
     }
 
-    /// The activity timestamp at which this session was dismissed, if it was.
-    pub fn dismissed_at(&self, id: &str) -> Option<i64> {
-        self.dismissed.get(id).copied()
+    /// The activity timestamp at which this session was deferred, if it was.
+    pub fn deferred_at(&self, id: &str) -> Option<i64> {
+        self.deferred.get(id).copied()
     }
 
     /// Replay this process's journal onto the current file and write the result.
@@ -169,13 +240,16 @@ impl AckStore {
         let _lock = Lock::acquire(&self.lock_path);
 
         let mut acks = read_map(&self.path, decode);
-        let mut dismissed = read_map(&self.dismissed_path, decode_flat);
-        replay(&self.journal, &mut acks, &mut dismissed);
+        let mut deferred = read_map(&self.deferred_path, decode_flat);
+        let mut dismissed = read_map(&self.dismissed_path, decode_set);
+        replay(&self.journal, &mut acks, &mut deferred, &mut dismissed);
 
         write_atomic(&self.path, &encode(&acks))?;
-        write_atomic(&self.dismissed_path, &encode_flat(&dismissed))?;
+        write_atomic(&self.deferred_path, &encode_flat(&deferred))?;
+        write_atomic(&self.dismissed_path, &encode_set(&dismissed))?;
 
         self.acks = acks;
+        self.deferred = deferred;
         self.dismissed = dismissed;
         self.journal.clear();
         Ok(())
@@ -188,7 +262,8 @@ impl AckStore {
 fn replay(
     journal: &[Op],
     acks: &mut BTreeMap<String, PathAcks>,
-    dismissed: &mut BTreeMap<String, i64>,
+    deferred: &mut BTreeMap<String, i64>,
+    dismissed: &mut BTreeSet<String>,
 ) {
     for op in journal {
         match op {
@@ -201,8 +276,14 @@ fn replay(
             Op::Unack(id) => {
                 acks.remove(id);
             }
-            Op::Dismiss(id, ts) => {
-                dismissed.insert(id.clone(), *ts);
+            Op::Defer(id, ts) => {
+                deferred.insert(id.clone(), *ts);
+            }
+            Op::Undefer(id) => {
+                deferred.remove(id);
+            }
+            Op::Dismiss(id) => {
+                dismissed.insert(id.clone());
             }
             Op::Undismiss(id) => {
                 dismissed.remove(id);
@@ -290,6 +371,28 @@ fn decode_flat(v: &Value) -> BTreeMap<String, i64> {
     out
 }
 
+/// A flat array of session ids. Anything that is not a string is dropped rather
+/// than coerced -- a junk entry that decoded to `""` would sit in the set
+/// forever, matching nothing and confusing anyone who opened the file.
+///
+/// An object decodes to an empty set, which is what makes this safe to point at
+/// a path that a much older build might have written a map to.
+fn decode_set(v: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if let Some(items) = v.as_array() {
+        for id in items {
+            if let Some(id) = id.as_str() {
+                out.insert(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn encode_set(ids: &BTreeSet<String>) -> Value {
+    Value::Array(ids.iter().map(|id| Value::from(id.clone())).collect())
+}
+
 fn encode_flat(map: &BTreeMap<String, i64>) -> Value {
     let mut root = Map::new();
     for (id, ts) in map {
@@ -346,12 +449,24 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_map_round_trips() {
+    fn deferred_map_round_trips() {
         let mut m: BTreeMap<String, i64> = BTreeMap::new();
         m.insert("sess-1".into(), 1_700_000_000_000);
         assert_eq!(decode_flat(&encode_flat(&m)), m);
         // Non-integer timestamps are dropped, not defaulted.
         assert!(decode_flat(&serde_json::json!({"s": "nope"})).is_empty());
+    }
+
+    #[test]
+    fn the_dismissed_set_round_trips_and_ignores_junk() {
+        let m: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(decode_set(&encode_set(&m)), m);
+        // Non-strings are dropped rather than coerced to "".
+        assert_eq!(decode_set(&serde_json::json!(["a", 5, null])).len(), 1);
+        // And a map -- what a much older build would have left at a path like
+        // this -- decodes to nothing at all rather than to a set of keys.
+        assert!(decode_set(&serde_json::json!({"a": 1})).is_empty());
+        assert!(decode_set(&Value::String("junk".into())).is_empty());
     }
 
     fn edits(path: &str, ts: i64) -> PathAcks {
@@ -368,13 +483,88 @@ mod tests {
         // What the other process wrote while we held our stale copy.
         let mut disk: BTreeMap<String, PathAcks> = BTreeMap::new();
         disk.insert("theirs".into(), edits("src/a.rs", 100));
-        let mut dismissed = BTreeMap::new();
+        let (mut deferred, mut dismissed) = (BTreeMap::new(), BTreeSet::new());
 
         let journal = vec![Op::Ack("ours".into(), edits("src/b.rs", 200))];
-        replay(&journal, &mut disk, &mut dismissed);
+        replay(&journal, &mut disk, &mut deferred, &mut dismissed);
 
         assert!(disk.contains_key("theirs"), "concurrent ack was erased");
         assert!(disk.contains_key("ours"));
+    }
+
+    /// A dismissal made in one pane must survive another pane's save, and an
+    /// un-dismissal must not be resurrected by it. Same argument as `unack`
+    /// above: a union of two sets cannot tell "restored" from "never dismissed".
+    #[test]
+    fn a_dismissal_merges_and_an_undismissal_sticks() {
+        let (mut acks, mut deferred) = (BTreeMap::new(), BTreeMap::new());
+        let mut disk: BTreeSet<String> = ["theirs".to_string()].into_iter().collect();
+
+        replay(
+            &[Op::Dismiss("ours".into())],
+            &mut acks,
+            &mut deferred,
+            &mut disk,
+        );
+        assert!(disk.contains("theirs"), "concurrent dismissal was erased");
+        assert!(disk.contains("ours"));
+
+        replay(
+            &[Op::Undismiss("theirs".into())],
+            &mut acks,
+            &mut deferred,
+            &mut disk,
+        );
+        assert!(!disk.contains("theirs"), "undismiss was undone by the merge");
+    }
+
+    /// The two suppressions are stored apart, so neither gesture can silently
+    /// perform the other. Deferring must never dismiss: one ends when the agent
+    /// moves, the other does not end at all.
+    #[test]
+    fn deferring_and_dismissing_do_not_touch_each_others_state() {
+        let dir = std::env::temp_dir().join(format!("sauron-two-gestures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = AckStore::load_at(dir.clone());
+        s.defer("waiting", 100);
+        s.dismiss("finished");
+        s.save().unwrap();
+
+        let fresh = AckStore::load_at(dir.clone());
+        assert_eq!(fresh.deferred_at("waiting"), Some(100));
+        assert!(!fresh.is_dismissed("waiting"), "a deferral dismissed a session");
+        assert!(fresh.is_dismissed("finished"));
+        assert_eq!(fresh.deferred_at("finished"), None, "a dismissal wrote a deferral");
+
+        // And the legacy deferral file is still where it was, holding a map --
+        // renaming it would have stranded every deferral already on disk.
+        let legacy = std::fs::read_to_string(dir.join("dismissed.json")).unwrap();
+        assert!(legacy.contains("waiting"), "deferrals left their own file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The escape hatch for a dismissal made in a process that has since exited.
+    #[test]
+    fn restore_all_brings_back_every_dismissed_session() {
+        let dir = std::env::temp_dir().join(format!("sauron-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = AckStore::load_at(dir.clone());
+        s.dismiss("a");
+        s.dismiss("b");
+        s.save().unwrap();
+
+        let mut later = AckStore::load_at(dir.clone());
+        assert_eq!(later.dismissed_count(), 2);
+        assert_eq!(later.restore_all_dismissed(), 2);
+        later.save().unwrap();
+
+        assert_eq!(AckStore::load_at(dir.clone()).dismissed_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An unack must not be undone by the merge. This is why the journal holds
@@ -384,9 +574,14 @@ mod tests {
     fn unack_beats_the_copy_still_on_disk() {
         let mut disk: BTreeMap<String, PathAcks> = BTreeMap::new();
         disk.insert("sess".into(), edits("src/a.rs", 100));
-        let mut dismissed = BTreeMap::new();
+        let (mut deferred, mut dismissed) = (BTreeMap::new(), BTreeSet::new());
 
-        replay(&[Op::Unack("sess".into())], &mut disk, &mut dismissed);
+        replay(
+            &[Op::Unack("sess".into())],
+            &mut disk,
+            &mut deferred,
+            &mut dismissed,
+        );
 
         assert!(!disk.contains_key("sess"), "unack was resurrected by merge");
     }
@@ -396,7 +591,7 @@ mod tests {
     #[test]
     fn journal_replays_in_order() {
         let mut acks = BTreeMap::new();
-        let mut dismissed = BTreeMap::new();
+        let (mut deferred, mut dismissed) = (BTreeMap::new(), BTreeSet::new());
         replay(
             &[
                 Op::Ack("s".into(), edits("a.rs", 1)),
@@ -404,17 +599,25 @@ mod tests {
                 Op::Ack("s".into(), edits("b.rs", 2)),
             ],
             &mut acks,
+            &mut deferred,
             &mut dismissed,
         );
         assert_eq!(acks["s"], edits("b.rs", 2));
 
         let mut acks = BTreeMap::new();
-        let mut dismissed = BTreeMap::new();
+        let (mut deferred, mut dismissed) = (BTreeMap::new(), BTreeSet::new());
         replay(
-            &[Op::Dismiss("s".into(), 5), Op::Undismiss("s".into())],
+            &[
+                Op::Defer("s".into(), 5),
+                Op::Undefer("s".into()),
+                Op::Dismiss("s".into()),
+                Op::Undismiss("s".into()),
+            ],
             &mut acks,
+            &mut deferred,
             &mut dismissed,
         );
+        assert!(deferred.is_empty());
         assert!(dismissed.is_empty());
     }
 
