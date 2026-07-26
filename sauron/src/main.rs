@@ -432,24 +432,10 @@ fn copy_to_clipboard(text: &str) -> bool {
         && std::io::stdout().flush().is_ok()
 }
 
-/// Minimal standard-alphabet base64, to avoid a dependency for one escape code.
-fn base64(input: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(A[(n >> 18 & 63) as usize] as char);
-        out.push(A[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
-    }
-    out
-}
+/// OSC 52 and the mirror's OSC 1337 both base64 a payload for the same
+/// terminal, so they share one encoder -- it lives in `mirror`, which is the
+/// one that runs it thousands of times.
+use sauron::mirror::base64;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

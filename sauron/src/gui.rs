@@ -254,10 +254,12 @@ pub fn stage_command(sauron_exe: &Path, repo: &str) -> String {
 /// nothing about it can stall the output you are reading.
 pub fn run(args: &[String]) -> std::io::Result<()> {
     let mut print_only = false;
+    let mut mirror = false;
     let mut repo_arg: Option<&str> = None;
     for a in args {
         match a.as_str() {
             "--print" | "-p" => print_only = true,
+            "--mirror" => mirror = true,
             s if !s.starts_with('-') => repo_arg = Some(s),
             _ => {}
         }
@@ -268,6 +270,14 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }),
     };
+
+    // `--mirror` does not launch anything. It attaches to a window that is
+    // already up -- you ran the app yourself -- and draws it into this pane, so
+    // it needs no `cmd` and works in a repo with no conf at all.
+    if mirror {
+        let app = config(&repo).and_then(|g| g.app);
+        return crate::mirror::run(args, &repo, app.as_deref());
+    }
 
     let Some(gui) = config(&repo) else {
         eprintln!(

@@ -518,6 +518,42 @@ activating its process — the app floats up, your keystrokes stay in the termin
 If no window ever appears in Accessibility, the app pane says so once, with the
 rect it should have used, rather than polling in silence.
 
+### `--mirror` — the app *inside* a pane
+
+Docking puts a real window in the layout. If you want the picture **in the
+terminal itself** — a pane you can look at, with the app running wherever it
+likes — mirror it:
+
+```bash
+sauron gui --mirror                 # the app named in .sauron/gui.conf
+sauron gui --mirror --app worldsmith
+sauron gui --mirror --fps 12 --px 1600
+sauron gui --mirror --probe         # what it can see, and what it would cost
+```
+
+The pane you type it in **splits vertically**: the mirror takes the left half,
+a fresh shell at the repo takes the right. Nothing is launched — you started the
+app yourself; this attaches to the window it already made.
+
+It captures **by window id off the window server**, so the app can be behind the
+terminal, half off the screen, or buried under another window and the mirror
+still shows it. That is the property that makes this worth having.
+
+What it is not: it is a **picture**. Keys and clicks go to the pane, not to the
+program — there is no channel back, and no version of this has one. It runs at
+a frame rate rather than at the app's refresh, because each frame is a capture,
+a rescale, and a base64 blob down a pty.
+
+> **Screen Recording permission is required** — System Settings → Privacy &
+> Security → Screen Recording → iTerm. Without it `screencapture` answers
+> `could not create image from window` and the mirror says so rather than
+> showing you a blank pane. Reading the *window list* needs no permission;
+> reading its *pixels* does.
+
+`--probe` reports the window it picked, the pane's cell grid, the measured
+milliseconds per frame, and the resulting bytes per second, so you can pick an
+`--fps` from numbers instead of from vibes.
+
 ### The panes under the app
 
 The app's window covers real panes, which are marked with a session variable —
@@ -720,6 +756,7 @@ sauron/src/
   handoff.rs    ·  strict opt-in clipboard pass lifecycle
   workspace.rs  ·  the `sauron workspace` launcher + iTerm pane splitting
   gui.rs        ·  .sauron/gui.conf, the docked app window, `sauron gui`
+  mirror.rs     ·  `--mirror`: the app drawn inside a pane, frame by frame
   orc.rs        ·  the orc charge, cold-file ranking, `sauron orc <file>`
 docs/AGENTS.md  ·  using Codex, and adding another agent
 ```
