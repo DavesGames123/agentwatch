@@ -122,8 +122,13 @@ const GRAB_MARGIN: f32 = 56.0;
 /// Every colour the pane uses. Grouped so a host project can retheme by editing
 /// one block — the only edit to this file that survives a regeneration cleanly,
 /// because it is contiguous.
-/// Every colour the pane uses, plus its width — one struct so a host can
-/// restyle the whole thing in a single call.
+/// Every colour the pane uses — one struct so a host can restyle the whole
+/// thing in a single call.
+///
+/// Width is deliberately NOT here. The pane is a table of fixed columns and its
+/// width is the sum of them; a host-settable width would be a knob that either
+/// did nothing or clipped a column, and a dead knob on a struct is a lie that
+/// costs someone an afternoon.
 ///
 /// WHY THIS IS NOT A BLOCK OF CONSTANTS ANY MORE
 /// --------------------------------------------
@@ -160,8 +165,6 @@ pub struct Skin {
     /// read as two unrelated claims rather than one.
     pub route: egui::Color32,
     pub route_dim: egui::Color32,
-
-    pub width: f32,
 }
 
 impl Default for Skin {
@@ -185,8 +188,6 @@ impl Default for Skin {
 
             route: egui::Color32::from_rgb(112, 222, 168),
             route_dim: egui::Color32::from_rgb(78, 150, 118),
-
-            width: 348.0,
         }
     }
 }
@@ -929,37 +930,24 @@ pub fn render(ctx: &egui::Context) {
                     ui.add_space(2.0);
 
                     let mut drew_any = false;
-                    // A grid, not a stack of cards. Every row answers the same
-                    // questions -- what is it, how long, where do I look, what
-                    // do I say -- and questions asked identically of every row
-                    // belong in columns you can read down. Striped, because at
-                    // six rows across five columns the eye needs the guide.
-                    egui::Grid::new("sauron_board")
-                        .striped(true)
-                        .num_columns(COLS)
-                        .spacing(egui::vec2(8.0, 4.0))
-                        .show(ui, |ui| {
-                            grid_font(ui);
-                            draw_grid_head(ui);
-                            for (token, _title) in GROUPS {
-                                let rows: Vec<&Row> = beacon
-                                    .rows
-                                    .iter()
-                                    .filter(|r| r.status == *token)
-                                    .collect();
-                                if rows.is_empty() {
-                                    continue;
-                                }
-                                drew_any = true;
-                                let colour = group_colour(token);
-                                for r in rows {
-                                    let open = expanded.contains(&r.id_short);
-                                    if draw_grid_row(ui, r, colour, open) {
-                                        toggled = Some(r.id_short.clone());
-                                    }
-                                }
+                    draw_col_heads(ui);
+                    let mut n = 0usize;
+                    for (token, _title) in GROUPS {
+                        let rows: Vec<&Row> =
+                            beacon.rows.iter().filter(|r| r.status == *token).collect();
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        drew_any = true;
+                        let colour = group_colour(token);
+                        for r in rows {
+                            let open = expanded.contains(&r.id_short);
+                            if draw_board_row(ui, r, colour, open, n % 2 == 1) {
+                                toggled = Some(r.id_short.clone());
                             }
-                        });
+                            n += 1;
+                        }
+                    }
 
                     if !drew_any {
                         draw_all_clear(ui);
@@ -995,246 +983,319 @@ pub fn render(ctx: &egui::Context) {
     }
 }
 
-/// Columns: status, task, where to look, reply, actions.
-const COLS: usize = 5;
+// ───────────────────────────────────────────────────────────────────────────
+//  Board geometry
+// ───────────────────────────────────────────────────────────────────────────
+//
+//  WHY THE COLUMNS ARE PLACED BY HAND AND NOT BY `egui::Grid`
+//  ---------------------------------------------------------
+//  Grid was the obvious tool and it was the wrong one: it derives each column's
+//  width from the widest content in it, so a table of fixed columns cannot be
+//  expressed. Asking for a width inside a cell -- `allocate_ui(vec2(w, ..))` --
+//  requests a size the Grid then overrides, which fails silently and looks like
+//  a styling problem rather than a layout one. It produced an actions column
+//  roughly one character wide, so "Send" rendered as a vertical S-e-n-d, and
+//  header labels that sat at content-derived offsets nowhere near the data
+//  underneath them.
+//
+//  A zero-height request made it worse: `allocate_ui(vec2(w, 0.0))` lets the
+//  child inherit the remaining available height, which the row then reported as
+//  its own -- a single row three hundred pixels tall.
+//
+//  So every column is a constant and every cell is painted at a computed x.
+//  `col_x` is the single source of those offsets and BOTH the header and the
+//  rows call it, which is what makes a heading provably sit above its column
+//  rather than approximately above it.
 
-/// Column widths. Fixed rather than proportional: a grid whose columns resize
-/// as content changes is not a grid you can read down, and the whole reason for
-/// the shape is that the same question sits in the same place on every row.
-const W_STATUS: f32 = 78.0;
-const W_TASK: f32 = 190.0;
-const W_WHERE: f32 = 150.0;
-const W_REPLY: f32 = 210.0;
-const W_ACTIONS: f32 = 54.0;
+const C_STATUS: f32 = 76.0;
+const C_TASK: f32 = 196.0;
+const C_WHERE: f32 = 124.0;
+const C_REPLY: f32 = 220.0;
+const COL_GAP: f32 = 10.0;
 
-/// Total pane width: the columns plus the grid's own spacing and margins.
-fn panel_w() -> f32 {
-    W_STATUS + W_TASK + W_WHERE + W_REPLY + W_ACTIONS + 8.0 * (COLS as f32 - 1.0) + PAD * 2.0
+/// Left edge of each column, given the row's left edge.
+fn col_x(left: f32) -> [f32; 4] {
+    let x0 = left + PAD;
+    let x1 = x0 + C_STATUS + COL_GAP;
+    let x2 = x1 + C_TASK + COL_GAP;
+    let x3 = x2 + C_WHERE + COL_GAP;
+    [x0, x1, x2, x3]
 }
 
-/// Widgets in the grid set their own font.
+fn panel_w() -> f32 {
+    PAD * 2.0 + C_STATUS + C_TASK + C_WHERE + C_REPLY + COL_GAP * 3.0
+}
+
+/// Widgets in the reply column set their own font.
 ///
 /// The host's style is the host's: this pane is a guest in an application whose
-/// UI scale may be tuned for being read across a room, and inheriting it
-/// rendered the draft box at a size that swallowed the screen. Painted text
-/// already passes an explicit `FontId`; only the widgets that read the style --
+/// UI scale may be tuned to be read across a room, and inheriting it rendered
+/// the draft box at a size that swallowed the screen. Painted text already
+/// passes an explicit `FontId`; only the widgets that read the style --
 /// TextEdit, Button, their hint text -- needed telling.
-fn grid_font(ui: &mut egui::Ui) {
+fn reply_font(ui: &mut egui::Ui) {
     ui.style_mut().override_font_id = Some(egui::FontId::proportional(10.5));
     ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 3.0);
-    ui.style_mut().spacing.button_padding = egui::vec2(5.0, 1.0);
+    ui.style_mut().spacing.button_padding = egui::vec2(6.0, 1.0);
     ui.style_mut().spacing.interact_size.y = 16.0;
 }
 
-/// The header row, in the same columns as the data under it.
-fn draw_grid_head(ui: &mut egui::Ui) {
+/// How tall a waiting row must be to hold its editor and buttons.
+const REPLY_H: f32 = 56.0;
+
+/// The column headings, painted at the same offsets the rows use.
+fn draw_col_heads(ui: &mut egui::Ui) {
     let sk = skin();
-    let head = |ui: &mut egui::Ui, text: &str, w: f32| {
-        ui.allocate_ui(egui::vec2(w, 12.0), |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .color(sk.faint)
-                    .size(8.5)
-                    .monospace(),
-            );
-        });
-    };
-    head(ui, "STATUS", W_STATUS);
-    head(ui, "TASK", W_TASK);
-    head(ui, "WHERE TO LOOK", W_WHERE);
-    head(ui, "REPLY", W_REPLY);
-    head(ui, "", W_ACTIONS);
-    ui.end_row();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 15.0), egui::Sense::hover());
+    let x = col_x(rect.left());
+    let p = ui.painter();
+    let f = egui::FontId::monospace(8.0);
+    for (i, t) in ["STATUS", "TASK", "WHERE TO LOOK", "REPLY"].iter().enumerate() {
+        p.text(
+            egui::pos2(x[i], rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            *t,
+            f.clone(),
+            sk.faint,
+        );
+    }
+    p.line_segment(
+        [
+            egui::pos2(rect.left() + PAD, rect.bottom() - 0.5),
+            egui::pos2(rect.right() - PAD, rect.bottom() - 0.5),
+        ],
+        egui::Stroke::new(1.0, sk.rule),
+    );
 }
 
-/// One row of the board. Returns whether its task cell was clicked, which is
-/// still what folds the file list.
+/// One row of the board. Returns whether it was clicked, which folds its file
+/// list.
 ///
-///   grep -n "fn draw_grid_row"  sauron_panel.rs
-fn draw_grid_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -> bool {
+///   grep -n "fn draw_board_row"  sauron_panel.rs
+fn draw_board_row(
+    ui: &mut egui::Ui,
+    r: &Row,
+    colour: egui::Color32,
+    expanded: bool,
+    stripe: bool,
+) -> bool {
     let sk = skin();
-    let mut clicked = false;
+    let waiting = wants_human(&r.status);
 
-    // ── status ──────────────────────────────────────────────────────────
-    ui.allocate_ui(egui::vec2(W_STATUS, 0.0), |ui| {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 3.5, colour);
-            ui.label(egui::RichText::new(status_label(&r.status)).color(colour).size(9.0));
-        });
-    });
-
-    // ── task ────────────────────────────────────────────────────────────
-    ui.allocate_ui(egui::vec2(W_TASK, 0.0), |ui| {
-        ui.vertical(|ui| {
-            let name = ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(display_name(r)).color(sk.title).size(10.5),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_text(if r.detail.is_empty() {
-                    "click to list the files this session wrote".to_string()
-                } else {
-                    r.detail.clone()
-                });
-            if name.clicked() {
-                clicked = true;
-            }
-            let stamp = if r.turn_started > 0 { r.turn_started } else { r.last_activity };
-            let meta = if stamp > 0 {
-                format!("{}  ·  {} file{}", elapsed(now_ms().saturating_sub(stamp)), r.files.len(), plural(r.files.len()))
-            } else {
-                format!("{} file{}", r.files.len(), plural(r.files.len()))
-            };
-            ui.label(egui::RichText::new(meta).color(sk.faint).size(9.0));
-        });
-    });
-
-    // ── where to look ───────────────────────────────────────────────────
-    ui.allocate_ui(egui::vec2(W_WHERE, 0.0), |ui| {
-        ui.vertical(|ui| {
-            if r.steps.is_empty() {
-                let what = if r.has_map && r.unmapped > 0 {
-                    "no mapped panel"
-                } else if r.has_map {
-                    "—"
-                } else {
-                    "no map"
-                };
-                ui.label(egui::RichText::new(what).color(sk.faint).size(9.5));
-                return;
-            }
-            for st in &r.steps {
-                let mark = if st.is_verified() { "" } else { "  ?" };
-                ui.label(
-                    egui::RichText::new(format!("{}{}", st.title, mark))
-                        .color(sk.route)
-                        .size(9.5),
-                )
-                .on_hover_text(if st.needs.is_empty() {
-                    st.open.clone()
-                } else {
-                    format!("{}\n\nneeds: {}", st.open, st.needs.join("; "))
-                });
-            }
-        });
-    });
-
-    // ── reply + actions ─────────────────────────────────────────────────
-    // Only rows actually waiting on a person get an editor. A running agent has
-    // not asked anything yet, and a column of boxes against rows with nothing
-    // to answer is furniture.
-    if wants_human(&r.status) {
-        draw_reply_cells(ui, r);
+    // Lay the text out before allocating, so the row is exactly as tall as its
+    // contents. Measuring after allocation is what produces the classic
+    // half-clipped second line when a task name happens to wrap.
+    let name = ui.painter().layout(
+        display_name(r),
+        egui::FontId::proportional(10.5),
+        sk.title,
+        C_TASK,
+    );
+    let stamp = if r.turn_started > 0 { r.turn_started } else { r.last_activity };
+    let meta = if stamp > 0 {
+        format!(
+            "{}  ·  {} file{}",
+            elapsed(now_ms().saturating_sub(stamp)),
+            r.files.len(),
+            plural(r.files.len())
+        )
     } else {
-        ui.allocate_ui(egui::vec2(W_REPLY, 0.0), |ui| {
-            ui.label(egui::RichText::new("").size(9.0));
-        });
-        ui.allocate_ui(egui::vec2(W_ACTIONS, 0.0), |_ui| {});
+        format!("{} file{}", r.files.len(), plural(r.files.len()))
+    };
+    let meta = ui.painter().layout(meta, egui::FontId::proportional(9.0), sk.faint, C_TASK);
+
+    let mut wheres = Vec::new();
+    if r.steps.is_empty() {
+        let what = if !r.has_map {
+            "no map"
+        } else if r.unmapped > 0 {
+            "no mapped panel"
+        } else {
+            "—"
+        };
+        wheres.push(ui.painter().layout(
+            what.to_string(),
+            egui::FontId::proportional(9.5),
+            sk.faint,
+            C_WHERE,
+        ));
+    } else {
+        for st in &r.steps {
+            let mark = if st.is_verified() { "" } else { " ?" };
+            wheres.push(ui.painter().layout(
+                format!("{}{}", st.title, mark),
+                egui::FontId::proportional(9.5),
+                sk.route,
+                C_WHERE,
+            ));
+        }
     }
 
-    ui.end_row();
+    let files: Vec<_> = if expanded {
+        r.files
+            .iter()
+            .map(|f| {
+                ui.painter().layout(
+                    f.clone(),
+                    egui::FontId::monospace(8.5),
+                    sk.file,
+                    C_TASK + C_WHERE,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // Unfolded: the write-set, under the task it belongs to. A second grid row
-    // rather than a taller cell, so the columns beside it stay on their own
-    // baselines instead of being dragged down by a long file list.
-    if expanded && !r.files.is_empty() {
-        let sk = skin();
-        ui.label("");
-        ui.allocate_ui(egui::vec2(W_TASK, 0.0), |ui| {
-            ui.vertical(|ui| {
-                for f in &r.files {
-                    ui.label(
-                        egui::RichText::new(f)
-                            .color(sk.file)
-                            .size(9.0)
-                            .monospace(),
-                    );
-                }
-            });
-        });
-        ui.label("");
-        ui.label("");
-        ui.label("");
-        ui.end_row();
+    // Heights are read off the galleys now, because painting moves them.
+    let name_h = name.size().y;
+    let meta_h = meta.size().y;
+    let where_h: f32 = wheres.iter().map(|g| g.size().y + 1.0).sum();
+    let files_h: f32 = files.iter().map(|g| g.size().y + 1.0).sum();
+
+    let text_h = (name_h + 2.0 + meta_h).max(where_h);
+    let mut h = 6.0 + text_h + 6.0;
+    if waiting {
+        h = h.max(REPLY_H);
+    }
+    if !files.is_empty() {
+        h += files_h + 4.0;
     }
 
-    clicked
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::click());
+    let x = col_x(rect.left());
+
+    {
+        let p = ui.painter();
+        // Zebra striping. The guide the eye needs once rows carry four columns;
+        // cheaper than a rule per row and it does not fight the translucency.
+        if stripe {
+            p.rect_filled(rect, egui::Rounding::none(), sk.row_hover);
+        }
+        if resp.hovered() {
+            p.rect_filled(rect, egui::Rounding::none(), sk.row_hover);
+        }
+        // Severity bar down the left edge -- what makes the pane readable at a
+        // glance without reading any of the words.
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + 1.0),
+                egui::pos2(rect.left() + 2.5, rect.bottom() - 1.0),
+            ),
+            egui::Rounding::none(),
+            colour,
+        );
+
+        let top = rect.top() + 6.0;
+
+        // status
+        p.circle_filled(egui::pos2(x[0] + 3.0, top + 5.0), 3.5, colour);
+        p.text(
+            egui::pos2(x[0] + 12.0, top + 5.0),
+            egui::Align2::LEFT_CENTER,
+            status_label(&r.status),
+            egui::FontId::proportional(9.0),
+            colour,
+        );
+
+        // task
+        let mut y = top;
+        p.galley(egui::pos2(x[1], y), name);
+        y += name_h + 2.0;
+        p.galley(egui::pos2(x[1], y), meta);
+
+        // where to look
+        let mut wy = top;
+        for g in wheres {
+            let gh = g.size().y;
+            p.galley(egui::pos2(x[2], wy), g);
+            wy += gh + 1.0;
+        }
+
+        // files, under the task column when unfolded
+        if !files.is_empty() {
+            let mut fy = rect.bottom() - 4.0 - files_h;
+            for g in files {
+                let gh = g.size().y;
+                p.circle_filled(egui::pos2(x[1] + 2.0, fy + gh * 0.5), 1.5, sk.faint);
+                p.galley(egui::pos2(x[1] + 9.0, fy), g);
+                fy += gh + 1.0;
+            }
+        }
+    }
+
+    if waiting {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(x[3], rect.top() + 4.0),
+            egui::vec2(C_REPLY, (rect.height() - 8.0).max(20.0)),
+        );
+        draw_reply_cell(ui, r, cell);
+    }
+
+    resp.clicked()
 }
 
-/// The reply editor and its buttons: the last two cells of a waiting row.
+/// The reply editor and its buttons, in one exactly-placed rect.
 ///
 /// A multiline box, not a single line. What gets sent is a sentence about
 /// something on screen -- "the flag clips through the hull on the port side" --
-/// and a field that shows six characters of it invites the shortest possible
+/// and a field showing six characters of it invites the shortest possible
 /// message rather than a useful one. It is collapsed to one line on delivery
 /// regardless, since the agent's prompt reads a line.
 ///
-///   grep -n "fn draw_reply_cells"  sauron_panel.rs
-fn draw_reply_cells(ui: &mut egui::Ui, r: &Row) {
+///   grep -n "fn draw_reply_cell"  sauron_panel.rs
+fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
     let sk = skin();
     let mut queued: Option<(&'static str, String, String)> = None;
     let mut shot = false;
 
-    let Ok(mut all) = drafts().lock() else {
-        ui.allocate_ui(egui::vec2(W_REPLY, 0.0), |_ui| {});
-        ui.allocate_ui(egui::vec2(W_ACTIONS, 0.0), |_ui| {});
-        return;
-    };
+    let Ok(mut all) = drafts().lock() else { return };
     let d = all.entry(r.id.clone()).or_default();
 
-    ui.allocate_ui(egui::vec2(W_REPLY, 0.0), |ui| {
+    ui.allocate_ui_at_rect(cell, |ui| {
+        reply_font(ui);
         ui.vertical(|ui| {
             if ui
                 .add(
                     egui::TextEdit::multiline(&mut d.text)
                         .desired_rows(2)
-                        .desired_width(W_REPLY)
+                        .desired_width(C_REPLY)
                         .hint_text("reply…"),
                 )
                 .changed()
             {
                 d.status.clear();
             }
-            if !d.attach.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("📎 {}", short_path(&d.attach)))
-                        .color(sk.route_dim)
-                        .size(8.5),
-                );
-            }
-            if !d.status.is_empty() {
-                ui.label(egui::RichText::new(&d.status).color(sk.route_dim).size(8.5));
-            }
-        });
-    });
-
-    ui.allocate_ui(egui::vec2(W_ACTIONS, 0.0), |ui| {
-        ui.vertical(|ui| {
-            let can_send = !d.text.trim().is_empty();
-            if ui
-                .add_enabled(can_send, egui::Button::new("Send"))
-                .on_hover_text("type this into the agent's own terminal")
-                .clicked()
-            {
-                queued = Some(("reply", d.text.clone(), d.attach.clone()));
-            }
-            if ui
-                .button("Shot")
-                .on_hover_text("capture the screen and attach it")
-                .clicked()
-            {
-                shot = true;
-            }
-            if ui
-                .button("Ack")
-                .on_hover_text("mark this session's edits as looked at")
-                .clicked()
-            {
-                queued = Some(("ack", String::new(), String::new()));
-            }
+            ui.horizontal(|ui| {
+                let can_send = !d.text.trim().is_empty();
+                if ui
+                    .add_enabled(can_send, egui::Button::new("Send"))
+                    .on_hover_text("type this into the agent's own terminal")
+                    .clicked()
+                {
+                    queued = Some(("reply", d.text.clone(), d.attach.clone()));
+                }
+                if ui
+                    .button("Shot")
+                    .on_hover_text("capture the screen and attach it")
+                    .clicked()
+                {
+                    shot = true;
+                }
+                if ui
+                    .button("Ack")
+                    .on_hover_text("mark this session's edits as looked at")
+                    .clicked()
+                {
+                    queued = Some(("ack", String::new(), String::new()));
+                }
+                if !d.attach.is_empty() {
+                    ui.label(egui::RichText::new("📎").color(sk.route_dim).size(9.0));
+                }
+                if !d.status.is_empty() {
+                    ui.label(egui::RichText::new(&d.status).color(sk.route_dim).size(8.5));
+                }
+            });
         });
     });
 
@@ -1242,7 +1303,7 @@ fn draw_reply_cells(ui: &mut egui::Ui, r: &Row) {
         match take_screenshot() {
             Ok(p) => {
                 d.attach = p;
-                d.status = "screenshot attached".into();
+                d.status = "shot attached".into();
             }
             // Surfaced rather than swallowed: the usual cause is macOS refusing
             // Screen Recording to this binary, which is a permission to grant,
@@ -1313,12 +1374,19 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     let worst = worst_colour(b);
     p.circle_filled(egui::pos2(rect.left() + PAD + 3.0, rect.center().y), 4.0, worst);
 
-    p.text(
-        egui::pos2(rect.left() + PAD + 15.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        "SAURON",
+    // Measured, not guessed. A hardcoded offset for the summary put it on top
+    // of the title the moment the host's font was wider than the number picked
+    // here, which rendered as "SAURONneeds attention".
+    let title = p.layout_no_wrap(
+        "SAURON".to_string(),
         egui::FontId::proportional(12.0),
         Palette::TITLE(),
+    );
+    let title_w = title.size().x;
+    let title_x = rect.left() + PAD + 15.0;
+    p.galley(
+        egui::pos2(title_x, rect.center().y - title.size().y * 0.5),
+        title,
     );
 
     let summary = if b.attention == 0 {
@@ -1329,7 +1397,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
         format!("{} need attention", b.attention)
     };
     p.text(
-        egui::pos2(rect.left() + PAD + 74.0, rect.center().y),
+        egui::pos2(title_x + title_w + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         summary,
         egui::FontId::proportional(11.0),
