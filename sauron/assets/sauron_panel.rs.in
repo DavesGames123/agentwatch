@@ -1088,21 +1088,91 @@ fn panel_w() -> f32 {
     W_BASE * sc()
 }
 
-/// A small action button: fixed box, fixed glyph size, immune to host style.
-fn action_w() -> f32 { 40.0 * sc() }
+/// A small action button, painted rather than added.
+///
+/// WHY NOT `egui::Button` IN A PLACED RECT
+/// --------------------------------------
+/// That was the previous attempt and it still came out wrong: `ui.put` fixes
+/// where a widget goes, but a `Button` computes its own desired size from the
+/// host's `button_padding`, and this host's padding is scaled 2-4x. The label
+/// was then squeezed into what remained and wrapped -- one character per line,
+/// "send" as a vertical s-e-n-d. Placing the rect was necessary and not
+/// sufficient.
+///
+/// So the button is a rect, a stroke and a centred glyph run, drawn by this
+/// file. `Align2::CENTER_CENTER` text cannot wrap, so the label is incapable of
+/// stacking however narrow the box gets, and nothing about it can be changed by
+/// a style this file does not own. `ui.interact` supplies the click without
+/// bringing any layout opinion with it.
+fn action_w() -> f32 { 42.0 * sc() }
 fn action_h() -> f32 { 20.0 * sc() }
 
-/// Height of the reply field.
-fn field_h() -> f32 { 34.0 * sc() }
-
-fn action_button(ui: &mut egui::Ui, rect: egui::Rect, label: &str, on: bool) -> bool {
+fn action_button(
+    ui: &mut egui::Ui,
+    id_src: (&str, &str),
+    rect: egui::Rect,
+    label: &str,
+    on: bool,
+) -> bool {
     let sk = skin();
-    let text = egui::RichText::new(label)
-        .font(egui::FontId::proportional(9.5 * sc()))
-        .color(if on { sk.title } else { sk.faint });
-    ui.put(rect, egui::Button::new(text).min_size(rect.size()))
-        .clicked()
-        && on
+    let k = sc();
+    let id = ui.make_persistent_id(id_src);
+    let resp = ui.interact(rect, id, egui::Sense::click());
+
+    let hot = on && resp.hovered();
+    let down = on && resp.is_pointer_button_down_on();
+    let bg = if down {
+        sk.route_dim
+    } else if hot {
+        sk.row_hover
+    } else {
+        sk.header_bg
+    };
+    let fg = if !on {
+        sk.faint
+    } else if hot || down {
+        sk.title
+    } else {
+        sk.dim
+    };
+
+    let p = ui.painter();
+    let rounding = egui::Rounding::same(3.0 * k);
+    p.rect_filled(rect, rounding, bg);
+    p.rect_stroke(rect, rounding, egui::Stroke::new(1.0, sk.rule));
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(9.5 * k),
+        fg,
+    );
+
+    resp.clicked() && on
+}
+
+/// Exactly the height `TextEdit` will occupy for `text` at this width.
+///
+/// Computed rather than assumed, using the same three numbers the widget does:
+/// its row height for the font, the taller of the wrapped galley and the
+/// minimum row count, and its own margin. A reserved height that disagrees with
+/// what the widget draws is how the reply box came to overlap the row beneath
+/// it -- egui grows the box to fit the text whether or not the row was measured
+/// for it.
+///
+///   grep -n "let desired_height"  src/warp_core/egui/src/widgets/text_edit/builder/show.rs
+fn field_h_for(ui: &egui::Ui, text: &str, width: f32) -> f32 {
+    let k = sc();
+    let font = egui::FontId::proportional(10.5 * k);
+    let margin = egui::vec2(4.0 * k, 3.0 * k);
+    let row_h = ui.fonts(|f| f.row_height(&font));
+    let galley = ui.painter().layout(
+        text.to_string(),
+        font,
+        egui::Color32::WHITE,
+        (width - margin.x * 2.0).max(10.0),
+    );
+    galley.size().y.max(row_h * 2.0) + margin.y * 2.0
 }
 
 /// One row of the board. Returns whether it was clicked, which folds its file
@@ -1167,14 +1237,14 @@ fn draw_board_row(
     // What has already been said to this agent. Cloned out under the lock and
     // the guard dropped immediately: `draw_reply_row` takes the same mutex, and
     // holding it across that call would deadlock on the first waiting row.
-    let sent: Vec<String> = if waiting {
+    let (sent, draft_text): (Vec<String>, String) = if waiting {
         drafts()
             .lock()
             .ok()
-            .and_then(|m| m.get(&r.id).map(|d| d.sent.clone()))
+            .and_then(|m| m.get(&r.id).map(|d| (d.sent.clone(), d.text.clone())))
             .unwrap_or_default()
     } else {
-        Vec::new()
+        (Vec::new(), String::new())
     };
     let sent: Vec<_> = sent
         .iter()
@@ -1192,10 +1262,17 @@ fn draw_board_row(
     let title_h = title.size().y;
     let files_h: f32 = files.iter().map(|g| g.size().y + 2.0 * k).sum();
     let sent_h: f32 = sent.iter().map(|g| g.size().y + 2.0 * k).sum();
+    // Measured from the text the box currently holds, so a row grows as its
+    // draft wraps instead of being overrun by it.
+    let field_h = if waiting {
+        field_h_for(ui, &draft_text, inner - action_w() * 3.0 - 12.0 * k)
+    } else {
+        0.0
+    };
 
     let mut h = 7.0 * k + meta_h + 3.0 * k + title_h + 7.0 * k;
     if waiting {
-        h += field_h() + 5.0 * k;
+        h += field_h + 5.0 * k;
     }
     if !sent.is_empty() {
         h += sent_h + 3.0 * k;
@@ -1277,13 +1354,13 @@ fn draw_board_row(
     }
 
     if waiting {
-        let top = rect.bottom() - pad() * 0.7 - field_h();
+        let top = rect.bottom() - pad() * 0.7 - field_h;
         draw_reply_row(
             ui,
             r,
             egui::Rect::from_min_size(
                 egui::pos2(rect.left() + pad(), top),
-                egui::vec2(inner, field_h()),
+                egui::vec2(inner, field_h),
             ),
         );
     }
@@ -1322,6 +1399,8 @@ fn draw_reply_row(ui: &mut egui::Ui, r: &Row, strip: egui::Rect) {
             field_rect,
             egui::TextEdit::multiline(&mut d.text)
                 .font(f.clone())
+                .margin(egui::vec2(4.0 * k, 3.0 * k))
+                .desired_rows(2)
                 .desired_width(field_w)
                 .hint_text(
                     egui::RichText::new("reply to this agent…")
@@ -1344,13 +1423,13 @@ fn draw_reply_row(ui: &mut egui::Ui, r: &Row, strip: egui::Rect) {
         )
     };
 
-    if action_button(ui, btn(0), "send", !d.text.trim().is_empty()) {
+    if action_button(ui, (&r.id, "send"), btn(0), "send", !d.text.trim().is_empty()) {
         queued = Some(("reply", d.text.clone(), d.attach.clone()));
     }
-    if action_button(ui, btn(1), "shot", true) {
+    if action_button(ui, (&r.id, "shot"), btn(1), "shot", true) {
         shot = true;
     }
-    if action_button(ui, btn(2), "ack", true) {
+    if action_button(ui, (&r.id, "ack"), btn(2), "ack", true) {
         queued = Some(("ack", String::new(), String::new()));
     }
 
