@@ -1250,59 +1250,30 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
 
 /// What the cursor gets for resting on a row.
 ///
-/// The route in full where there is one, because the collapsed card has room
-/// for door names only. Falls back to the old fold hint on a row with no route,
-/// and to nothing at all on a row with neither -- an empty tooltip is better
-/// than one that says nothing useful, since a tooltip that always appears
-/// trains you to ignore it.
+/// DELIBERATELY ONE LINE
+/// --------------------
+/// This used to render the whole route -- every step, its instruction, its
+/// preconditions -- and it was unusable. A tooltip is laid out against the
+/// cursor, not the pane, so several sentences of prose became a column of
+/// wrapped text taller than the window, covering the very GUI it was describing
+/// and obscuring the cable drawn to answer the same question.
+///
+/// The route has two better homes already: the card names the doors inline, and
+/// unfolding gives the full instruction in a box that is actually the right
+/// shape for it. A tooltip's job here is to say what clicking does.
 ///
 ///   grep -n "fn hover_text"  sauron_panel.rs
 fn hover_text(r: &Row, expanded: bool) -> String {
+    if r.files.is_empty() {
+        return String::new();
+    }
+    if expanded {
+        return "click to fold".to_string();
+    }
     if r.steps.is_empty() {
-        if r.files.is_empty() {
-            return String::new();
-        }
-        return if expanded {
-            "click to fold".to_string()
-        } else {
-            "click to list the files this session wrote".to_string()
-        };
+        return "click to list the files this session wrote".to_string();
     }
-
-    let mut t = String::from("Where to look\n");
-    for (i, s) in r.steps.iter().enumerate() {
-        let mark = if s.is_verified() { "" } else { "   (inferred)" };
-        t.push_str(&format!(
-            "\n{}. {}  —  {} file{}{}\n   {}\n",
-            i + 1,
-            s.title,
-            s.hits,
-            plural(s.hits),
-            mark,
-            s.open,
-        ));
-        if !s.needs.is_empty() {
-            t.push_str(&format!("   needs: {}\n", s.needs.join("; ")));
-        }
-    }
-    if r.unmapped > 0 {
-        t.push_str(&format!(
-            "\n{} file{} match no panel — the map may be behind the code\n",
-            r.unmapped,
-            plural(r.unmapped),
-        ));
-    }
-    if r.truncated > 0 {
-        t.push_str(&format!("+{} more surface{} not shown\n", r.truncated, plural(r.truncated)));
-    }
-    if !r.files.is_empty() {
-        t.push_str(if expanded {
-            "\nclick to fold"
-        } else {
-            "\nclick for the files this session wrote"
-        });
-    }
-    t
+    "click for the route and the files this session wrote".to_string()
 }
 
 /// What the card calls this session. Orcs get a marker: they are sauron's own
