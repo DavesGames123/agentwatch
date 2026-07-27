@@ -1142,6 +1142,27 @@ fn draw_board_row(
 
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::click());
 
+    // Publish what this row points at, so a host can draw a line from it to the
+    // control in question. Only anchors that name something: a surface with no
+    // button has nothing to run a cable to, and a cable into empty screen is
+    // worse than no cable.
+    //
+    // Done here, beside the row's own rect, because that rect IS the source of
+    // the line -- and losing this one statement in a layout rewrite silently
+    // turns the whole feature off, which is exactly what happened.
+    if resp.hovered() {
+        if let Ok(mut hv) = hover_state().lock() {
+            *hv = Some((
+                rect,
+                r.steps
+                    .iter()
+                    .filter(|st| !st.anchor.is_empty())
+                    .map(|st| st.anchor.clone())
+                    .collect(),
+            ));
+        }
+    }
+
     {
         let p = ui.painter();
         if resp.hovered() {
