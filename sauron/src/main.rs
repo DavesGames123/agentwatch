@@ -483,6 +483,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// terminal, so they share one encoder -- it lives in `mirror`, which is the
 /// one that runs it thousands of times.
 use sauron::mirror::base64;
+use sauron::reply;
 use sauron::route;
 
 fn main() -> std::io::Result<()> {
@@ -545,6 +546,13 @@ fn main() -> std::io::Result<()> {
     // the pane, and must work in a checkout that never installed one.
     if args.first().map(|s| s.as_str()) == Some("route") {
         return route::run(&args[1..]);
+    }
+
+    // `sauron reply ...` -- say something to a running agent in its own
+    // terminal. Beside `route` for the same reason: it is about the board, not
+    // the pane, and must work with no pane installed anywhere.
+    if args.first().map(|s| s.as_str()) == Some("reply") {
+        return reply::run(&args[1..]);
     }
 
     let once = args.iter().any(|a| a == "--once");
@@ -758,6 +766,14 @@ fn main() -> std::io::Result<()> {
         }
 
         if last_tick.elapsed() >= TICK {
+            // Deliver anything a reader queued BEFORE resyncing, so a reply
+            // typed into the in-app pane reaches the agent on the same tick it
+            // was written rather than the one after. The agent's own log record
+            // of receiving it is then picked up by the resync below, which is
+            // what makes the board move without a second round trip.
+            //   grep -n "fn drain"  src/reply.rs
+            reply::drain();
+
             // resync, not refresh: this also re-reads the ack file, so work you
             // acked in a muthur board or another sauron stops reading as
             // untested here without a relaunch.

@@ -38,6 +38,7 @@ pub mod mirror;
 pub mod model;
 pub mod orc;
 pub mod panel;
+pub mod reply;
 pub mod route;
 pub mod scan;
 pub mod scene;
