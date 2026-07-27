@@ -961,7 +961,6 @@ pub fn render(ctx: &egui::Context) {
                     ui.add_space(2.0);
 
                     let mut drew_any = false;
-                    draw_col_heads(ui);
                     let mut n = 0usize;
                     for (token, _title) in GROUPS {
                         let rows: Vec<&Row> =
@@ -1015,96 +1014,59 @@ pub fn render(ctx: &egui::Context) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-//  Board geometry
+//  Board layout
 // ───────────────────────────────────────────────────────────────────────────
 //
-//  WHY THE COLUMNS ARE PLACED BY HAND AND NOT BY `egui::Grid`
-//  ---------------------------------------------------------
-//  Grid was the obvious tool and it was the wrong one: it derives each column's
-//  width from the widest content in it, so a table of fixed columns cannot be
-//  expressed. Asking for a width inside a cell -- `allocate_ui(vec2(w, ..))` --
-//  requests a size the Grid then overrides, which fails silently and looks like
-//  a styling problem rather than a layout one. It produced an actions column
-//  roughly one character wide, so "Send" rendered as a vertical S-e-n-d, and
-//  header labels that sat at content-derived offsets nowhere near the data
-//  underneath them.
+//  ONE COLUMN, NOT FOUR
+//  --------------------
+//  This was a four-column table twice, and both times the columns were the
+//  problem rather than the styling. A task name is 40-60 characters; a route is
+//  a panel name; a reply is a sentence. Giving each a fixed slice of a pane that
+//  has to sit over a game means every one of them is too narrow, and the longest
+//  -- the title -- broke one word per line while a "WHERE TO LOOK" column sat
+//  empty showing an em dash.
 //
-//  A zero-height request made it worse: `allocate_ui(vec2(w, 0.0))` lets the
-//  child inherit the remaining available height, which the row then reported as
-//  its own -- a single row three hundred pixels tall.
+//  So each row is now full width and stacked, like a message in an inbox:
 //
-//  So every column is a constant and every cell is painted at a computed x.
-//  `col_x` is the single source of those offsets and BOTH the header and the
-//  rows call it, which is what makes a heading provably sit above its column
-//  rather than approximately above it.
+//      ● AWAITING ACK · 11m02s · 0 files · Interplanetary
+//      Build Sauron GUI navigation guide system
+//      [ reply to this agent…                  ] [send][shot][ack]
+//
+//  The metadata is one dim line, the title gets the whole width at the largest
+//  size in the pane, and the reply spans the row. Nothing competes for
+//  horizontal space, so nothing has to be cramped to fit.
+//
+//  EVERY INTERACTIVE RECT IS PLACED, NOT REQUESTED
+//  ----------------------------------------------
+//  `ui.button(..)` sizes itself from the host's style, and this host's style is
+//  2-4x. Asking politely -- `Style::override_font_id`, a `RichText` font --
+//  fixed the glyphs but not the padding, and missed entirely wherever the call
+//  was written as a chained `.button(..)` the patch did not match. Buttons are
+//  now `ui.put` into rects this file computes, so their size is a fact of the
+//  layout rather than a property of whatever style happens to be in scope.
 
-fn c_status() -> f32 { 70.0 * sc() }
-fn c_task() -> f32 { 200.0 * sc() }
-fn c_where() -> f32 { 116.0 * sc() }
-fn c_reply() -> f32 { 214.0 * sc() }
-fn col_gap() -> f32 { 10.0 * sc() }
-
-/// Left edge of each column, given the row's left edge.
-fn col_x(left: f32) -> [f32; 4] {
-    let x0 = left + pad();
-    let x1 = x0 + c_status() + col_gap();
-    let x2 = x1 + c_task() + col_gap();
-    let x3 = x2 + c_where() + col_gap();
-    [x0, x1, x2, x3]
-}
+/// Base width of the pane, before scale. One column, sized for a task title.
+const W_BASE: f32 = 430.0;
 
 fn panel_w() -> f32 {
-    pad() * 2.0 + c_status() + c_task() + c_where() + c_reply() + col_gap() * 3.0
+    W_BASE * sc()
 }
 
-/// The font every widget in the reply cell is told to use, explicitly.
-///
-/// WHY EXPLICITLY AND NOT VIA `Style::override_font_id`
-/// ---------------------------------------------------
-/// Setting `override_font_id` on the cell's `Ui` is the tidy way and it did not
-/// work here: the host's own style kept winning, so Send/Shot/Ack rendered at
-/// the game's chrome size -- four times the hand-painted text beside them --
-/// while every length in this file stayed in raw pixels. Passing the `FontId`
-/// to each widget cannot be overridden by anyone, and a debug pane that renders
-/// correctly is worth more than one that reads elegantly.
-fn reply_font_id() -> egui::FontId {
-    egui::FontId::proportional(11.0 * sc())
-}
+/// A small action button: fixed box, fixed glyph size, immune to host style.
+fn action_w() -> f32 { 40.0 * sc() }
+fn action_h() -> f32 { 20.0 * sc() }
 
-/// Spacing for the reply cell, scaled with everything else.
-fn reply_spacing(ui: &mut egui::Ui) {
-    let k = sc();
-    ui.style_mut().spacing.item_spacing = egui::vec2(4.0 * k, 4.0 * k);
-    ui.style_mut().spacing.button_padding = egui::vec2(7.0 * k, 3.0 * k);
-    ui.style_mut().spacing.interact_size.y = 18.0 * k;
-}
+/// Height of the reply field.
+fn field_h() -> f32 { 34.0 * sc() }
 
-/// How tall a waiting row must be to hold its editor and buttons.
-fn reply_h() -> f32 { 64.0 * sc() }
-
-/// The column headings, painted at the same offsets the rows use.
-fn draw_col_heads(ui: &mut egui::Ui) {
+fn action_button(ui: &mut egui::Ui, rect: egui::Rect, label: &str, on: bool) -> bool {
     let sk = skin();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 15.0), egui::Sense::hover());
-    let x = col_x(rect.left());
-    let p = ui.painter();
-    let f = egui::FontId::monospace(8.0 * sc());
-    for (i, t) in ["STATUS", "TASK", "WHERE TO LOOK", "REPLY"].iter().enumerate() {
-        p.text(
-            egui::pos2(x[i], rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            *t,
-            f.clone(),
-            sk.faint,
-        );
-    }
-    p.line_segment(
-        [
-            egui::pos2(rect.left() + pad(), rect.bottom() - 0.5),
-            egui::pos2(rect.right() - pad(), rect.bottom() - 0.5),
-        ],
-        egui::Stroke::new(1.0, sk.rule),
-    );
+    let text = egui::RichText::new(label)
+        .font(egui::FontId::proportional(9.5 * sc()))
+        .color(if on { sk.title } else { sk.faint });
+    ui.put(rect, egui::Button::new(text).min_size(rect.size()))
+        .clicked()
+        && on
 }
 
 /// One row of the board. Returns whether it was clicked, which folds its file
@@ -1116,69 +1078,49 @@ fn draw_board_row(
     r: &Row,
     colour: egui::Color32,
     expanded: bool,
-    stripe: bool,
+    _stripe: bool,
 ) -> bool {
     let sk = skin();
+    let k = sc();
     let waiting = wants_human(&r.status);
+    let inner = panel_w() - pad() * 2.0;
 
-    // Lay the text out before allocating, so the row is exactly as tall as its
-    // contents. Measuring after allocation is what produces the classic
-    // half-clipped second line when a task name happens to wrap.
-    let name = ui.painter().layout(
-        display_name(r),
-        egui::FontId::proportional(10.5 * sc()),
-        sk.title,
-        c_task(),
-    );
+    // ── measure first, allocate second ──────────────────────────────────
+    // A row measured after it is allocated is the classic source of a
+    // half-clipped last line, and of content overrunning into the footer.
     let stamp = if r.turn_started > 0 { r.turn_started } else { r.last_activity };
-    let meta = if stamp > 0 {
-        format!(
-            "{}  ·  {} file{}",
-            elapsed(now_ms().saturating_sub(stamp)),
-            r.files.len(),
-            plural(r.files.len())
-        )
-    } else {
-        format!("{} file{}", r.files.len(), plural(r.files.len()))
-    };
-    let meta = ui.painter().layout(meta, egui::FontId::proportional(9.0 * sc()), sk.faint, c_task());
-
-    let mut wheres = Vec::new();
-    if r.steps.is_empty() {
-        let what = if !r.has_map {
-            "no map"
-        } else if r.unmapped > 0 {
-            "no mapped panel"
-        } else {
-            "—"
-        };
-        wheres.push(ui.painter().layout(
-            what.to_string(),
-            egui::FontId::proportional(9.5 * sc()),
-            sk.faint,
-            c_where(),
-        ));
-    } else {
-        for st in &r.steps {
-            let mark = if st.is_verified() { "" } else { " ?" };
-            wheres.push(ui.painter().layout(
-                format!("{}{}", st.title, mark),
-                egui::FontId::proportional(9.5 * sc()),
-                sk.route,
-                c_where(),
-            ));
+    let mut bits: Vec<String> = vec![status_label(&r.status).to_string()];
+    if stamp > 0 {
+        bits.push(elapsed(now_ms().saturating_sub(stamp)));
+    }
+    bits.push(format!("{} file{}", r.files.len(), plural(r.files.len())));
+    if let Some(first) = r.steps.first() {
+        bits.push(first.title.clone());
+        if r.steps.len() > 1 {
+            bits.push(format!("+{}", r.steps.len() - 1));
         }
     }
-
+    let meta = ui.painter().layout(
+        bits.join("  ·  "),
+        egui::FontId::proportional(9.5 * k),
+        sk.faint,
+        inner - 14.0 * k,
+    );
+    let title = ui.painter().layout(
+        display_name(r),
+        egui::FontId::proportional(12.0 * k),
+        sk.title,
+        inner,
+    );
     let files: Vec<_> = if expanded {
         r.files
             .iter()
             .map(|f| {
                 ui.painter().layout(
                     f.clone(),
-                    egui::FontId::monospace(8.5 * sc()),
+                    egui::FontId::monospace(8.5 * k),
                     sk.file,
-                    c_task() + c_where(),
+                    inner - 12.0 * k,
                 )
             })
             .collect()
@@ -1186,169 +1128,157 @@ fn draw_board_row(
         Vec::new()
     };
 
-    // Heights are read off the galleys now, because painting moves them.
-    let name_h = name.size().y;
     let meta_h = meta.size().y;
-    let where_h: f32 = wheres.iter().map(|g| g.size().y + 1.0).sum();
-    let files_h: f32 = files.iter().map(|g| g.size().y + 1.0).sum();
+    let title_h = title.size().y;
+    let files_h: f32 = files.iter().map(|g| g.size().y + 2.0 * k).sum();
 
-    let text_h = (name_h + 2.0 + meta_h).max(where_h);
-    let mut h = 6.0 + text_h + 6.0;
+    let mut h = 7.0 * k + meta_h + 3.0 * k + title_h + 7.0 * k;
     if waiting {
-        h = h.max(reply_h());
+        h += field_h() + 5.0 * k;
     }
     if !files.is_empty() {
-        h += files_h + 4.0;
+        h += files_h + 4.0 * k;
     }
 
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::click());
-    let x = col_x(rect.left());
 
     {
         let p = ui.painter();
-        // Zebra striping. The guide the eye needs once rows carry four columns;
-        // cheaper than a rule per row and it does not fight the translucency.
-        if stripe {
-            p.rect_filled(rect, egui::Rounding::none(), sk.row_hover);
-        }
         if resp.hovered() {
-            p.rect_filled(rect, egui::Rounding::none(), sk.row_hover);
+            p.rect_filled(rect, egui::Rounding::same(4.0 * k), sk.row_hover);
         }
-        // Severity bar down the left edge -- what makes the pane readable at a
-        // glance without reading any of the words.
+        // Severity bar: what makes the board readable at a glance without
+        // reading any of the words.
         p.rect_filled(
             egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top() + 1.0),
-                egui::pos2(rect.left() + 2.5, rect.bottom() - 1.0),
+                egui::pos2(rect.left() + 2.0 * k, rect.top() + 3.0 * k),
+                egui::pos2(rect.left() + 4.5 * k, rect.bottom() - 3.0 * k),
             ),
-            egui::Rounding::none(),
+            egui::Rounding::same(1.5 * k),
             colour,
         );
 
-        let top = rect.top() + 6.0;
+        let x = rect.left() + pad();
+        let mut y = rect.top() + 7.0 * k;
 
-        // status
-        p.circle_filled(egui::pos2(x[0] + 3.0, top + 5.0), 3.5, colour);
-        p.text(
-            egui::pos2(x[0] + 12.0, top + 5.0),
-            egui::Align2::LEFT_CENTER,
-            status_label(&r.status),
-            egui::FontId::proportional(9.0 * sc()),
-            colour,
-        );
+        // status pip, then the whole metadata line
+        p.circle_filled(egui::pos2(x + 3.0 * k, y + meta_h * 0.5), 3.0 * k, colour);
+        p.galley(egui::pos2(x + 11.0 * k, y), meta);
+        y += meta_h + 3.0 * k;
 
-        // task
-        let mut y = top;
-        p.galley(egui::pos2(x[1], y), name);
-        y += name_h + 2.0;
-        p.galley(egui::pos2(x[1], y), meta);
+        p.galley(egui::pos2(x, y), title);
+        y += title_h;
 
-        // where to look
-        let mut wy = top;
-        for g in wheres {
-            let gh = g.size().y;
-            p.galley(egui::pos2(x[2], wy), g);
-            wy += gh + 1.0;
-        }
-
-        // files, under the task column when unfolded
         if !files.is_empty() {
-            let mut fy = rect.bottom() - 4.0 - files_h;
+            y += 4.0 * k;
             for g in files {
                 let gh = g.size().y;
-                p.circle_filled(egui::pos2(x[1] + 2.0, fy + gh * 0.5), 1.5, sk.faint);
-                p.galley(egui::pos2(x[1] + 9.0, fy), g);
-                fy += gh + 1.0;
+                p.circle_filled(egui::pos2(x + 3.0 * k, y + gh * 0.5), 1.5 * k, sk.faint);
+                p.galley(egui::pos2(x + 11.0 * k, y), g);
+                y += gh + 2.0 * k;
             }
         }
     }
 
     if waiting {
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(x[3], rect.top() + 4.0),
-            egui::vec2(c_reply(), (rect.height() - 8.0).max(20.0)),
+        let top = rect.bottom() - pad() * 0.7 - field_h();
+        draw_reply_row(
+            ui,
+            r,
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + pad(), top),
+                egui::vec2(inner, field_h()),
+            ),
         );
-        draw_reply_cell(ui, r, cell);
     }
 
     resp.clicked()
 }
 
-/// The reply editor and its buttons, in one exactly-placed rect.
+/// The reply field and its three actions, in one exactly-placed strip.
 ///
-/// A multiline box, not a single line. What gets sent is a sentence about
-/// something on screen -- "the flag clips through the hull on the port side" --
-/// and a field showing six characters of it invites the shortest possible
-/// message rather than a useful one. It is collapsed to one line on delivery
-/// regardless, since the agent's prompt reads a line.
+/// The field takes whatever the buttons do not, so it grows with the pane
+/// instead of being a fixed stub. A sentence about something on screen is the
+/// unit here -- "the flag clips through the hull on the port side" -- and a box
+/// showing six characters of it invites the shortest possible message rather
+/// than a useful one.
 ///
-///   grep -n "fn draw_reply_cell"  sauron_panel.rs
-fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
+///   grep -n "fn draw_reply_row"  sauron_panel.rs
+fn draw_reply_row(ui: &mut egui::Ui, r: &Row, strip: egui::Rect) {
     let sk = skin();
+    let k = sc();
     let mut queued: Option<(&'static str, String, String)> = None;
     let mut shot = false;
 
     let Ok(mut all) = drafts().lock() else { return };
     let d = all.entry(r.id.clone()).or_default();
 
-    ui.allocate_ui_at_rect(cell, |ui| {
-        reply_spacing(ui);
-        let f = reply_font_id();
-        ui.vertical(|ui| {
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut d.text)
-                        .font(f.clone())
-                        .desired_rows(3)
-                        .desired_width(c_reply())
-                        .hint_text(
-                            egui::RichText::new("reply to this agent…")
-                                .font(f.clone())
-                                .color(sk.faint),
-                        ),
-                )
-                .changed()
-            {
-                d.status.clear();
-            }
-            ui.horizontal(|ui| {
-                let can_send = !d.text.trim().is_empty();
-                if ui
-                    .add_enabled(can_send, egui::Button::new(egui::RichText::new("Send").font(f.clone())))
-                    .on_hover_text("type this into the agent's own terminal")
-                    .clicked()
-                {
-                    queued = Some(("reply", d.text.clone(), d.attach.clone()));
-                }
-                if ui
-                    .button("Shot")
-                    .on_hover_text("capture the screen and attach it")
-                    .clicked()
-                {
-                    shot = true;
-                }
-                if ui
-                    .button("Ack")
-                    .on_hover_text("mark this session's edits as looked at")
-                    .clicked()
-                {
-                    queued = Some(("ack", String::new(), String::new()));
-                }
-                if !d.attach.is_empty() {
-                    ui.label(egui::RichText::new("📎").color(sk.route_dim).size(9.0 * sc()));
-                }
-                if !d.status.is_empty() {
-                    ui.label(egui::RichText::new(&d.status).color(sk.route_dim).size(8.5 * sc()));
-                }
-            });
-        });
-    });
+    let gap = 4.0 * k;
+    let actions_w = action_w() * 3.0 + gap * 2.0;
+    let field_w = (strip.width() - actions_w - gap).max(60.0 * k);
+
+    let field_rect =
+        egui::Rect::from_min_size(strip.min, egui::vec2(field_w, strip.height()));
+    let f = egui::FontId::proportional(10.5 * k);
+
+    let changed = ui
+        .put(
+            field_rect,
+            egui::TextEdit::multiline(&mut d.text)
+                .font(f.clone())
+                .desired_width(field_w)
+                .hint_text(
+                    egui::RichText::new("reply to this agent…")
+                        .font(f)
+                        .color(sk.faint),
+                ),
+        )
+        .changed();
+    if changed {
+        d.status.clear();
+    }
+
+    // Buttons on their own baseline, vertically centred against the field.
+    let by = strip.center().y - action_h() * 0.5;
+    let bx = strip.right() - actions_w;
+    let btn = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(bx + (action_w() + gap) * i as f32, by),
+            egui::vec2(action_w(), action_h()),
+        )
+    };
+
+    if action_button(ui, btn(0), "send", !d.text.trim().is_empty()) {
+        queued = Some(("reply", d.text.clone(), d.attach.clone()));
+    }
+    if action_button(ui, btn(1), "shot", true) {
+        shot = true;
+    }
+    if action_button(ui, btn(2), "ack", true) {
+        queued = Some(("ack", String::new(), String::new()));
+    }
+
+    // Status and attachment live under the strip, painted rather than laid out,
+    // so they cannot push the row's geometry around after it was measured.
+    if !d.status.is_empty() || !d.attach.is_empty() {
+        let mut note = d.status.clone();
+        if !d.attach.is_empty() {
+            note = format!("{}  {}", short_path(&d.attach), note);
+        }
+        ui.painter().text(
+            egui::pos2(strip.left(), strip.bottom() + 1.0 * k),
+            egui::Align2::LEFT_TOP,
+            note.trim(),
+            egui::FontId::proportional(8.5 * k),
+            sk.route_dim,
+        );
+    }
 
     if shot {
         match take_screenshot() {
             Ok(p) => {
                 d.attach = p;
-                d.status = "shot attached".into();
+                d.status = "attached".into();
             }
             // Surfaced rather than swallowed: the usual cause is macOS refusing
             // Screen Recording to this binary, which is a permission to grant,
@@ -1368,7 +1298,7 @@ fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
     }
 }
 
-/// The short status word shown in the status column.
+/// The short status word shown at the head of the metadata line.
 fn status_label(status: &str) -> &'static str {
     GROUPS
         .iter()
@@ -1377,7 +1307,7 @@ fn status_label(status: &str) -> &'static str {
         .unwrap_or("—")
 }
 
-/// Just the file name -- the temp directory prefix is noise in a narrow column.
+/// Just the file name -- the temp directory prefix is noise in a narrow pane.
 fn short_path(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
