@@ -104,7 +104,12 @@ const POLL: Duration = Duration::from_millis(500);
 //  Look
 // ───────────────────────────────────────────────────────────────────────────
 
-const PANEL_W: f32 = 348.0;
+/// Pane width. A function, not a constant, because the host may set it: this
+/// pane is a guest in somebody else's window and 348px is a guess about their
+/// layout, not a fact.
+fn panel_w() -> f32 {
+    skin().width
+}
 const PAD: f32 = 10.0;
 /// Header strip height. A constant rather than a measurement because the drag
 /// clamp needs it *outside* the closure that draws the header.
@@ -123,29 +128,126 @@ const GRAB_MARGIN: f32 = 56.0;
 /// Every colour the pane uses. Grouped so a host project can retheme by editing
 /// one block — the only edit to this file that survives a regeneration cleanly,
 /// because it is contiguous.
+/// Every colour the pane uses, plus its width — one struct so a host can
+/// restyle the whole thing in a single call.
+///
+/// WHY THIS IS NOT A BLOCK OF CONSTANTS ANY MORE
+/// --------------------------------------------
+/// It used to be, with a comment claiming a contiguous block was the one edit
+/// that survived regeneration cleanly. That was wrong twice over. Editing a
+/// GENERATED file means re-applying the edit after every `panel install`, which
+/// is a chore that eventually gets skipped. And a host whose own palette is
+/// user-switchable at runtime — a theme picker in its settings — cannot be
+/// served by baked constants at all: the pane would sit in the corner wearing
+/// last week's colours while everything around it changed.
+///
+/// So the values live in a host-settable struct and `Default` reproduces the
+/// original look exactly. A host that never calls `set_skin` sees no change.
+#[derive(Debug, Clone, Copy)]
+pub struct Skin {
+    pub bg: egui::Color32,
+    pub edge: egui::Color32,
+    pub header_bg: egui::Color32,
+    pub title: egui::Color32,
+    pub dim: egui::Color32,
+    pub faint: egui::Color32,
+    pub row_hover: egui::Color32,
+    pub rule: egui::Color32,
+    pub file: egui::Color32,
+
+    pub errored: egui::Color32,
+    pub blocked: egui::Color32,
+    pub awaiting_ack: egui::Color32,
+    pub needs_test: egui::Color32,
+    pub running: egui::Color32,
+
+    /// The route: where to go to look at a change. A host drawing its own
+    /// highlight should use this same colour, or the pane and the highlight
+    /// read as two unrelated claims rather than one.
+    pub route: egui::Color32,
+    pub route_dim: egui::Color32,
+
+    pub width: f32,
+}
+
+impl Default for Skin {
+    fn default() -> Self {
+        Self {
+            bg: egui::Color32::from_rgba_premultiplied(10, 12, 17, 236),
+            edge: egui::Color32::from_rgb(58, 66, 84),
+            header_bg: egui::Color32::from_rgba_premultiplied(20, 24, 33, 245),
+            title: egui::Color32::from_rgb(214, 222, 236),
+            dim: egui::Color32::from_rgb(122, 132, 150),
+            faint: egui::Color32::from_rgb(86, 94, 110),
+            row_hover: egui::Color32::from_rgba_premultiplied(38, 44, 58, 120),
+            rule: egui::Color32::from_rgb(38, 44, 57),
+            file: egui::Color32::from_rgb(146, 172, 200),
+
+            errored: egui::Color32::from_rgb(255, 92, 92),
+            blocked: egui::Color32::from_rgb(255, 178, 66),
+            awaiting_ack: egui::Color32::from_rgb(150, 200, 255),
+            needs_test: egui::Color32::from_rgb(112, 222, 168),
+            running: egui::Color32::from_rgb(140, 146, 168),
+
+            route: egui::Color32::from_rgb(112, 222, 168),
+            route_dim: egui::Color32::from_rgb(78, 150, 118),
+
+            width: 348.0,
+        }
+    }
+}
+
+static SKIN: OnceLock<Mutex<Skin>> = OnceLock::new();
+
+fn skin_state() -> &'static Mutex<Skin> {
+    SKIN.get_or_init(|| Mutex::new(Skin::default()))
+}
+
+/// Restyle the pane. Cheap enough to call every frame, which is the right way
+/// to drive it from a host whose theme can change under the user.
+///
+///   grep -n "fn set_skin"  sauron_panel.rs
+pub fn set_skin(s: Skin) {
+    if let Ok(mut cur) = skin_state().lock() {
+        *cur = s;
+    }
+}
+
+/// The current skin, or the default if a lock is somehow poisoned. Never
+/// returns an error: a debug pane that refuses to draw because a colour was
+/// unavailable would be a worse failure than drawing in the wrong colour.
+pub fn skin() -> Skin {
+    skin_state().lock().map(|s| *s).unwrap_or_default()
+}
+
+/// Named accessors, so call sites read the way they did when these were
+/// constants. The SCREAMING_CASE-function spelling is deliberate: it is what
+/// this pane's first host uses for exactly the same reason — a colour that
+/// reads the live theme cannot be a const, and renaming every call site to say
+/// so would be churn for nothing.
+#[allow(non_snake_case)]
 struct Palette;
+
+#[allow(non_snake_case)]
 impl Palette {
-    const BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(10, 12, 17, 236);
-    const EDGE: egui::Color32 = egui::Color32::from_rgb(58, 66, 84);
-    const HEADER_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 24, 33, 245);
-    const TITLE: egui::Color32 = egui::Color32::from_rgb(214, 222, 236);
-    const DIM: egui::Color32 = egui::Color32::from_rgb(122, 132, 150);
-    const FAINT: egui::Color32 = egui::Color32::from_rgb(86, 94, 110);
-    const ROW_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(38, 44, 58, 120);
-    const RULE: egui::Color32 = egui::Color32::from_rgb(38, 44, 57);
-    const FILE: egui::Color32 = egui::Color32::from_rgb(146, 172, 200);
+    fn BG() -> egui::Color32 { skin().bg }
+    fn EDGE() -> egui::Color32 { skin().edge }
+    fn HEADER_BG() -> egui::Color32 { skin().header_bg }
+    fn TITLE() -> egui::Color32 { skin().title }
+    fn DIM() -> egui::Color32 { skin().dim }
+    fn FAINT() -> egui::Color32 { skin().faint }
+    fn ROW_HOVER() -> egui::Color32 { skin().row_hover }
+    fn RULE() -> egui::Color32 { skin().rule }
+    fn FILE() -> egui::Color32 { skin().file }
 
-    const ERRORED: egui::Color32 = egui::Color32::from_rgb(255, 92, 92);
-    const BLOCKED: egui::Color32 = egui::Color32::from_rgb(255, 178, 66);
-    const AWAITING_ACK: egui::Color32 = egui::Color32::from_rgb(150, 200, 255);
-    const NEEDS_TEST: egui::Color32 = egui::Color32::from_rgb(112, 222, 168);
-    const RUNNING: egui::Color32 = egui::Color32::from_rgb(140, 146, 168);
+    fn ERRORED() -> egui::Color32 { skin().errored }
+    fn BLOCKED() -> egui::Color32 { skin().blocked }
+    fn AWAITING_ACK() -> egui::Color32 { skin().awaiting_ack }
+    fn NEEDS_TEST() -> egui::Color32 { skin().needs_test }
+    fn RUNNING() -> egui::Color32 { skin().running }
 
-    /// The route: where to go to look at a change. Keyed to NEEDS_TEST,
-    /// because that is the status whose entire meaning is "someone has to open
-    /// something and look".
-    const ROUTE: egui::Color32 = egui::Color32::from_rgb(112, 222, 168);
-    const ROUTE_DIM: egui::Color32 = egui::Color32::from_rgb(78, 150, 118);
+    fn ROUTE() -> egui::Color32 { skin().route }
+    fn ROUTE_DIM() -> egui::Color32 { skin().route_dim }
 }
 
 /// The wire status token -> how it is grouped, coloured and titled.
@@ -154,20 +256,39 @@ impl Palette {
 /// own ranking: an errored agent is dead until rescued, a blocked one resumes
 /// the moment you answer, and unverified edits merely wait. Reordering these
 /// reorders the pane.
-const GROUPS: &[(&str, &str, egui::Color32)] = &[
-    ("errored", "ERRORED", Palette::ERRORED),
-    ("blocked", "WAITING ON YOU", Palette::BLOCKED),
-    ("awaiting_ack", "AWAITING ACK", Palette::AWAITING_ACK),
-    ("needs_test", "AWAITING TEST", Palette::NEEDS_TEST),
-    ("working", "RUNNING", Palette::RUNNING),
-    ("delegated", "DELEGATED", Palette::RUNNING),
+/// The wire status token -> how it is grouped and titled.
+///
+/// The order of this table is the order the groups appear, and it is sauron's
+/// own ranking: an errored agent is dead until rescued, a blocked one resumes
+/// the moment you answer, and unverified edits merely wait. Reordering these
+/// reorders the pane.
+///
+/// The colour is looked up separately rather than stored here, because a skin
+/// is resolved at draw time and this table is a `const`.
+const GROUPS: &[(&str, &str)] = &[
+    ("errored", "ERRORED"),
+    ("blocked", "WAITING ON YOU"),
+    ("awaiting_ack", "AWAITING ACK"),
+    ("needs_test", "AWAITING TEST"),
+    ("working", "RUNNING"),
+    ("delegated", "DELEGATED"),
 ];
+
+fn group_colour(token: &str) -> egui::Color32 {
+    match token {
+        "errored" => Palette::ERRORED(),
+        "blocked" => Palette::BLOCKED(),
+        "awaiting_ack" => Palette::AWAITING_ACK(),
+        "needs_test" => Palette::NEEDS_TEST(),
+        _ => Palette::RUNNING(),
+    }
+}
 
 fn group_of(status: &str) -> Option<(&'static str, egui::Color32, usize)> {
     GROUPS
         .iter()
-        .position(|(tok, _, _)| *tok == status)
-        .map(|i| (GROUPS[i].1, GROUPS[i].2, i))
+        .position(|(tok, _)| *tok == status)
+        .map(|i| (GROUPS[i].1, group_colour(GROUPS[i].0), i))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -680,12 +801,12 @@ pub fn render(ctx: &egui::Context) {
         .constrain(false)
         .show(ctx, |ui| {
             egui::Frame::none()
-                .fill(Palette::BG)
-                .stroke(egui::Stroke::new(1.0, Palette::EDGE))
+                .fill(Palette::BG())
+                .stroke(egui::Stroke::new(1.0, Palette::EDGE()))
                 .rounding(egui::Rounding::same(7.0))
                 .inner_margin(egui::Margin::same(0.0))
                 .show(ui, |ui| {
-                    ui.set_width(PANEL_W);
+                    ui.set_width(panel_w());
                     ui.spacing_mut().item_spacing.y = 0.0;
 
                     drag = draw_header(ui, &beacon);
@@ -695,16 +816,20 @@ pub fn render(ctx: &egui::Context) {
                     ui.add_space(2.0);
 
                     let mut drew_any = false;
-                    for (token, title, colour) in GROUPS {
+                    for (token, title) in GROUPS {
                         let rows: Vec<&Row> =
                             beacon.rows.iter().filter(|r| r.status == *token).collect();
                         if rows.is_empty() {
                             continue;
                         }
                         drew_any = true;
-                        draw_group_header(ui, title, *colour, rows.len());
+                        // Resolved here rather than carried in GROUPS: the
+                        // table is a `const` and a skin is only known at draw
+                        // time.
+                        let colour = group_colour(token);
+                        draw_group_header(ui, title, colour, rows.len());
                         for r in rows {
-                            if draw_row(ui, r, *colour, expanded.contains(&r.id_short)) {
+                            if draw_row(ui, r, colour, expanded.contains(&r.id_short)) {
                                 toggled = Some(r.id_short.clone());
                             }
                         }
@@ -733,7 +858,7 @@ pub fn render(ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let mut p = pos + drag;
         p.x = p.x.clamp(
-            screen.left() - PANEL_W + GRAB_MARGIN,
+            screen.left() - panel_w() + GRAB_MARGIN,
             screen.right() - GRAB_MARGIN,
         );
         p.y = p.y.clamp(screen.top(), screen.bottom() - HEADER_H);
@@ -754,7 +879,7 @@ pub fn render(ctx: &egui::Context) {
 fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     let collapsed = COLLAPSED.load(Ordering::Relaxed);
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(PANEL_W, HEADER_H), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(panel_w(), HEADER_H), egui::Sense::click_and_drag());
     let dragging = resp.dragged();
     if dragging {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -773,7 +898,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
             se: 0.0,
         }
     };
-    p.rect_filled(rect, rounding, Palette::HEADER_BG);
+    p.rect_filled(rect, rounding, Palette::HEADER_BG());
 
     // Severity dot: the colour of the worst thing on the board. On a folded
     // pane this is the entire signal, so it is drawn first and never elided.
@@ -785,7 +910,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
         egui::Align2::LEFT_CENTER,
         "SAURON",
         egui::FontId::proportional(12.0),
-        Palette::TITLE,
+        Palette::TITLE(),
     );
 
     let summary = if b.attention == 0 {
@@ -801,9 +926,9 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
         summary,
         egui::FontId::proportional(11.0),
         if b.attention == 0 {
-            Palette::FAINT
+            Palette::FAINT()
         } else {
-            Palette::DIM
+            Palette::DIM()
         },
     );
 
@@ -811,9 +936,9 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     let cx = rect.right() - PAD - 4.0;
     let cy = rect.center().y;
     let tint = if resp.hovered() {
-        Palette::TITLE
+        Palette::TITLE()
     } else {
-        Palette::DIM
+        Palette::DIM()
     };
     let tri = if collapsed {
         [
@@ -836,7 +961,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
                 egui::pos2(rect.left(), rect.bottom() - 0.5),
                 egui::pos2(rect.right(), rect.bottom() - 0.5),
             ],
-            egui::Stroke::new(1.0, Palette::RULE),
+            egui::Stroke::new(1.0, Palette::RULE()),
         );
     }
 
@@ -868,12 +993,12 @@ fn worst_colour(b: &Beacon) -> egui::Color32 {
             }
         }
     }
-    best.map(|(_, c)| c).unwrap_or(Palette::FAINT)
+    best.map(|(_, c)| c).unwrap_or(Palette::FAINT())
 }
 
 fn draw_group_header(ui: &mut egui::Ui, title: &str, colour: egui::Color32, n: usize) {
     let h = 19.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::hover());
     let p = ui.painter();
     p.text(
         egui::pos2(rect.left() + PAD, rect.center().y + 1.0),
@@ -887,14 +1012,14 @@ fn draw_group_header(ui: &mut egui::Ui, title: &str, colour: egui::Color32, n: u
         egui::Align2::RIGHT_CENTER,
         n.to_string(),
         egui::FontId::proportional(9.5),
-        Palette::FAINT,
+        Palette::FAINT(),
     );
 }
 
 /// One session card. Returns true if it was clicked, meaning its file list
 /// should fold or unfold — the caller applies that after the borrow ends.
 fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -> bool {
-    let text_w = PANEL_W - PAD * 2.0 - 6.0 - 46.0;
+    let text_w = panel_w() - PAD * 2.0 - 6.0 - 46.0;
 
     // Lay the text out before allocating, so the row is exactly as tall as its
     // contents. Measuring after allocation is what produces the classic
@@ -902,14 +1027,14 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
     let name = ui.painter().layout(
         display_name(r),
         egui::FontId::proportional(12.0),
-        Palette::TITLE,
+        Palette::TITLE(),
         text_w,
     );
     let detail = (!r.detail.is_empty()).then(|| {
         ui.painter().layout(
             r.detail.clone(),
             egui::FontId::proportional(10.5),
-            Palette::DIM,
+            Palette::DIM(),
             text_w,
         )
     });
@@ -921,8 +1046,8 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
                 ui.painter().layout(
                     f.clone(),
                     egui::FontId::monospace(9.5),
-                    Palette::FILE,
-                    PANEL_W - PAD * 2.0 - 14.0,
+                    Palette::FILE(),
+                    panel_w() - PAD * 2.0 - 14.0,
                 )
             })
             .collect()
@@ -942,7 +1067,7 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
                 r.steps.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" · ")
             ),
             egui::FontId::proportional(10.5),
-            Palette::ROUTE,
+            Palette::ROUTE(),
             text_w,
         )
     });
@@ -954,21 +1079,21 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
             route_body.push(ui.painter().layout(
                 format!("{}. {} — {} file(s){}", i + 1, st.title, st.hits, mark),
                 egui::FontId::proportional(10.5),
-                Palette::ROUTE,
-                PANEL_W - PAD * 2.0 - 14.0,
+                Palette::ROUTE(),
+                panel_w() - PAD * 2.0 - 14.0,
             ));
             route_body.push(ui.painter().layout(
                 st.open.clone(),
                 egui::FontId::proportional(10.0),
-                Palette::ROUTE_DIM,
-                PANEL_W - PAD * 2.0 - 20.0,
+                Palette::ROUTE_DIM(),
+                panel_w() - PAD * 2.0 - 20.0,
             ));
             if !st.needs.is_empty() {
                 route_body.push(ui.painter().layout(
                     format!("needs: {}", st.needs.join("; ")),
                     egui::FontId::proportional(10.0),
-                    Palette::BLOCKED,
-                    PANEL_W - PAD * 2.0 - 20.0,
+                    Palette::BLOCKED(),
+                    panel_w() - PAD * 2.0 - 20.0,
                 ));
             }
         }
@@ -978,16 +1103,16 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
             route_body.push(ui.painter().layout(
                 format!("{} file(s) match no panel — the map may be behind the code", r.unmapped),
                 egui::FontId::proportional(9.5),
-                Palette::FAINT,
-                PANEL_W - PAD * 2.0 - 20.0,
+                Palette::FAINT(),
+                panel_w() - PAD * 2.0 - 20.0,
             ));
         }
         if r.truncated > 0 {
             route_body.push(ui.painter().layout(
                 format!("+{} more surface(s) not shown", r.truncated),
                 egui::FontId::proportional(9.5),
-                Palette::FAINT,
-                PANEL_W - PAD * 2.0 - 20.0,
+                Palette::FAINT(),
+                panel_w() - PAD * 2.0 - 20.0,
             ));
         }
     }
@@ -1017,11 +1142,11 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
     }
     h += 7.0;
 
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(PANEL_W, h), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::click());
     let p = ui.painter();
 
     if resp.hovered() {
-        p.rect_filled(rect, egui::Rounding::none(), Palette::ROW_HOVER);
+        p.rect_filled(rect, egui::Rounding::none(), Palette::ROW_HOVER());
         // Publish what this row connects to, for a host drawing a cable from
         // the card to the control. Only anchors that name something: a surface
         // with no button has nothing to run a line to, and a cable into empty
@@ -1067,7 +1192,7 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
             egui::Align2::RIGHT_CENTER,
             elapsed(now_ms().saturating_sub(stamp)),
             egui::FontId::proportional(10.0),
-            Palette::FAINT,
+            Palette::FAINT(),
         );
     }
     y += 2.0 + name_h;
@@ -1097,7 +1222,7 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
         y += 2.0;
         for g in files {
             let gh = g.size().y;
-            p.circle_filled(egui::pos2(x + 2.5, y + gh * 0.5), 1.5, Palette::FAINT);
+            p.circle_filled(egui::pos2(x + 2.5, y + gh * 0.5), 1.5, Palette::FAINT());
             p.galley(egui::pos2(x + 10.0, y), g);
             y += gh + 1.0;
         }
@@ -1107,7 +1232,7 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
             egui::Align2::RIGHT_CENTER,
             format!("{} file{}", r.files.len(), plural(r.files.len())),
             egui::FontId::proportional(9.5),
-            Palette::FAINT,
+            Palette::FAINT(),
         );
     }
 
@@ -1205,13 +1330,13 @@ fn plural(n: usize) -> &'static str {
 }
 
 fn draw_all_clear(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, 34.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 34.0), egui::Sense::hover());
     ui.painter().text(
         egui::pos2(rect.left() + PAD, rect.center().y),
         egui::Align2::LEFT_CENTER,
         "board clear — nothing waiting on you",
         egui::FontId::proportional(11.0),
-        Palette::FAINT,
+        Palette::FAINT(),
     );
 }
 
@@ -1226,21 +1351,21 @@ fn draw_footer(ui: &mut egui::Ui, b: &Beacon) {
     bits.push(b.label.clone());
     let line = bits.join("  ·  ");
 
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(PANEL_W, 20.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 20.0), egui::Sense::hover());
     let p = ui.painter();
     p.line_segment(
         [
             egui::pos2(rect.left() + PAD, rect.top() + 0.5),
             egui::pos2(rect.right() - PAD, rect.top() + 0.5),
         ],
-        egui::Stroke::new(1.0, Palette::RULE),
+        egui::Stroke::new(1.0, Palette::RULE()),
     );
     p.text(
         egui::pos2(rect.left() + PAD, rect.center().y + 1.0),
         egui::Align2::LEFT_CENTER,
         line,
         egui::FontId::proportional(9.5),
-        Palette::FAINT,
+        Palette::FAINT(),
     );
 }
 
