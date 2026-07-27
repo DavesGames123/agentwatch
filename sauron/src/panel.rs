@@ -413,7 +413,7 @@ mod tests {
     fn template_has_no_unfilled_holes() {
         let filled = TEMPLATE
             .replace("{{EGUI_IMPORT}}", "use egui;")
-            .replace("{{VERSION}}", "1")
+            .replace("{{VERSION}}", &beacon::VERSION.to_string())
             .replace("{{STALE_MS}}", "6000")
             .replace("{{INSTALL_ARGS}}", "");
         assert!(

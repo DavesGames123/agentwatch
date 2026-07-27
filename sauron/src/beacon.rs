@@ -42,9 +42,23 @@
 //! detail  station hull plates render at the wrong scale
 //! file    src/gui/overlays/station_damage.rs
 //! file    src/combat/hull.rs
+//! step    xray    Colony / X-ray  2       verified        Press E, or click the x-ray squircle.
+//! need    a station selected
+//! route   0       0                                       (unmapped, truncated)
 //! row     blocked ...
 //! end
 //! ```
+//!
+//! v2 added `step`, `need` and `route`: where to look in order to see the edits
+//! a row is asking about, resolved from the watched repo's own
+//! `.sauron/panels.toml` (see `route.rs`). Each attaches to the row above it,
+//! and `need` to the `step` above it, the same way `file` already did.
+//!
+//! A repo with no map emits none of the three, which is not the same as a repo
+//! whose map covered everything -- the `route` line is written whenever a map
+//! was found, so its absence means "no map" and `route 0 0` means "mapped, all
+//! covered". A reader that cannot tell those apart will eventually report a
+//! stale map as a clean one.
 //!
 //! The trailing `end` line is the torn-read guard. `rename` is atomic on every
 //! filesystem this runs on, so a reader should never see a partial file -- but
@@ -68,7 +82,7 @@ use crate::scan::home;
 
 /// Wire format version. Bump on any field change; readers refuse a version they
 /// were not built for rather than guessing at a shifted column.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// How stale a beacon may be before a reader must treat sauron as gone.
 ///
@@ -96,6 +110,33 @@ pub struct BeaconRow {
     pub detail: String,
     /// Repo-relative paths written but not acked.
     pub files: Vec<String>,
+    /// Where to look, best first. Empty when the repo ships no map, or when
+    /// nothing this row touched is described by one.
+    pub steps: Vec<BeaconStep>,
+    /// Files in this row that no panel claims. The staleness signal -- see
+    /// `route::Route::unmapped`.
+    pub unmapped: usize,
+    /// Surfaces beyond the route's cap that were not listed.
+    pub truncated: usize,
+    /// Whether the repo published a map at all. Distinguishes "nothing to
+    /// open" from "nobody said".
+    pub has_map: bool,
+}
+
+/// One surface to open, flattened for a reader that knows nothing about maps.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BeaconStep {
+    /// What the host's own UI calls this control; empty when it has no button.
+    /// A host that wants to highlight the thing to press matches on this.
+    pub anchor: String,
+    pub title: String,
+    /// How many of the row's files this surface renders.
+    pub hits: usize,
+    /// `verified` or `inferred`, passed through from the map so a reader can
+    /// show a guess as a guess.
+    pub confidence: String,
+    pub open: String,
+    pub needs: Vec<String>,
 }
 
 /// A published board, as read back off disk.
@@ -211,6 +252,10 @@ const DETAIL_MAX: usize = 180;
 /// Board -> wire text.
 fn render(board: &Board) -> String {
     let mut out = String::with_capacity(2048);
+    // Once per publish, not once per row: the map is mtime-cached, but the
+    // repo root lookup and the Option dance are still work, and every row on a
+    // board shares the same map by construction.
+    let map = crate::route::for_repo(board.repo_root());
     let attention = board.rows.iter().filter(|r| wants_human(r.status)).count();
     let working = board
         .rows
@@ -245,6 +290,25 @@ fn render(board: &Board) -> String {
         }
         for p in &r.pending {
             out.push_str(&format!("file\t{}\n", esc(p)));
+        }
+        if let Some(m) = &map {
+            let route = m.route(&r.pending);
+            for s in &route.steps {
+                out.push_str(&format!(
+                    "step\t{}\t{}\t{}\t{}\t{}\n",
+                    esc(&s.anchor),
+                    esc(&s.title),
+                    s.hits,
+                    esc(&s.confidence),
+                    esc(&collapse_ws(&s.open)),
+                ));
+                for n in &s.needs {
+                    out.push_str(&format!("need\t{}\n", esc(&collapse_ws(n))));
+                }
+            }
+            // Written even when both are zero: its presence is how a reader
+            // knows a map existed at all.
+            out.push_str(&format!("route\t{}\t{}\n", route.unmapped, route.truncated));
         }
     }
     out.push_str("end\n");
@@ -378,6 +442,10 @@ pub fn parse(text: &str) -> Option<Beacon> {
                     name: unesc(f[6]),
                     detail: String::new(),
                     files: Vec::new(),
+                    steps: Vec::new(),
+                    unmapped: 0,
+                    truncated: 0,
+                    has_map: false,
                 });
             }
             // `detail` and `file` attach to the row above them. A stray one
@@ -392,6 +460,38 @@ pub fn parse(text: &str) -> Option<Beacon> {
             "file" => {
                 if let Some(r) = b.rows.last_mut() {
                     r.files.push(unesc(rest));
+                }
+            }
+            // `step` attaches to the row above it and `need` to the step above
+            // that, on the same reasoning as `file`: a stray one degrades a
+            // single card rather than rejecting the whole snapshot.
+            "step" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                if f.len() < 5 {
+                    continue;
+                }
+                if let Some(r) = b.rows.last_mut() {
+                    r.steps.push(BeaconStep {
+                        anchor: unesc(f[0]),
+                        title: unesc(f[1]),
+                        hits: f[2].parse().unwrap_or(0),
+                        confidence: unesc(f[3]),
+                        open: unesc(f[4]),
+                        needs: Vec::new(),
+                    });
+                }
+            }
+            "need" => {
+                if let Some(s) = b.rows.last_mut().and_then(|r| r.steps.last_mut()) {
+                    s.needs.push(unesc(rest));
+                }
+            }
+            "route" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                if let Some(r) = b.rows.last_mut() {
+                    r.unmapped = f.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    r.truncated = f.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    r.has_map = true;
                 }
             }
             _ => {}
@@ -411,7 +511,7 @@ mod tests {
 
     fn sample() -> String {
         let mut s = String::new();
-        s.push_str("sauron-beacon\t1\n");
+        s.push_str(&format!("sauron-beacon\t{VERSION}\n"));
         s.push_str("repo\t/tmp/demo\n");
         s.push_str("label\tdemo\n");
         s.push_str("pid\t99\n");
@@ -420,6 +520,9 @@ mod tests {
         s.push_str("row\terrored\tabc12345\t1700000000000\t1700000001000\t0\t7\ta\\tname\n");
         s.push_str("detail\tAPI error — retry\n");
         s.push_str("file\tsrc/a.rs\n");
+        s.push_str("step\txray\tColony\t1\tverified\tPress E.\n");
+        s.push_str("need\ta station selected\n");
+        s.push_str("route\t2\t1\n");
         s.push_str("row\tworking\tdef67890\t0\t1700000002000\t1\t0\torc: shrink b.rs\n");
         s.push_str("end\n");
         s
@@ -449,8 +552,52 @@ mod tests {
 
     #[test]
     fn rejects_foreign_version() {
-        let future = sample().replace("sauron-beacon\t1", "sauron-beacon\t2");
+        let future = sample().replace(
+            &format!("sauron-beacon\t{VERSION}"),
+            &format!("sauron-beacon\t{}", VERSION + 1),
+        );
         assert!(parse(&future).is_none());
+        let past = sample().replace(&format!("sauron-beacon\t{VERSION}"), "sauron-beacon\t1");
+        assert!(parse(&past).is_none());
+    }
+
+    #[test]
+    fn parses_the_route_lines() {
+        let b = parse(&sample()).expect("parses");
+        let r = &b.rows[0];
+        assert_eq!(r.steps.len(), 1);
+        assert_eq!(r.steps[0].anchor, "xray");
+        assert_eq!(r.steps[0].title, "Colony");
+        assert_eq!(r.steps[0].hits, 1);
+        assert_eq!(r.steps[0].confidence, "verified");
+        assert_eq!(r.steps[0].needs, vec!["a station selected".to_string()]);
+        assert_eq!((r.unmapped, r.truncated), (2, 1));
+        assert!(r.has_map);
+    }
+
+    #[test]
+    fn a_row_without_route_lines_reports_no_map() {
+        // The distinction that matters: this row had no `route` line at all,
+        // which means the repo published no map -- not that its map covered
+        // everything. A reader that conflates the two shows a stale map as a
+        // clean one, forever.
+        let b = parse(&sample()).expect("parses");
+        let r = &b.rows[1];
+        assert!(!r.has_map);
+        assert!(r.steps.is_empty());
+        assert_eq!(r.unmapped, 0);
+    }
+
+    #[test]
+    fn a_need_before_any_step_is_dropped_not_fatal() {
+        let hand_edited = sample().replace(
+            "file\tsrc/a.rs\n",
+            "file\tsrc/a.rs\nneed\torphaned\n",
+        );
+        let b = parse(&hand_edited).expect("still parses");
+        // Attached to the previous row's last step if there is one; the point
+        // is that the snapshot survives rather than blanking the pane.
+        assert_eq!(b.rows.len(), 2);
     }
 
     #[test]

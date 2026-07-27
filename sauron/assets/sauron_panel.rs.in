@@ -36,6 +36,18 @@
 //       draws on top
 //    3. optionally `sauron_panel::set_visible(bool)` from a key binding
 //
+//  ROUTES
+//  ------
+//  When the watched repo ships a `.sauron/panels.toml`, each row also carries
+//  where to look in order to see its edits -- which panel, how to open it, and
+//  what must be true first. The pane shows that itself, and `route_anchors()`
+//  hands the host the names of the controls involved so it can ring the real
+//  button. Those names come from the map, so they are whatever that project
+//  calls its own UI; this file never interprets them.
+//
+//  A repo with no map produces no routes and the pane looks exactly as it did
+//  before the feature existed.
+//
 //  PLACEMENT
 //  ---------
 //  Docked to the left margin by default. Drag the header strip to move it; the
@@ -51,6 +63,8 @@
 //    fn parse           -- the v{{VERSION}} wire format reader
 //    fn draw_header     -- fold control and drag handle, one surface
 //    fn draw_row        -- one session card
+//    fn route_anchors   -- controls the host should highlight, for `needs_test`
+//    fn route_steps     -- the same routes, with their instructions
 //    const DEFAULT_POS  -- where it docks before anyone moves it
 //    const STALE_MS     -- how old a beacon may be and still count as live
 //    struct Palette     -- every colour in one place, for retheming
@@ -126,6 +140,12 @@ impl Palette {
     const AWAITING_ACK: egui::Color32 = egui::Color32::from_rgb(150, 200, 255);
     const NEEDS_TEST: egui::Color32 = egui::Color32::from_rgb(112, 222, 168);
     const RUNNING: egui::Color32 = egui::Color32::from_rgb(140, 146, 168);
+
+    /// The route: where to go to look at a change. Keyed to NEEDS_TEST,
+    /// because that is the status whose entire meaning is "someone has to open
+    /// something and look".
+    const ROUTE: egui::Color32 = egui::Color32::from_rgb(112, 222, 168);
+    const ROUTE_DIM: egui::Color32 = egui::Color32::from_rgb(78, 150, 118);
 }
 
 /// The wire status token -> how it is grouped, coloured and titled.
@@ -165,6 +185,28 @@ struct Row {
     name: String,
     detail: String,
     files: Vec<String>,
+    /// Where to look in order to see this row's edits, best first. Empty when
+    /// the watched repo publishes no map.
+    steps: Vec<Step>,
+    /// Files no surface claims. Shown rather than swallowed: a map that has
+    /// fallen behind the code still emits routes that look complete, and this
+    /// count is the only outward sign.
+    unmapped: usize,
+    truncated: usize,
+    has_map: bool,
+}
+
+/// One surface to open.
+#[derive(Debug, Clone, Default)]
+struct Step {
+    /// What the host's own UI calls this control; empty when it has no button.
+    /// `route_anchors` hands these to the host so it can ring the real thing.
+    anchor: String,
+    title: String,
+    hits: usize,
+    confidence: String,
+    open: String,
+    needs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -250,6 +292,79 @@ pub fn is_visible() -> bool {
 
 pub fn toggle_visible() {
     VISIBLE.fetch_xor(true, Ordering::Relaxed);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Routes, for a host that wants to highlight the thing to press
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The controls a host should draw attention to right now, best first, without
+/// duplicates.
+///
+/// These are the `anchor` strings from the watched repo's own
+/// `.sauron/panels.toml` — whatever that project calls its own buttons. This
+/// file cannot know what they mean, and deliberately does not try: it hands
+/// them back, and the host matches them against its own controls and rings
+/// whatever it finds. A surface with no button has an empty anchor and is
+/// omitted here, because there is nothing to point at.
+///
+/// SCOPED TO `needs_test`, AND THAT IS THE WHOLE DESIGN
+/// ---------------------------------------------------
+/// Only rows awaiting test contribute. Every other attention status wants a
+/// different verb: an errored agent needs rescuing, a blocked one needs
+/// answering, and ringing a panel for either would be telling someone to go
+/// look at work that is not finished. "Edits written, nobody has looked yet" is
+/// the one state where opening a panel is the correct next action.
+///
+/// Returns empty when sauron is not running, when the beacon is stale, when the
+/// repo ships no map, or when nothing is awaiting test — so a host can call it
+/// unconditionally every frame and get silence whenever silence is right.
+///
+///   grep -n "fn route_anchors"  sauron_panel.rs
+pub fn route_anchors() -> Vec<String> {
+    let Ok(mut st) = state().lock() else {
+        return Vec::new();
+    };
+    poll(&mut st);
+    let now = now_ms();
+    let Some(b) = st.beacon.as_ref().filter(|b| now.saturating_sub(b.written_ms) < STALE_MS)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for r in b.rows.iter().filter(|r| r.status == "needs_test") {
+        for s in &r.steps {
+            if !s.anchor.is_empty() && !out.contains(&s.anchor) {
+                out.push(s.anchor.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The full route for every row awaiting test: `(anchor, title, open, needs)`.
+///
+/// For a host that wants to render the instruction itself — a toast, a step
+/// list beside the highlight — rather than only ringing a button. Same scope
+/// and same emptiness guarantees as `route_anchors`.
+///
+///   grep -n "fn route_steps"  sauron_panel.rs
+pub fn route_steps() -> Vec<(String, String, String, Vec<String>)> {
+    let Ok(mut st) = state().lock() else {
+        return Vec::new();
+    };
+    poll(&mut st);
+    let now = now_ms();
+    let Some(b) = st.beacon.as_ref().filter(|b| now.saturating_sub(b.written_ms) < STALE_MS)
+    else {
+        return Vec::new();
+    };
+    b.rows
+        .iter()
+        .filter(|r| r.status == "needs_test")
+        .flat_map(|r| r.steps.iter())
+        .map(|s| (s.anchor.clone(), s.title.clone(), s.open.clone(), s.needs.clone()))
+        .collect()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -416,6 +531,38 @@ fn parse(text: &str) -> Option<Beacon> {
             "file" => {
                 if let Some(r) = b.rows.last_mut() {
                     r.files.push(unesc(rest));
+                }
+            }
+            "step" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                if f.len() < 5 {
+                    continue;
+                }
+                if let Some(r) = b.rows.last_mut() {
+                    r.steps.push(Step {
+                        anchor: unesc(f[0]),
+                        title: unesc(f[1]),
+                        hits: f[2].parse().unwrap_or(0),
+                        confidence: unesc(f[3]),
+                        open: unesc(f[4]),
+                        needs: Vec::new(),
+                    });
+                }
+            }
+            "need" => {
+                if let Some(s) = b.rows.last_mut().and_then(|r| r.steps.last_mut()) {
+                    s.needs.push(unesc(rest));
+                }
+            }
+            "route" => {
+                let f: Vec<&str> = rest.split('\t').collect();
+                if let Some(r) = b.rows.last_mut() {
+                    r.unmapped = f.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    r.truncated = f.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    // Presence, not content: a row with no `route` line came
+                    // from a repo with no map, which is a different fact from a
+                    // map that covered everything.
+                    r.has_map = true;
                 }
             }
             _ => {}
@@ -726,6 +873,68 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
         Vec::new()
     };
 
+    // The route, laid out on the same pass as everything else. Collapsed, only
+    // the door names: the pane must stay scannable, and "which panel" is the
+    // question a glance is asking. Unfolded, the full instruction and its
+    // preconditions — the same fold the file list already lives behind, so the
+    // row has one control rather than two.
+    let route_line = (!r.steps.is_empty()).then(|| {
+        ui.painter().layout(
+            format!(
+                "→ {}",
+                r.steps.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" · ")
+            ),
+            egui::FontId::proportional(10.5),
+            Palette::ROUTE,
+            text_w,
+        )
+    });
+
+    let mut route_body = Vec::new();
+    if expanded {
+        for (i, st) in r.steps.iter().enumerate() {
+            let mark = if st.confidence == "verified" { "" } else { "  (inferred)" };
+            route_body.push(ui.painter().layout(
+                format!("{}. {} — {} file(s){}", i + 1, st.title, st.hits, mark),
+                egui::FontId::proportional(10.5),
+                Palette::ROUTE,
+                PANEL_W - PAD * 2.0 - 14.0,
+            ));
+            route_body.push(ui.painter().layout(
+                st.open.clone(),
+                egui::FontId::proportional(10.0),
+                Palette::ROUTE_DIM,
+                PANEL_W - PAD * 2.0 - 20.0,
+            ));
+            if !st.needs.is_empty() {
+                route_body.push(ui.painter().layout(
+                    format!("needs: {}", st.needs.join("; ")),
+                    egui::FontId::proportional(10.0),
+                    Palette::BLOCKED,
+                    PANEL_W - PAD * 2.0 - 20.0,
+                ));
+            }
+        }
+        // Staleness, stated. A map behind the code emits routes that look
+        // complete; these two counts are the only thing that says otherwise.
+        if r.unmapped > 0 {
+            route_body.push(ui.painter().layout(
+                format!("{} file(s) match no panel — the map may be behind the code", r.unmapped),
+                egui::FontId::proportional(9.5),
+                Palette::FAINT,
+                PANEL_W - PAD * 2.0 - 20.0,
+            ));
+        }
+        if r.truncated > 0 {
+            route_body.push(ui.painter().layout(
+                format!("+{} more surface(s) not shown", r.truncated),
+                egui::FontId::proportional(9.5),
+                Palette::FAINT,
+                PANEL_W - PAD * 2.0 - 20.0,
+            ));
+        }
+    }
+
     // Heights are read off the galleys now, because painting moves them.
     let name_h = name.size().y;
     let detail_h = detail.as_ref().map(|d| d.size().y);
@@ -733,6 +942,15 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
     let mut h = 7.0 + name_h;
     if let Some(dh) = detail_h {
         h += 2.0 + dh;
+    }
+    if let Some(g) = &route_line {
+        h += 3.0 + g.size().y;
+    }
+    for g in &route_body {
+        h += 1.0 + g.size().y;
+    }
+    if !route_body.is_empty() {
+        h += 4.0;
     }
     for g in &files {
         h += 1.0 + g.size().y;
@@ -788,6 +1006,22 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
         y += detail_h.unwrap_or(0.0) + 2.0;
     }
 
+    if let Some(g) = route_line {
+        y += 3.0;
+        let gh = g.size().y;
+        p.galley(egui::pos2(x, y), g);
+        y += gh;
+    }
+
+    if !route_body.is_empty() {
+        y += 4.0;
+        for g in route_body {
+            let gh = g.size().y;
+            p.galley(egui::pos2(x + 10.0, y), g);
+            y += gh + 1.0;
+        }
+    }
+
     if expanded && !files.is_empty() {
         y += 2.0;
         for g in files {
@@ -807,12 +1041,12 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
     }
 
     if !r.files.is_empty() {
-        resp.on_hover_text(if expanded {
-            "click to fold the file list"
-        } else {
-            "click to list the files this session wrote"
-        })
-        .clicked()
+        let hint = match (expanded, r.steps.is_empty()) {
+            (true, _) => "click to fold",
+            (false, false) => "click for the route and the files this session wrote",
+            (false, true) => "click to list the files this session wrote",
+        };
+        resp.on_hover_text(hint).clicked()
     } else {
         resp.clicked()
     }
