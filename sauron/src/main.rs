@@ -483,6 +483,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// terminal, so they share one encoder -- it lives in `mirror`, which is the
 /// one that runs it thousands of times.
 use sauron::mirror::base64;
+use sauron::route;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -536,6 +537,14 @@ fn main() -> std::io::Result<()> {
     // agent logs at all, so it must not depend on a board being buildable.
     if args.first().map(|s| s.as_str()) == Some("panel") {
         return panel::run(&args[1..]);
+    }
+
+    // `sauron route ...` -- what to open in order to look at a change, read out
+    // of the watched repo's own `.sauron/panels.toml`. Sits beside `panel`
+    // rather than inside it: it answers a question about the repo, not about
+    // the pane, and must work in a checkout that never installed one.
+    if args.first().map(|s| s.as_str()) == Some("route") {
+        return route::run(&args[1..]);
     }
 
     let once = args.iter().any(|a| a == "--once");
