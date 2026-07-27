@@ -635,6 +635,25 @@ mod tests {
     }
 
     #[test]
+    fn the_delivered_format_is_pinned_because_the_pane_mirrors_it() {
+        // `sauron_panel.rs.in::delivered_line` reproduces this exactly, so the
+        // pane can show you what was actually typed at the agent rather than
+        // what you typed into the box -- the two differ, because the editor is
+        // multiline and the prompt reads a line. Change the format here and the
+        // pane will echo a message that was never sent.
+        //   grep -n "fn delivered_line"  assets/sauron_panel.rs.in
+        let m = Message {
+            text: "one\n\ntwo   three".into(),
+            attach: "/tmp/a.png".into(),
+            ..sample()
+        };
+        assert_eq!(line_for(&m), "one two three (screenshot: /tmp/a.png)");
+
+        let bare = Message { attach: String::new(), ..m };
+        assert_eq!(line_for(&bare), "one two three");
+    }
+
+    #[test]
     fn delivered_line_is_one_line() {
         // A newline mid-message would submit half of it at the agent's prompt
         // and leave the rest in the box.

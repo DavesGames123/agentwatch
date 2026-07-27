@@ -405,12 +405,48 @@ static VISIBLE: AtomicBool = AtomicBool::new(true);
 /// looking at another row is the whole point.
 #[derive(Debug, Clone, Default)]
 struct Draft {
+    /// What has already been said to this agent, oldest first.
+    ///
+    /// Sending clears the editor, which is right -- a box still holding text
+    /// you already sent reads as unsent. But it also made the message vanish
+    /// with nothing but "sent" to show for it, so there was no way to see what
+    /// you had told an agent thirty seconds earlier while looking at what it
+    /// did next.
+    ///
+    /// In memory only, and deliberately: the durable record of a reply is the
+    /// agent's own transcript, and a pane that persisted its own half of the
+    /// conversation would be a second source of truth that could disagree with
+    /// it.
+    sent: Vec<String>,
     text: String,
     /// Absolute path to a screenshot to send along, if one was taken.
     attach: String,
     /// Last thing that happened, shown under the box. Cleared on edit.
     status: String,
 }
+
+/// Exactly the line sauron will type at the agent.
+///
+/// MUST MATCH `line_for` IN reply.rs. The editor is multiline and the agent's
+/// prompt reads a line, so what is sent is the draft with its whitespace
+/// collapsed and the attachment appended as a path -- which is not what was
+/// typed. Echoing the draft instead of this would show a message that was never
+/// delivered, and the entire point of showing it is to know what the agent
+/// actually received.
+///
+///   grep -n "fn line_for"  src/reply.rs
+fn delivered_line(text: &str, attach: &str) -> String {
+    let mut s = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !attach.is_empty() {
+        s.push_str(&format!(" (screenshot: {attach})"));
+    }
+    s
+}
+
+/// How many sent messages a row keeps on screen. Enough to see the thread you
+/// are in the middle of; not so many that one chatty row pushes the rest of the
+/// board off the pane.
+const SENT_KEPT: usize = 3;
 
 static DRAFTS: OnceLock<Mutex<HashMap<String, Draft>>> = OnceLock::new();
 
@@ -1128,13 +1164,41 @@ fn draw_board_row(
         Vec::new()
     };
 
+    // What has already been said to this agent. Cloned out under the lock and
+    // the guard dropped immediately: `draw_reply_row` takes the same mutex, and
+    // holding it across that call would deadlock on the first waiting row.
+    let sent: Vec<String> = if waiting {
+        drafts()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&r.id).map(|d| d.sent.clone()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let sent: Vec<_> = sent
+        .iter()
+        .map(|t| {
+            ui.painter().layout(
+                format!("› {t}"),
+                egui::FontId::proportional(9.5 * k),
+                sk.route_dim,
+                inner - 8.0 * k,
+            )
+        })
+        .collect();
+
     let meta_h = meta.size().y;
     let title_h = title.size().y;
     let files_h: f32 = files.iter().map(|g| g.size().y + 2.0 * k).sum();
+    let sent_h: f32 = sent.iter().map(|g| g.size().y + 2.0 * k).sum();
 
     let mut h = 7.0 * k + meta_h + 3.0 * k + title_h + 7.0 * k;
     if waiting {
         h += field_h() + 5.0 * k;
+    }
+    if !sent.is_empty() {
+        h += sent_h + 3.0 * k;
     }
     if !files.is_empty() {
         h += files_h + 4.0 * k;
@@ -1196,6 +1260,17 @@ fn draw_board_row(
                 let gh = g.size().y;
                 p.circle_filled(egui::pos2(x + 3.0 * k, y + gh * 0.5), 1.5 * k, sk.faint);
                 p.galley(egui::pos2(x + 11.0 * k, y), g);
+                y += gh + 2.0 * k;
+            }
+        }
+
+        // Your side of the conversation, newest last, directly above the box
+        // you would type the next one into.
+        if !sent.is_empty() {
+            y += 3.0 * k;
+            for g in sent {
+                let gh = g.size().y;
+                p.galley(egui::pos2(x, y), g);
                 y += gh + 2.0 * k;
             }
         }
@@ -1310,6 +1385,12 @@ fn draw_reply_row(ui: &mut egui::Ui, r: &Row, strip: egui::Rect) {
     if let Some((kind, text, attach)) = queued {
         match queue_message(kind, &r.id, &text, &attach) {
             Ok(()) => {
+                if kind == "reply" {
+                    d.sent.push(delivered_line(&text, &attach));
+                    if d.sent.len() > SENT_KEPT {
+                        d.sent.remove(0);
+                    }
+                }
                 d.text.clear();
                 d.attach.clear();
                 d.status = if kind == "ack" { "acked".into() } else { "sent".into() };
