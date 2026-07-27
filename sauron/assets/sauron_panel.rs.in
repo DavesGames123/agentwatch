@@ -104,10 +104,12 @@ const POLL: Duration = Duration::from_millis(500);
 //  Look
 // ───────────────────────────────────────────────────────────────────────────
 
-const PAD: f32 = 10.0;
+const PAD_BASE: f32 = 10.0;
+fn pad() -> f32 { PAD_BASE * sc() }
 /// Header strip height. A constant rather than a measurement because the drag
 /// clamp needs it *outside* the closure that draws the header.
-const HEADER_H: f32 = 30.0;
+const HEADER_H_BASE: f32 = 30.0;
+fn header_h() -> f32 { HEADER_H_BASE * sc() }
 
 /// Where the pane sits until someone drags it: docked against the left margin,
 /// under the top edge.
@@ -117,7 +119,8 @@ const DEFAULT_POS: [f32; 2] = [16.0, 16.0];
 /// the pane can be parked mostly off either edge -- useful when it is in the way
 /// of something you are actually looking at -- without ever becoming impossible
 /// to grab back.
-const GRAB_MARGIN: f32 = 56.0;
+const GRAB_MARGIN_BASE: f32 = 56.0;
+fn grab_margin() -> f32 { GRAB_MARGIN_BASE * sc() }
 
 /// Every colour the pane uses. Grouped so a host project can retheme by editing
 /// one block — the only edit to this file that survives a regeneration cleanly,
@@ -165,6 +168,21 @@ pub struct Skin {
     /// read as two unrelated claims rather than one.
     pub route: egui::Color32,
     pub route_dim: egui::Color32,
+
+    /// How large the pane draws, against a design baseline of raw pixels.
+    ///
+    /// NOT cosmetic, and the single most important field here. A host may run
+    /// its own UI at 2-4x for a high-DPI screen or simply because its chrome is
+    /// meant to be read across a room. This pane paints most of its text by
+    /// hand at explicit sizes, so without a scale it renders at raw pixels
+    /// beside widgets drawn at the host's — text a quarter the size of the
+    /// buttons next to it, and columns sized in pixels far too narrow for the
+    /// text actually landing in them, which then wraps one word per line and
+    /// overruns the row it was measured for.
+    ///
+    /// Every length and every font size in this file is multiplied by it.
+    /// 1.0 reproduces the original look exactly.
+    pub scale: f32,
 }
 
 impl Default for Skin {
@@ -188,6 +206,8 @@ impl Default for Skin {
 
             route: egui::Color32::from_rgb(112, 222, 168),
             route_dim: egui::Color32::from_rgb(78, 150, 118),
+
+            scale: 1.0,
         }
     }
 }
@@ -213,6 +233,17 @@ pub fn set_skin(s: Skin) {
 /// unavailable would be a worse failure than drawing in the wrong colour.
 pub fn skin() -> Skin {
     skin_state().lock().map(|s| *s).unwrap_or_default()
+}
+
+/// The pane's scale factor. Read once per drawing function rather than per
+/// call site, so a frame cannot draw half at one size and half at another.
+fn sc() -> f32 {
+    // Clamped, not merely defaulted. A host that hands over its own UI scale
+    // unmodified can make this pane illegible at one end and wider than the
+    // window it floats over at the other, and neither failure announces itself
+    // as a scale problem -- one reads as broken text, the other as a broken
+    // layout.
+    skin().scale.clamp(0.85, 1.5)
 }
 
 /// Named accessors, so call sites read the way they did when these were
@@ -973,10 +1004,10 @@ pub fn render(ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let mut p = pos + drag;
         p.x = p.x.clamp(
-            screen.left() - panel_w() + GRAB_MARGIN,
-            screen.right() - GRAB_MARGIN,
+            screen.left() - panel_w() + grab_margin(),
+            screen.right() - grab_margin(),
         );
-        p.y = p.y.clamp(screen.top(), screen.bottom() - HEADER_H);
+        p.y = p.y.clamp(screen.top(), screen.bottom() - header_h());
         if let Ok(mut st) = state().lock() {
             st.pos = Some(p);
         }
@@ -1007,41 +1038,49 @@ pub fn render(ctx: &egui::Context) {
 //  rows call it, which is what makes a heading provably sit above its column
 //  rather than approximately above it.
 
-const C_STATUS: f32 = 76.0;
-const C_TASK: f32 = 196.0;
-const C_WHERE: f32 = 124.0;
-const C_REPLY: f32 = 220.0;
-const COL_GAP: f32 = 10.0;
+fn c_status() -> f32 { 70.0 * sc() }
+fn c_task() -> f32 { 200.0 * sc() }
+fn c_where() -> f32 { 116.0 * sc() }
+fn c_reply() -> f32 { 214.0 * sc() }
+fn col_gap() -> f32 { 10.0 * sc() }
 
 /// Left edge of each column, given the row's left edge.
 fn col_x(left: f32) -> [f32; 4] {
-    let x0 = left + PAD;
-    let x1 = x0 + C_STATUS + COL_GAP;
-    let x2 = x1 + C_TASK + COL_GAP;
-    let x3 = x2 + C_WHERE + COL_GAP;
+    let x0 = left + pad();
+    let x1 = x0 + c_status() + col_gap();
+    let x2 = x1 + c_task() + col_gap();
+    let x3 = x2 + c_where() + col_gap();
     [x0, x1, x2, x3]
 }
 
 fn panel_w() -> f32 {
-    PAD * 2.0 + C_STATUS + C_TASK + C_WHERE + C_REPLY + COL_GAP * 3.0
+    pad() * 2.0 + c_status() + c_task() + c_where() + c_reply() + col_gap() * 3.0
 }
 
-/// Widgets in the reply column set their own font.
+/// The font every widget in the reply cell is told to use, explicitly.
 ///
-/// The host's style is the host's: this pane is a guest in an application whose
-/// UI scale may be tuned to be read across a room, and inheriting it rendered
-/// the draft box at a size that swallowed the screen. Painted text already
-/// passes an explicit `FontId`; only the widgets that read the style --
-/// TextEdit, Button, their hint text -- needed telling.
-fn reply_font(ui: &mut egui::Ui) {
-    ui.style_mut().override_font_id = Some(egui::FontId::proportional(10.5));
-    ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 3.0);
-    ui.style_mut().spacing.button_padding = egui::vec2(6.0, 1.0);
-    ui.style_mut().spacing.interact_size.y = 16.0;
+/// WHY EXPLICITLY AND NOT VIA `Style::override_font_id`
+/// ---------------------------------------------------
+/// Setting `override_font_id` on the cell's `Ui` is the tidy way and it did not
+/// work here: the host's own style kept winning, so Send/Shot/Ack rendered at
+/// the game's chrome size -- four times the hand-painted text beside them --
+/// while every length in this file stayed in raw pixels. Passing the `FontId`
+/// to each widget cannot be overridden by anyone, and a debug pane that renders
+/// correctly is worth more than one that reads elegantly.
+fn reply_font_id() -> egui::FontId {
+    egui::FontId::proportional(11.0 * sc())
+}
+
+/// Spacing for the reply cell, scaled with everything else.
+fn reply_spacing(ui: &mut egui::Ui) {
+    let k = sc();
+    ui.style_mut().spacing.item_spacing = egui::vec2(4.0 * k, 4.0 * k);
+    ui.style_mut().spacing.button_padding = egui::vec2(7.0 * k, 3.0 * k);
+    ui.style_mut().spacing.interact_size.y = 18.0 * k;
 }
 
 /// How tall a waiting row must be to hold its editor and buttons.
-const REPLY_H: f32 = 56.0;
+fn reply_h() -> f32 { 64.0 * sc() }
 
 /// The column headings, painted at the same offsets the rows use.
 fn draw_col_heads(ui: &mut egui::Ui) {
@@ -1049,7 +1088,7 @@ fn draw_col_heads(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 15.0), egui::Sense::hover());
     let x = col_x(rect.left());
     let p = ui.painter();
-    let f = egui::FontId::monospace(8.0);
+    let f = egui::FontId::monospace(8.0 * sc());
     for (i, t) in ["STATUS", "TASK", "WHERE TO LOOK", "REPLY"].iter().enumerate() {
         p.text(
             egui::pos2(x[i], rect.center().y),
@@ -1061,8 +1100,8 @@ fn draw_col_heads(ui: &mut egui::Ui) {
     }
     p.line_segment(
         [
-            egui::pos2(rect.left() + PAD, rect.bottom() - 0.5),
-            egui::pos2(rect.right() - PAD, rect.bottom() - 0.5),
+            egui::pos2(rect.left() + pad(), rect.bottom() - 0.5),
+            egui::pos2(rect.right() - pad(), rect.bottom() - 0.5),
         ],
         egui::Stroke::new(1.0, sk.rule),
     );
@@ -1087,9 +1126,9 @@ fn draw_board_row(
     // half-clipped second line when a task name happens to wrap.
     let name = ui.painter().layout(
         display_name(r),
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(10.5 * sc()),
         sk.title,
-        C_TASK,
+        c_task(),
     );
     let stamp = if r.turn_started > 0 { r.turn_started } else { r.last_activity };
     let meta = if stamp > 0 {
@@ -1102,7 +1141,7 @@ fn draw_board_row(
     } else {
         format!("{} file{}", r.files.len(), plural(r.files.len()))
     };
-    let meta = ui.painter().layout(meta, egui::FontId::proportional(9.0), sk.faint, C_TASK);
+    let meta = ui.painter().layout(meta, egui::FontId::proportional(9.0 * sc()), sk.faint, c_task());
 
     let mut wheres = Vec::new();
     if r.steps.is_empty() {
@@ -1115,18 +1154,18 @@ fn draw_board_row(
         };
         wheres.push(ui.painter().layout(
             what.to_string(),
-            egui::FontId::proportional(9.5),
+            egui::FontId::proportional(9.5 * sc()),
             sk.faint,
-            C_WHERE,
+            c_where(),
         ));
     } else {
         for st in &r.steps {
             let mark = if st.is_verified() { "" } else { " ?" };
             wheres.push(ui.painter().layout(
                 format!("{}{}", st.title, mark),
-                egui::FontId::proportional(9.5),
+                egui::FontId::proportional(9.5 * sc()),
                 sk.route,
-                C_WHERE,
+                c_where(),
             ));
         }
     }
@@ -1137,9 +1176,9 @@ fn draw_board_row(
             .map(|f| {
                 ui.painter().layout(
                     f.clone(),
-                    egui::FontId::monospace(8.5),
+                    egui::FontId::monospace(8.5 * sc()),
                     sk.file,
-                    C_TASK + C_WHERE,
+                    c_task() + c_where(),
                 )
             })
             .collect()
@@ -1156,7 +1195,7 @@ fn draw_board_row(
     let text_h = (name_h + 2.0 + meta_h).max(where_h);
     let mut h = 6.0 + text_h + 6.0;
     if waiting {
-        h = h.max(REPLY_H);
+        h = h.max(reply_h());
     }
     if !files.is_empty() {
         h += files_h + 4.0;
@@ -1194,7 +1233,7 @@ fn draw_board_row(
             egui::pos2(x[0] + 12.0, top + 5.0),
             egui::Align2::LEFT_CENTER,
             status_label(&r.status),
-            egui::FontId::proportional(9.0),
+            egui::FontId::proportional(9.0 * sc()),
             colour,
         );
 
@@ -1227,7 +1266,7 @@ fn draw_board_row(
     if waiting {
         let cell = egui::Rect::from_min_size(
             egui::pos2(x[3], rect.top() + 4.0),
-            egui::vec2(C_REPLY, (rect.height() - 8.0).max(20.0)),
+            egui::vec2(c_reply(), (rect.height() - 8.0).max(20.0)),
         );
         draw_reply_cell(ui, r, cell);
     }
@@ -1253,14 +1292,20 @@ fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
     let d = all.entry(r.id.clone()).or_default();
 
     ui.allocate_ui_at_rect(cell, |ui| {
-        reply_font(ui);
+        reply_spacing(ui);
+        let f = reply_font_id();
         ui.vertical(|ui| {
             if ui
                 .add(
                     egui::TextEdit::multiline(&mut d.text)
-                        .desired_rows(2)
-                        .desired_width(C_REPLY)
-                        .hint_text("reply…"),
+                        .font(f.clone())
+                        .desired_rows(3)
+                        .desired_width(c_reply())
+                        .hint_text(
+                            egui::RichText::new("reply to this agent…")
+                                .font(f.clone())
+                                .color(sk.faint),
+                        ),
                 )
                 .changed()
             {
@@ -1269,7 +1314,7 @@ fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
             ui.horizontal(|ui| {
                 let can_send = !d.text.trim().is_empty();
                 if ui
-                    .add_enabled(can_send, egui::Button::new("Send"))
+                    .add_enabled(can_send, egui::Button::new(egui::RichText::new("Send").font(f.clone())))
                     .on_hover_text("type this into the agent's own terminal")
                     .clicked()
                 {
@@ -1290,10 +1335,10 @@ fn draw_reply_cell(ui: &mut egui::Ui, r: &Row, cell: egui::Rect) {
                     queued = Some(("ack", String::new(), String::new()));
                 }
                 if !d.attach.is_empty() {
-                    ui.label(egui::RichText::new("📎").color(sk.route_dim).size(9.0));
+                    ui.label(egui::RichText::new("📎").color(sk.route_dim).size(9.0 * sc()));
                 }
                 if !d.status.is_empty() {
-                    ui.label(egui::RichText::new(&d.status).color(sk.route_dim).size(8.5));
+                    ui.label(egui::RichText::new(&d.status).color(sk.route_dim).size(8.5 * sc()));
                 }
             });
         });
@@ -1348,7 +1393,7 @@ fn short_path(p: &str) -> &str {
 fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     let collapsed = COLLAPSED.load(Ordering::Relaxed);
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(panel_w(), HEADER_H), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(panel_w(), header_h()), egui::Sense::click_and_drag());
     let dragging = resp.dragged();
     if dragging {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1372,18 +1417,18 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     // Severity dot: the colour of the worst thing on the board. On a folded
     // pane this is the entire signal, so it is drawn first and never elided.
     let worst = worst_colour(b);
-    p.circle_filled(egui::pos2(rect.left() + PAD + 3.0, rect.center().y), 4.0, worst);
+    p.circle_filled(egui::pos2(rect.left() + pad() + 3.0, rect.center().y), 4.0, worst);
 
     // Measured, not guessed. A hardcoded offset for the summary put it on top
     // of the title the moment the host's font was wider than the number picked
     // here, which rendered as "SAURONneeds attention".
     let title = p.layout_no_wrap(
         "SAURON".to_string(),
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(12.0 * sc()),
         Palette::TITLE(),
     );
     let title_w = title.size().x;
-    let title_x = rect.left() + PAD + 15.0;
+    let title_x = rect.left() + pad() + 15.0;
     p.galley(
         egui::pos2(title_x, rect.center().y - title.size().y * 0.5),
         title,
@@ -1400,7 +1445,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
         egui::pos2(title_x + title_w + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         summary,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.0 * sc()),
         if b.attention == 0 {
             Palette::FAINT()
         } else {
@@ -1409,7 +1454,7 @@ fn draw_header(ui: &mut egui::Ui, b: &Beacon) -> egui::Vec2 {
     );
 
     // Caret. Drawn rather than typed so it points the right way in any font.
-    let cx = rect.right() - PAD - 4.0;
+    let cx = rect.right() - pad() - 4.0;
     let cy = rect.center().y;
     let tint = if resp.hovered() {
         Palette::TITLE()
@@ -1500,10 +1545,10 @@ fn plural(n: usize) -> &'static str {
 fn draw_all_clear(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 34.0), egui::Sense::hover());
     ui.painter().text(
-        egui::pos2(rect.left() + PAD, rect.center().y),
+        egui::pos2(rect.left() + pad(), rect.center().y),
         egui::Align2::LEFT_CENTER,
         "board clear — nothing waiting on you",
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.0 * sc()),
         Palette::FAINT(),
     );
 }
@@ -1523,16 +1568,16 @@ fn draw_footer(ui: &mut egui::Ui, b: &Beacon) {
     let p = ui.painter();
     p.line_segment(
         [
-            egui::pos2(rect.left() + PAD, rect.top() + 0.5),
-            egui::pos2(rect.right() - PAD, rect.top() + 0.5),
+            egui::pos2(rect.left() + pad(), rect.top() + 0.5),
+            egui::pos2(rect.right() - pad(), rect.top() + 0.5),
         ],
         egui::Stroke::new(1.0, Palette::RULE()),
     );
     p.text(
-        egui::pos2(rect.left() + PAD, rect.center().y + 1.0),
+        egui::pos2(rect.left() + pad(), rect.center().y + 1.0),
         egui::Align2::LEFT_CENTER,
         line,
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(9.5 * sc()),
         Palette::FAINT(),
     );
 }
