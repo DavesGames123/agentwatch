@@ -772,7 +772,9 @@ fn main() -> std::io::Result<()> {
             // of receiving it is then picked up by the resync below, which is
             // what makes the board move without a second round trip.
             //   grep -n "fn drain"  src/reply.rs
-            reply::drain();
+            for id in reply::drain() {
+                app.board.ack(&id);
+            }
 
             // resync, not refresh: this also re-reads the ack file, so work you
             // acked in a muthur board or another sauron stops reading as

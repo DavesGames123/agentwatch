@@ -299,6 +299,9 @@ fn group_of(status: &str) -> Option<(&'static str, egui::Color32, usize)> {
 struct Row {
     status: String,
     id_short: String,
+    /// The full session id. `id_short` is for eyes; this is the only form that
+    /// can address a session, which is what the reply panel needs.
+    id: String,
     turn_started: i64,
     last_activity: i64,
     is_orc: bool,
@@ -357,6 +360,122 @@ struct Beacon {
 /// Host-controlled master switch, so a key binding can hide the pane outright
 /// without the host having to gate the `render` call itself.
 static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Replying
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The reply panel's state: which row is being answered, and the draft.
+///
+/// One target at a time, deliberately. A draft per row would mean several
+/// half-written messages you cannot see, and the pane is a debug affordance
+/// over somebody's game -- the failure mode to avoid is a reply that was typed
+/// and silently never sent.
+#[derive(Debug, Clone, Default)]
+struct ReplyState {
+    /// Full session id of the row being answered. `None` = panel closed.
+    target: Option<String>,
+    /// The row's name, kept so the panel keeps its heading if the board
+    /// reshuffles mid-type.
+    name: String,
+    draft: String,
+    /// Absolute path to a screenshot to send along, if one was taken.
+    attach: String,
+    /// Last thing that happened, shown under the buttons. Cleared on edit.
+    status: String,
+}
+
+static REPLY: OnceLock<Mutex<ReplyState>> = OnceLock::new();
+
+fn reply_state() -> &'static Mutex<ReplyState> {
+    REPLY.get_or_init(|| Mutex::new(ReplyState::default()))
+}
+
+/// Where queued messages go, mirroring `beacon_path`'s resolution so the two
+/// halves of the conversation cannot end up in different directories.
+///
+///   grep -n "fn outbox_dir"  sauron_panel.rs
+fn outbox_dir() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("SAURON_OUTBOX") {
+        return Some(PathBuf::from(explicit));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".claude").join("sauron").join("outbox"))
+}
+
+/// Queue one message for the running sauron to deliver.
+///
+/// Written under a dot-name and renamed, because sauron drains this directory
+/// every two seconds and a reader that catches a half-written file would
+/// deliver half a sentence. `rename` is atomic on every filesystem this runs
+/// on, so the message either exists whole or not at all.
+///
+///   grep -n "fn queue_message"  sauron_panel.rs
+fn queue_message(kind: &str, session: &str, text: &str, attach: &str) -> Result<(), String> {
+    let dir = outbox_dir().ok_or("no HOME")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let now = now_ms();
+    let mut body = String::new();
+    body.push_str(&format!("kind\t{}\n", esc(kind)));
+    body.push_str(&format!("session\t{}\n", esc(session)));
+    body.push_str(&format!("queued\t{now}\n"));
+    if !attach.is_empty() {
+        body.push_str(&format!("attach\t{}\n", esc(attach)));
+    }
+    body.push_str(&format!("text\t{}\n", esc(text)));
+    body.push_str("end\n");
+
+    let stem = format!("{now}-{}", session.split('-').next().unwrap_or("x"));
+    let tmp = dir.join(format!(".{stem}.tmp"));
+    let dst = dir.join(format!("{stem}.msg"));
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Grab the screen to a file and return its path.
+///
+/// Shelling out to `screencapture` rather than reading back the host's own
+/// framebuffer, which would mean a GPU copy pass, a format conversion, and an
+/// opinion about the host's render graph -- for a debug affordance whose
+/// delivery path is already macOS-and-iTerm2 only. The OS already has this.
+///
+/// `-x` suppresses the shutter sound. The whole main display is captured rather
+/// than a region, because the point is to show an agent what you are looking at
+/// and an interactive crosshair would steal focus from the game to do it.
+///
+///   grep -n "fn take_screenshot"  sauron_panel.rs
+fn take_screenshot() -> Result<String, String> {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sauron-shot-{}.png", now_ms()));
+    let out = std::process::Command::new("screencapture")
+        .arg("-x")
+        .arg(&path)
+        .output()
+        .map_err(|e| format!("screencapture: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    if !path.exists() {
+        return Err("screencapture wrote nothing".into());
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Open the reply panel against a row.
+fn begin_reply(r: &Row) {
+    if let Ok(mut st) = reply_state().lock() {
+        // Switching rows discards the draft rather than carrying it: a message
+        // written for one agent arriving at another is the one outcome worth
+        // spending a lost sentence to prevent.
+        if st.target.as_deref() != Some(r.id.as_str()) {
+            *st = ReplyState::default();
+        }
+        st.target = Some(r.id.clone());
+        st.name = r.name.clone();
+    }
+}
 
 /// The row the cursor is on, and what it connects to: the card's rect in
 /// screen space plus the anchors its route names.
@@ -624,6 +743,15 @@ fn poll(st: &mut State) {
 //  The v{{VERSION}} wire format
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Escape the field separators out of free text, for a queued message.
+///
+/// Backslash first, or the escapes introduced for tab and newline would then
+/// have their own backslashes escaped. Same ordering trap as the beacon's
+/// reader half, same fix.
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+}
+
 fn unesc(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_string();
@@ -680,17 +808,18 @@ fn parse(text: &str) -> Option<Beacon> {
             }
             "row" => {
                 let f: Vec<&str> = rest.split('\t').collect();
-                if f.len() < 7 {
+                if f.len() < 8 {
                     continue;
                 }
                 b.rows.push(Row {
                     status: f[0].to_string(),
                     id_short: unesc(f[1]),
-                    turn_started: f[2].parse().unwrap_or(0),
-                    last_activity: f[3].parse().unwrap_or(0),
-                    is_orc: f[4] == "1",
-                    total_edits: f[5].parse().unwrap_or(0),
-                    name: unesc(f[6]),
+                    id: unesc(f[2]),
+                    turn_started: f[3].parse().unwrap_or(0),
+                    last_activity: f[4].parse().unwrap_or(0),
+                    is_orc: f[5] == "1",
+                    total_edits: f[6].parse().unwrap_or(0),
+                    name: unesc(f[7]),
                     ..Row::default()
                 });
             }
@@ -850,6 +979,12 @@ pub fn render(ctx: &egui::Context) {
         }
     }
 
+    // The reply panel, alongside rather than inside the pane. Its own Area so
+    // it is not clipped by the pane's width and does not push the rows around
+    // as a draft grows -- the board must stay readable while you write about
+    // one of its rows.
+    draw_reply_panel(ctx, pos);
+
     // Applied after the area closes, because the clamp needs the screen rect and
     // the closure needs the position it was already given. The one-frame lag
     // this costs is the same lag egui's own windows have -- their move is also
@@ -866,6 +1001,163 @@ pub fn render(ctx: &egui::Context) {
             st.pos = Some(p);
         }
     }
+}
+
+/// Width of the reply panel. Narrower than the pane: it holds a paragraph and
+/// four buttons, not a board.
+const REPLY_W: f32 = 300.0;
+
+/// The reply panel, docked to the right edge of the pane.
+///
+/// Only drawn when a row has been clicked. There is no "no row selected" empty
+/// state, because a panel that is always present but usually inert is furniture
+/// -- and this one sits on top of a game.
+///
+///   grep -n "fn draw_reply_panel"  sauron_panel.rs
+fn draw_reply_panel(ctx: &egui::Context, pane_pos: egui::Pos2) {
+    if COLLAPSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mut st) = reply_state().lock() else {
+        return;
+    };
+    let Some(session) = st.target.clone() else {
+        return;
+    };
+
+    let sk = skin();
+    let mut close = false;
+    let mut queued: Option<Result<String, String>> = None;
+
+    egui::Area::new(egui::Id::new("sauron_reply"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(pane_pos.x + panel_w() + 8.0, pane_pos.y))
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(sk.bg)
+                .stroke(egui::Stroke::new(1.0, sk.edge))
+                .inner_margin(egui::Margin::same(PAD))
+                .show(ui, |ui| {
+                    ui.set_width(REPLY_W);
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("REPLY")
+                                .color(sk.route)
+                                .size(10.0)
+                                .monospace(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(truncate(&st.name, 60))
+                            .color(sk.title)
+                            .size(11.0),
+                    );
+                    ui.add_space(4.0);
+
+                    let edited = ui
+                        .add(
+                            egui::TextEdit::multiline(&mut st.draft)
+                                .desired_rows(4)
+                                .desired_width(REPLY_W)
+                                .hint_text("type back to this agent…"),
+                        )
+                        .changed();
+                    if edited {
+                        st.status.clear();
+                    }
+
+                    if !st.attach.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("📎 {}", short_path(&st.attach)))
+                                .color(sk.route_dim)
+                                .size(9.5)
+                                .monospace(),
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        // Enabled only with something to say. An empty reply is
+                        // a dropped keystroke, not a message.
+                        let can_send = !st.draft.trim().is_empty();
+                        if ui
+                            .add_enabled(can_send, egui::Button::new("Send"))
+                            .on_hover_text("type this into the agent's own terminal")
+                            .clicked()
+                        {
+                            queued = Some(
+                                queue_message("reply", &session, &st.draft, &st.attach)
+                                    .map(|()| "sent".to_string()),
+                            );
+                        }
+                        if ui
+                            .button("Shot")
+                            .on_hover_text("capture the screen and attach it")
+                            .clicked()
+                        {
+                            match take_screenshot() {
+                                Ok(p) => {
+                                    st.attach = p;
+                                    st.status = "screenshot attached".into();
+                                }
+                                Err(e) => st.status = format!("screenshot failed: {e}"),
+                            }
+                        }
+                        if ui
+                            .button("Ack")
+                            .on_hover_text("mark this session's edits as looked at")
+                            .clicked()
+                        {
+                            queued = Some(
+                                queue_message("ack", &session, "", "")
+                                    .map(|()| "acked".to_string()),
+                            );
+                        }
+                    });
+
+                    if !st.status.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(&st.status)
+                                .color(sk.route_dim)
+                                .size(9.5),
+                        );
+                    }
+                });
+        });
+
+    match queued {
+        Some(Ok(what)) => {
+            // Cleared on success so the panel cannot be mistaken for still
+            // holding an unsent draft.
+            st.draft.clear();
+            st.attach.clear();
+            st.status = format!("{what} — sauron delivers within a tick");
+        }
+        Some(Err(e)) => st.status = format!("failed: {e}"),
+        None => {}
+    }
+    if close {
+        *st = ReplyState::default();
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
+}
+
+/// Just the file name -- the temp directory prefix is noise in a 300px column.
+fn short_path(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
 }
 
 /// The always-visible strip: dot, title, count, caret. It is both the fold
@@ -1241,11 +1533,18 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
     // cursor off the row -- which is also what keeps the cable up while you
     // read it.
     let tip = hover_text(r, expanded);
-    if tip.is_empty() {
+    let clicked = if tip.is_empty() {
         resp.clicked()
     } else {
         resp.on_hover_text(tip).clicked()
+    };
+    // A click both folds the card open and aims the reply panel at it. One
+    // gesture, because the two things you want after noticing a row are to see
+    // what it touched and to say something about it.
+    if clicked {
+        begin_reply(r);
     }
+    clicked
 }
 
 /// What the cursor gets for resting on a row.

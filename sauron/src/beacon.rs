@@ -38,7 +38,7 @@
 //! pid     2418
 //! written 1753567890123
 //! counts  3       1       12      2         (attention working clear stale)
-//! row     needs_test      a1b2c3d4  <turn_started> <last_activity> <orc> <edits> <name>
+//! row     needs_test      a1b2c3d4  <full-id> <turn_started> <last_activity> <orc> <edits> <name>
 //! detail  station hull plates render at the wrong scale
 //! file    src/gui/overlays/station_damage.rs
 //! file    src/combat/hull.rs
@@ -82,7 +82,7 @@ use crate::scan::home;
 
 /// Wire format version. Bump on any field change; readers refuse a version they
 /// were not built for rather than guessing at a shifted column.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// How stale a beacon may be before a reader must treat sauron as gone.
 ///
@@ -95,6 +95,14 @@ pub const STALE_MS: i64 = 6_000;
 /// anything about sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeaconRow {
+    /// The full session id.
+    ///
+    /// Carried alongside `id_short` rather than instead of it because they are
+    /// for different consumers: the short form is for eyes and collides
+    /// eventually, the full one is the only thing that can address a session --
+    /// resume it, or deliver a reply to it. A reader that can only see the
+    /// short form can display a board but never answer it.
+    pub id: String,
     /// Wire token -- see `status_token`. A string, not the enum, because the
     /// reader is in another crate and must not need this one's types.
     pub status: String,
@@ -275,9 +283,10 @@ fn render(board: &Board) -> String {
 
     for r in &board.rows {
         out.push_str(&format!(
-            "row\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "row\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             status_token(r.status),
             esc(&r.id_short),
+            esc(&r.id),
             r.turn_started,
             r.last_activity,
             if r.is_orc { 1 } else { 0 },
@@ -429,17 +438,18 @@ pub fn parse(text: &str) -> Option<Beacon> {
             }
             "row" => {
                 let f: Vec<&str> = rest.split('\t').collect();
-                if f.len() < 7 {
+                if f.len() < 8 {
                     continue;
                 }
                 b.rows.push(BeaconRow {
                     status: f[0].to_string(),
                     id_short: unesc(f[1]),
-                    turn_started: f[2].parse().unwrap_or(0),
-                    last_activity: f[3].parse().unwrap_or(0),
-                    is_orc: f[4] == "1",
-                    total_edits: f[5].parse().unwrap_or(0),
-                    name: unesc(f[6]),
+                    id: unesc(f[2]),
+                    turn_started: f[3].parse().unwrap_or(0),
+                    last_activity: f[4].parse().unwrap_or(0),
+                    is_orc: f[5] == "1",
+                    total_edits: f[6].parse().unwrap_or(0),
+                    name: unesc(f[7]),
                     detail: String::new(),
                     files: Vec::new(),
                     steps: Vec::new(),
@@ -517,13 +527,13 @@ mod tests {
         s.push_str("pid\t99\n");
         s.push_str("written\t1700000000000\n");
         s.push_str("counts\t2\t1\t5\t3\n");
-        s.push_str("row\terrored\tabc12345\t1700000000000\t1700000001000\t0\t7\ta\\tname\n");
+        s.push_str("row\terrored\tabc12345\tabc12345-full-id\t1700000000000\t1700000001000\t0\t7\ta\\tname\n");
         s.push_str("detail\tAPI error — retry\n");
         s.push_str("file\tsrc/a.rs\n");
         s.push_str("step\txray\tColony\t1\tverified\tPress E.\n");
         s.push_str("need\ta station selected\n");
         s.push_str("route\t2\t1\n");
-        s.push_str("row\tworking\tdef67890\t0\t1700000002000\t1\t0\torc: shrink b.rs\n");
+        s.push_str("row\tworking\tdef67890\tdef67890-full-id\t0\t1700000002000\t1\t0\torc: shrink b.rs\n");
         s.push_str("end\n");
         s
     }
@@ -539,6 +549,8 @@ mod tests {
         // The escaped tab must survive the round trip as a real tab, or a name
         // containing one would silently split into extra columns on re-read.
         assert_eq!(b.rows[0].name, "a\tname");
+        // The full id is what a reader needs to answer a row at all.
+        assert_eq!(b.rows[0].id, "abc12345-full-id");
         assert_eq!(b.rows[0].files, vec!["src/a.rs".to_string()]);
         assert!(b.rows[1].is_orc);
         assert!(b.rows[1].files.is_empty());

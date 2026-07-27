@@ -77,6 +77,14 @@ pub fn outbox_dir() -> PathBuf {
 /// One queued message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Message {
+    /// What to do: `reply` types the text at the agent, `ack` marks its
+    /// write-set tested.
+    ///
+    /// Acking rides this channel rather than having the reader write
+    /// `acks.json` directly, because the ack file is JSON and a reader that
+    /// must not take a JSON dependency to speak the beacon must not need one to
+    /// answer it either. One queue, one format, two verbs.
+    pub kind: String,
     /// The session to talk to. Full id, not the short form the pane displays --
     /// the short form is for eyes and collides eventually.
     pub session: String,
@@ -105,6 +113,7 @@ pub struct Message {
 
 pub fn render(m: &Message) -> String {
     let mut s = String::new();
+    s.push_str(&format!("kind\t{}\n", esc(m.kind_or_default())));
     s.push_str(&format!("session\t{}\n", esc(&m.session)));
     s.push_str(&format!("queued\t{}\n", m.queued_ms));
     if !m.attach.is_empty() {
@@ -127,6 +136,7 @@ pub fn parse(text: &str) -> Option<Message> {
             continue;
         };
         match tag {
+            "kind" => m.kind = unesc(rest),
             "session" => m.session = unesc(rest),
             "queued" => m.queued_ms = rest.parse().unwrap_or(0),
             "attach" => m.attach = unesc(rest),
@@ -136,7 +146,8 @@ pub fn parse(text: &str) -> Option<Message> {
     }
     // Same torn-read guard as the beacon. A half-written message delivered as
     // a truncated sentence would be worse than one delivered late.
-    (sealed && !m.session.is_empty() && !m.text.is_empty()).then_some(m)
+    let says_something = m.kind_or_default() == "ack" || !m.text.is_empty();
+    (sealed && !m.session.is_empty() && says_something).then_some(m)
 }
 
 fn esc(s: &str) -> String {
@@ -160,6 +171,13 @@ fn unesc(s: &str) -> String {
         }
     }
     out
+}
+
+impl Message {
+    /// The verb, defaulting to `reply` for a message that predates the field.
+    pub fn kind_or_default(&self) -> &str {
+        if self.kind.is_empty() { "reply" } else { &self.kind }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -189,18 +207,26 @@ pub fn queue(m: &Message) -> std::io::Result<PathBuf> {
 
 /// Deliver everything deliverable. Called once per TICK.
 ///
-/// Returns the number delivered, for the caller's status line. Failures are not
-/// errors: the overwhelmingly common one is "that terminal is not open", which
-/// is a state, not a fault, and the message is left for the next pass.
+/// Returns the session ids of any queued ACKS, for the caller to apply.
+///
+/// Acks are handed back rather than performed here because the caller already
+/// owns a `Board`, and `Board::ack` is the path the TUI's own `a` key takes --
+/// it resolves the write-set, defers a waiting state, and journals the op. A
+/// second implementation reading `acks.json` directly would be a second set of
+/// rules about what acking means, and the two would drift.
+///
+/// Replies that cannot be delivered are not errors: the common case is "that
+/// terminal is not open", which is a state, not a fault, so the message is left
+/// for a later pass.
 ///
 ///   grep -n "fn drain"  src/reply.rs
-pub fn drain() -> usize {
+pub fn drain() -> Vec<String> {
     let dir = outbox_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
+        return Vec::new();
     };
     let now = now_ms();
-    let mut sent = 0;
+    let mut acks = Vec::new();
 
     let mut paths: Vec<PathBuf> = entries
         .flatten()
@@ -223,12 +249,19 @@ pub fn drain() -> usize {
             let _ = std::fs::remove_file(&path);
             continue;
         }
+        if m.kind_or_default() == "ack" {
+            // No terminal and no live process needed: an ack is a note about
+            // work already done, so a session that has since exited is the
+            // normal case rather than a failure. Always consumed.
+            acks.push(m.session.clone());
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         if deliver(&m).is_ok() {
             let _ = std::fs::remove_file(&path);
-            sent += 1;
         }
     }
-    sent
+    acks
 }
 
 /// One message, all three hops.
@@ -433,6 +466,8 @@ pub fn ack_session(id: &str, edits: &BTreeMap<String, i64>) -> std::io::Result<(
     store.save()
 }
 
+
+
 // ───────────────────────────────────────────────────────────────────────────
 //  CLI
 // ───────────────────────────────────────────────────────────────────────────
@@ -467,7 +502,8 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             Ok(())
         }
         Some("--drain") => {
-            println!("delivered {}", drain());
+            let acks = drain();
+            println!("drained; {} ack(s) pending for the board", acks.len());
             Ok(())
         }
         Some("--list") => {
@@ -521,6 +557,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 std::process::exit(2);
             }
             let m = Message {
+                kind: "reply".into(),
                 session: args[1].clone(),
                 text: args[2..].join(" "),
                 attach: String::new(),
@@ -536,6 +573,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 std::process::exit(2);
             }
             let m = Message {
+                kind: "reply".into(),
                 session: session.to_string(),
                 text: args[1..].join(" "),
                 attach: String::new(),
@@ -565,6 +603,7 @@ mod tests {
 
     fn sample() -> Message {
         Message {
+            kind: "reply".into(),
             session: "4dcde696-4bca-4371-98cb-cd9edefc9157".into(),
             text: "the flag\tclips\nthrough the hull".into(),
             attach: "/tmp/shot.png".into(),
@@ -632,11 +671,28 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_outbox_drains_to_zero() {
+    fn a_missing_outbox_drains_to_nothing() {
         // Not an error: it is the state on a machine where nobody has replied.
-        assert_eq!(
-            std::fs::read_dir(outbox_dir()).is_err() && drain() == 0,
-            std::fs::read_dir(outbox_dir()).is_err()
-        );
+        if std::fs::read_dir(outbox_dir()).is_err() {
+            assert!(drain().is_empty());
+        }
     }
+
+    #[test]
+    fn an_ack_needs_no_text_but_a_reply_does() {
+        // An ack is a verb about a whole card; a reply with nothing in it is a
+        // dropped keystroke, not a message.
+        let ack = Message { kind: "ack".into(), text: String::new(), ..sample() };
+        assert!(parse(&render(&ack)).is_some());
+        let empty_reply = Message { kind: "reply".into(), text: String::new(), ..sample() };
+        assert!(parse(&render(&empty_reply)).is_none());
+    }
+
+    #[test]
+    fn a_message_without_a_kind_reads_as_a_reply() {
+        // Forward compatibility with anything queued before the field existed.
+        let m = Message { kind: String::new(), ..sample() };
+        assert_eq!(m.kind_or_default(), "reply");
+    }
+
 }
