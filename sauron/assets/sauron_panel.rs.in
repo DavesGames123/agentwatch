@@ -209,6 +209,14 @@ struct Step {
     needs: Vec<String>,
 }
 
+impl Step {
+    /// Whether the map's author traced this route to a call site rather than
+    /// reasoning it out. Shown, so a guess never reads as an instruction.
+    fn is_verified(&self) -> bool {
+        self.confidence == "verified"
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct Beacon {
     label: String,
@@ -228,6 +236,19 @@ struct Beacon {
 /// Host-controlled master switch, so a key binding can hide the pane outright
 /// without the host having to gate the `render` call itself.
 static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// The row the cursor is on, and what it connects to: the card's rect in
+/// screen space plus the anchors its route names.
+///
+/// Written by `draw_row`, read by the host through `hover_link`. Cleared at the
+/// top of every `render` so a frame with no hover produces no link — including
+/// the frames where the pane refuses to draw at all, which is what stops a
+/// cable being left dangling when sauron dies mid-hover.
+static HOVER: OnceLock<Mutex<Option<(egui::Rect, Vec<String>)>>> = OnceLock::new();
+
+fn hover_state() -> &'static Mutex<Option<(egui::Rect, Vec<String>)>> {
+    HOVER.get_or_init(|| Mutex::new(None))
+}
 
 /// Whether the pane is folded to its header strip. Persists for the process
 /// lifetime; deliberately not written to disk, because a debug pane that
@@ -340,6 +361,35 @@ pub fn route_anchors() -> Vec<String> {
         }
     }
     out
+}
+
+/// The card the cursor is on and the controls its route names:
+/// `(row_rect_in_screen_space, anchors)`.
+///
+/// For a host that wants to draw a line from the task to the thing it is about
+/// — the pane says "Colony / X-ray", this says which pixels to run a cable
+/// between. `None` whenever the cursor is not on a row, so a host can call it
+/// every frame and get silence when silence is right.
+///
+/// UNLIKE `route_anchors`, THIS IGNORES STATUS
+/// ------------------------------------------
+/// Any row answers, not just `needs_test`. Ambient rings are a claim that
+/// something needs doing, and only rows awaiting test qualify. A hover is not a
+/// claim — it is a question the user just asked, about that specific row, and
+/// the honest answer to "where does this one live" does not depend on whether
+/// the agent has finished.
+///
+/// ONE FRAME BEHIND, ON PURPOSE
+/// ----------------------------
+/// The rect is whatever the pane measured last frame, because a host's overlay
+/// chain may well run before the pane draws. Chasing that with a two-pass
+/// handshake would cost more than it buys: at any hover the cursor is still on
+/// the row a frame later, and a cable that lags one frame is a cable nobody
+/// notices lagging.
+///
+///   grep -n "fn hover_link"  sauron_panel.rs
+pub fn hover_link() -> Option<(egui::Rect, Vec<String>)> {
+    hover_state().lock().ok()?.clone()
 }
 
 /// The full route for every row awaiting test: `(anchor, title, open, needs)`.
@@ -582,6 +632,13 @@ fn parse(text: &str) -> Option<Beacon> {
 /// Once per frame, after the host's own UI. Draws nothing — and costs nothing
 /// beyond an occasional `stat` — unless a live sauron is watching this repo.
 pub fn render(ctx: &egui::Context) {
+    // Cleared unconditionally, before any early return. A link that outlives
+    // the row it came from would point at nothing, and the frames where this
+    // function bails -- hidden, stale beacon, sauron gone -- are exactly the
+    // frames where a stale cable would be left hanging on screen.
+    if let Ok(mut h) = hover_state().lock() {
+        *h = None;
+    }
     if !VISIBLE.load(Ordering::Relaxed) {
         return;
     }
@@ -965,6 +1022,20 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
 
     if resp.hovered() {
         p.rect_filled(rect, egui::Rounding::none(), Palette::ROW_HOVER);
+        // Publish what this row connects to, for a host drawing a cable from
+        // the card to the control. Only anchors that name something: a surface
+        // with no button has nothing to run a line to, and a cable into empty
+        // screen is worse than no cable.
+        if let Ok(mut h) = hover_state().lock() {
+            *h = Some((
+                rect,
+                r.steps
+                    .iter()
+                    .filter(|s| !s.anchor.is_empty())
+                    .map(|s| s.anchor.clone())
+                    .collect(),
+            ));
+        }
     }
     // Severity bar down the left edge — the thing that makes the pane readable
     // at a glance without reading any of the words.
@@ -1040,16 +1111,73 @@ fn draw_row(ui: &mut egui::Ui, r: &Row, colour: egui::Color32, expanded: bool) -
         );
     }
 
-    if !r.files.is_empty() {
-        let hint = match (expanded, r.steps.is_empty()) {
-            (true, _) => "click to fold",
-            (false, false) => "click for the route and the files this session wrote",
-            (false, true) => "click to list the files this session wrote",
-        };
-        resp.on_hover_text(hint).clicked()
-    } else {
+    // The tooltip answers "where in the GUI is this happening" in full, so the
+    // question can be asked without unfolding the card and without moving the
+    // cursor off the row -- which is also what keeps the cable up while you
+    // read it.
+    let tip = hover_text(r, expanded);
+    if tip.is_empty() {
         resp.clicked()
+    } else {
+        resp.on_hover_text(tip).clicked()
     }
+}
+
+/// What the cursor gets for resting on a row.
+///
+/// The route in full where there is one, because the collapsed card has room
+/// for door names only. Falls back to the old fold hint on a row with no route,
+/// and to nothing at all on a row with neither -- an empty tooltip is better
+/// than one that says nothing useful, since a tooltip that always appears
+/// trains you to ignore it.
+///
+///   grep -n "fn hover_text"  sauron_panel.rs
+fn hover_text(r: &Row, expanded: bool) -> String {
+    if r.steps.is_empty() {
+        if r.files.is_empty() {
+            return String::new();
+        }
+        return if expanded {
+            "click to fold".to_string()
+        } else {
+            "click to list the files this session wrote".to_string()
+        };
+    }
+
+    let mut t = String::from("Where to look\n");
+    for (i, s) in r.steps.iter().enumerate() {
+        let mark = if s.is_verified() { "" } else { "   (inferred)" };
+        t.push_str(&format!(
+            "\n{}. {}  —  {} file{}{}\n   {}\n",
+            i + 1,
+            s.title,
+            s.hits,
+            plural(s.hits),
+            mark,
+            s.open,
+        ));
+        if !s.needs.is_empty() {
+            t.push_str(&format!("   needs: {}\n", s.needs.join("; ")));
+        }
+    }
+    if r.unmapped > 0 {
+        t.push_str(&format!(
+            "\n{} file{} match no panel — the map may be behind the code\n",
+            r.unmapped,
+            plural(r.unmapped),
+        ));
+    }
+    if r.truncated > 0 {
+        t.push_str(&format!("+{} more surface{} not shown\n", r.truncated, plural(r.truncated)));
+    }
+    if !r.files.is_empty() {
+        t.push_str(if expanded {
+            "\nclick to fold"
+        } else {
+            "\nclick for the files this session wrote"
+        });
+    }
+    t
 }
 
 /// What the card calls this session. Orcs get a marker: they are sauron's own
