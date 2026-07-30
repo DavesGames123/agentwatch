@@ -35,12 +35,16 @@
 //! That is the same contract, reached differently, and the difference is worth
 //! knowing about because the keystroke is not the same keystroke.
 //!
+//! The argv these functions hand to `wt.exe` is built in `plat::wt`, which is
+//! compiled on every platform so that its tests run on every platform. Only the
+//! parts that genuinely touch Windows -- spawning, the environment, the probe --
+//! are here.
+//!
 //! grep targets:
-//!   fn powershell_exe   -- pwsh if present, else the always-installed 5.1
+//!   fn pwsh_present     -- is PowerShell 7 installed
 //!   fn wt_window        -- which WT window this process's workspace owns
-//!   fn agent_pane_argv  -- the split that grows the agent column
-//!   fn orc_pane_argv    -- the split that stages an orc, unrun
-//!   fn ps_single_quote  -- PowerShell literal escaping (double the quote)
+//!   fn wt_pane          -- which pane index the Eye was given at launch
+//!   fn run_wt           -- hand an argv to wt.exe and read its exit code
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,25 +64,11 @@ pub const WT_WINDOW_ENV: &str = "SAURON_WT_WINDOW";
 pub const WT_PANE_ENV: &str = "SAURON_WT_PANE";
 
 pub(super) fn home_impl() -> PathBuf {
-    // USERPROFILE is what every Windows shell sets and what Claude Code itself
-    // resolves `~` to. HOMEDRIVE+HOMEPATH is the older pair, still set on
-    // domain-joined machines where USERPROFILE may point at a redirected
-    // profile; taking it second means a redirected profile wins, which is the
-    // one the agent logs will actually be under.
-    if let Some(p) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(p);
-    }
-    if let (Some(drive), Some(path)) = (
-        std::env::var_os("HOMEDRIVE"),
-        std::env::var_os("HOMEPATH"),
-    ) {
-        let mut joined = PathBuf::from(drive);
-        joined.push(PathBuf::from(path).strip_prefix("\\").unwrap_or(Path::new("")));
-        if joined.as_os_str().len() > 2 {
-            return joined;
-        }
-    }
-    PathBuf::from(".")
+    super::home_from(
+        std::env::var("USERPROFILE").ok().as_deref(),
+        std::env::var("HOMEDRIVE").ok().as_deref(),
+        std::env::var("HOMEPATH").ok().as_deref(),
+    )
 }
 
 pub(super) fn clipboard_write_impl(text: &str) -> bool {
@@ -93,11 +83,7 @@ pub(super) fn clipboard_write_impl(text: &str) -> bool {
         return false;
     };
     if let Some(stdin) = child.stdin.as_mut() {
-        let mut buf = vec![0xFF, 0xFE]; // UTF-16LE BOM
-        for unit in text.encode_utf16() {
-            buf.extend_from_slice(&unit.to_le_bytes());
-        }
-        let _ = stdin.write_all(&buf);
+        let _ = stdin.write_all(&super::utf16le_with_bom(text));
     }
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
@@ -136,13 +122,23 @@ pub(super) fn reload_impl(exe: PathBuf, args: Vec<String>) -> std::io::Error {
 /// index recorded at launch. See the module header for why that index exists and
 /// what invalidates it.
 pub fn spawn_agent_pane(cmd: &str, focus: bool) -> Result<(), String> {
-    run_wt(&agent_pane_argv(&wt_window(), wt_pane(), cmd, focus))
+    run_wt(&super::wt::agent_pane_argv(
+        &wt_window(),
+        wt_pane(),
+        cmd,
+        focus,
+        &super::shell_exe(),
+    ))
 }
 
 /// Stage an orc in sauron's own column: a pane that opens with the command
 /// loaded and waiting, never run.
 pub fn spawn_orc_pane(cmd: &str) -> Result<(), String> {
-    run_wt(&orc_pane_argv(&wt_window(), cmd))
+    run_wt(&super::wt::orc_pane_argv(
+        &wt_window(),
+        cmd,
+        &super::shell_exe(),
+    ))
 }
 
 /// Run the launch layout. Unlike the spawn paths this one is allowed to fail
@@ -189,76 +185,6 @@ fn wt_pane() -> Option<u32> {
     std::env::var(WT_PANE_ENV).ok()?.trim().parse().ok()
 }
 
-/// The split that grows the agent column.
-///
-/// `move-focus first` is the stand-in for iTerm's "the sessions ahead of me":
-/// the launch layout builds the agent column first, so pane 0 is in it. The
-/// split is horizontal, which in `wt`'s vocabulary means the new pane lands
-/// *below* the one being split -- the column grows downward, as it does on macOS.
-fn agent_pane_argv(window: &str, sauron_pane: Option<u32>, cmd: &str, focus: bool) -> Vec<String> {
-    let mut argv = vec![
-        "-w".to_string(),
-        window.to_string(),
-        "move-focus".to_string(),
-        "first".to_string(),
-        ";".to_string(),
-        "split-pane".to_string(),
-        "--horizontal".to_string(),
-    ];
-    argv.push("--".to_string());
-    argv.extend(shell_command(cmd));
-
-    // Focus lands on the new pane by default, so only the "leave me where I was"
-    // case needs anything more -- and it can only be honoured when launch told us
-    // where that was.
-    if !focus {
-        if let Some(idx) = sauron_pane {
-            argv.push(";".to_string());
-            argv.push("focus-pane".to_string());
-            argv.push("--target".to_string());
-            argv.push(idx.to_string());
-        }
-    }
-    argv
-}
-
-/// The split that stages an orc: a shell with the command in its history and a
-/// banner saying how to run it. Nothing executes until the user says so.
-fn orc_pane_argv(window: &str, cmd: &str) -> Vec<String> {
-    let staged = format!(
-        "[Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory('{}'); \
-         Write-Host 'sauron: orc staged -- press Up then Enter to loose it' \
-         -ForegroundColor Yellow; Write-Host '{}' -ForegroundColor DarkGray",
-        ps_single_quote(cmd),
-        ps_single_quote(cmd),
-    );
-    vec![
-        "-w".to_string(),
-        window.to_string(),
-        "split-pane".to_string(),
-        "--horizontal".to_string(),
-        "--".to_string(),
-        powershell_exe(),
-        "-NoExit".to_string(),
-        "-NoLogo".to_string(),
-        "-Command".to_string(),
-        staged,
-    ]
-}
-
-/// Run `cmd` through a shell, so a pane command can be the same string on both
-/// platforms. `-NoExit` keeps the pane alive after the agent exits, matching
-/// iTerm's behaviour of leaving the session open.
-fn shell_command(cmd: &str) -> Vec<String> {
-    vec![
-        powershell_exe(),
-        "-NoExit".to_string(),
-        "-NoLogo".to_string(),
-        "-Command".to_string(),
-        cmd.to_string(),
-    ]
-}
-
 /// Is PowerShell 7 installed? Probing costs one process spawn, and only happens
 /// when a pane is opened. The choice itself is `plat::shell_exe`'s -- it is
 /// needed by the layout builder, which is compiled off Windows too.
@@ -273,79 +199,4 @@ pub(super) fn pwsh_present() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-/// The PowerShell a pane runs, as `plat::shell_exe` decides it.
-fn powershell_exe() -> String {
-    super::shell_exe()
-}
-
-/// Escape a string for a PowerShell single-quoted literal, where the only
-/// metacharacter is the quote itself and it escapes by doubling. Single quotes
-/// are used rather than double precisely because of this: inside double quotes
-/// PowerShell would expand `$`, and a repo path or a brief is allowed to contain
-/// one.
-fn ps_single_quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_split_targets_the_named_window_and_grows_the_column_down() {
-        let argv = agent_pane_argv("sauron-worldsmith", None, "claude", true);
-        assert_eq!(argv[0], "-w");
-        assert_eq!(argv[1], "sauron-worldsmith");
-        // The column is found by walking to its first pane, exactly as the iTerm
-        // path finds "everything ahead of me".
-        assert!(argv.windows(2).any(|w| w == ["move-focus", "first"]));
-        assert!(argv.contains(&"--horizontal".to_string()));
-    }
-
-    #[test]
-    fn agent_split_hands_focus_back_only_when_launch_recorded_a_pane() {
-        let with = agent_pane_argv("w", Some(3), "claude", false);
-        assert!(with.windows(2).any(|w| w == ["--target", "3"]));
-
-        // No recorded index means no focus restore -- and specifically not a
-        // guessed one, which would drop the user into someone else's pane.
-        let without = agent_pane_argv("w", None, "claude", false);
-        assert!(!without.contains(&"focus-pane".to_string()));
-
-        // Asking for focus never restores it, whatever launch recorded.
-        let focused = agent_pane_argv("w", Some(3), "claude", true);
-        assert!(!focused.contains(&"focus-pane".to_string()));
-    }
-
-    #[test]
-    fn orc_pane_stages_the_command_without_running_it() {
-        let argv = orc_pane_argv("w", "sauron orc src\\big.rs");
-        let joined = argv.join(" ");
-        // The command reaches the pane as history, never as the thing the pane
-        // was told to execute. If this ever becomes the pane's own commandline,
-        // the orc runs unreviewed -- which is the failure this test exists for.
-        assert!(joined.contains("AddToHistory('sauron orc src\\big.rs')"));
-        assert!(argv.iter().any(|a| a == "-NoExit"));
-        assert!(!argv.iter().any(|a| a == "sauron orc src\\big.rs"));
-    }
-
-    #[test]
-    fn a_quote_in_the_command_cannot_break_out_of_the_literal() {
-        let argv = orc_pane_argv("w", "sauron orc it's.rs");
-        let joined = argv.join(" ");
-        assert!(joined.contains("AddToHistory('sauron orc it''s.rs')"));
-    }
-
-    #[test]
-    fn a_semicolon_in_the_command_is_not_a_wt_separator() {
-        // wt splits its own argv on a bare `;` element. The command travels as
-        // one element, so an embedded semicolon is text -- assert that rather
-        // than trusting it, because the failure mode is wt running half a
-        // command as a second subcommand.
-        let argv = shell_command("claude --resume a;b");
-        assert!(argv.iter().any(|a| a == "claude --resume a;b"));
-        assert!(!argv.iter().any(|a| a == ";"));
-    }
 }

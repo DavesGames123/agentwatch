@@ -550,6 +550,103 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_path_folds_its_backslashes_and_its_drive_colon() {
+        // The bug this pins: folding only `/` and `.` left `\` and `:` in the
+        // name, and `:` is not legal in a filename at all -- so the directory
+        // could not exist, and the board would have drawn perfectly and been
+        // empty with nothing going red.
+        assert_eq!(
+            encode_path(Path::new("C:\\Users\\dave\\code\\my-repo")),
+            "C--Users-dave-code-my-repo"
+        );
+        // A dotted directory folds the same way it does on macOS.
+        assert_eq!(
+            encode_path(Path::new("D:\\src\\v1.2\\app")),
+            "D--src-v1-2-app"
+        );
+        // And the macOS form is untouched by the added characters.
+        assert_eq!(
+            encode_path(Path::new("/Users/you/code/my-repo")),
+            "-Users-you-code-my-repo"
+        );
+    }
+
+    /// A `projects` directory holding `names`, in a fresh temp dir.
+    fn projects_dir(tag: &str, names: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sauron-probe-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in names {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_probe_finds_a_log_dir_under_a_different_separator_convention() {
+        // The whole point of the fallback: nobody has confirmed what Claude Code
+        // names these on Windows. Whatever convention it turns out to use, the
+        // repo path still has to reach its own sessions.
+        let dir = projects_dir("found", &["C--Users-dave-code-my-repo"]);
+        let hit = probe_project_dir(&dir, Path::new("C:\\Users\\dave\\code\\my-repo"));
+        assert_eq!(hit, Some(dir.join("C--Users-dave-code-my-repo")));
+
+        // A convention nobody has proposed, to show the match is not tuned to one
+        // guess: underscores throughout.
+        let dir = projects_dir("alt", &["C__Users_dave_code_my_repo"]);
+        let hit = probe_project_dir(&dir, Path::new("C:\\Users\\dave\\code\\my-repo"));
+        assert_eq!(hit, Some(dir.join("C__Users_dave_code_my_repo")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_probe_refuses_an_ambiguous_answer_rather_than_guessing() {
+        // Two directories that both normalise to the repo path. Attaching the
+        // board to the wrong repo's sessions is worse than showing none, so this
+        // must answer nothing at all.
+        let dir = projects_dir(
+            "ambiguous",
+            &["C--Users-dave-code-my-repo", "C__Users_dave_code_my_repo"],
+        );
+        let hit = probe_project_dir(&dir, Path::new("C:\\Users\\dave\\code\\my-repo"));
+        assert_eq!(hit, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_neighbour_differing_only_in_punctuation_is_a_known_false_match() {
+        // `my-repo` and `myrepo` are different repositories, and this matches the
+        // wrong one. Pinned rather than fixed because it cannot be fixed here:
+        // Claude Code's encoding is lossy -- `-a-b-my-repo` is equally a decoding
+        // of `/a/b/my-repo` and of `/a/b/my/repo` -- so no probe over these names
+        // can separate them, and a cleverer normalisation would only move which
+        // pair it confuses.
+        //
+        // What bounds the risk is that the probe runs at all only when the exact
+        // encoding missed *and* the convention differs *and* such a neighbour
+        // exists. Confirm the real naming on a Windows box and this whole path,
+        // test included, is deleted.
+        let dir = projects_dir("neighbour", &["C--Users-dave-code-myrepo"]);
+        let hit = probe_project_dir(&dir, Path::new("C:\\Users\\dave\\code\\my-repo"));
+        assert_eq!(hit, Some(dir.join("C--Users-dave-code-myrepo")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_probe_answers_nothing_when_the_directory_is_missing_or_empty() {
+        let dir = projects_dir("empty", &[]);
+        assert_eq!(probe_project_dir(&dir, Path::new("C:\\r")), None);
+        assert_eq!(
+            probe_project_dir(&dir.join("absent"), Path::new("C:\\r")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn filters_write_set_to_repo_paths() {
         let root = Path::new("/Users/you/code/my-repo");
         // Relative paths are repo paths.

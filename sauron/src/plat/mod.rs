@@ -67,6 +67,8 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+pub mod wt;
+
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -144,25 +146,86 @@ pub fn resolve_program(name: &str) -> String {
     }
     #[cfg(windows)]
     {
-        // An explicit path is already an answer.
-        if name.contains('\\') || name.contains('/') {
-            return name.to_string();
-        }
-        let exts = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        let Some(path) = std::env::var_os("PATH") else {
-            return name.to_string();
-        };
-        for dir in std::env::split_paths(&path) {
-            for ext in exts.split(';').filter(|e| !e.is_empty()) {
-                let candidate = dir.join(format!("{name}{ext}"));
-                if candidate.is_file() {
-                    return candidate.to_string_lossy().into_owned();
-                }
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string());
+        let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        resolve_in(name, &dirs, &exts, |p| p.is_file())
+    }
+}
+
+/// The extensions Windows treats as executable when `PATHEXT` is unset.
+#[cfg_attr(not(windows), allow(dead_code))]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// The search `resolve_program` performs, with the filesystem injected.
+///
+/// Separated so it can be exercised on any platform: the logic is a loop over
+/// two lists and a predicate, and gating it behind `cfg(windows)` would have left
+/// it compiled-but-never-run on the machine doing the porting -- which is the
+/// same as untested.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_in(
+    name: &str,
+    dirs: &[std::path::PathBuf],
+    pathext: &str,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> String {
+    // An explicit path is already an answer.
+    if name.contains('\\') || name.contains('/') {
+        return name.to_string();
+    }
+    for dir in dirs {
+        for ext in pathext.split(';').filter(|e| !e.trim().is_empty()) {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if exists(&candidate) {
+                return candidate.to_string_lossy().into_owned();
             }
         }
-        name.to_string()
     }
+    // Nothing found: hand back the name so the failure is the spawn's own
+    // "not found" rather than something invented here.
+    name.to_string()
+}
+
+/// Windows' home directory, from the three variables that can name it.
+///
+/// `USERPROFILE` is what every Windows shell sets and what Claude Code resolves
+/// `~` to. `HOMEDRIVE`+`HOMEPATH` is the older pair, still set on domain-joined
+/// machines; it is consulted second so a redirected profile -- the one the agent
+/// logs will actually be under -- wins.
+///
+/// Takes its inputs rather than reading the environment so that every branch,
+/// including the ones a Mac never has variables for, is reachable from a test.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn home_from(userprofile: Option<&str>, homedrive: Option<&str>, homepath: Option<&str>) -> PathBuf {
+    if let Some(p) = userprofile.map(str::trim).filter(|p| !p.is_empty()) {
+        return PathBuf::from(p);
+    }
+    if let (Some(drive), Some(path)) = (
+        homedrive.map(str::trim).filter(|d| !d.is_empty()),
+        homepath.map(str::trim).filter(|p| !p.is_empty()),
+    ) {
+        // HOMEPATH is drive-relative and leads with a separator (`\Users\you`),
+        // which `PathBuf::push` would read as "start again from the root" -- and
+        // the drive letter would be dropped.
+        return PathBuf::from(format!("{}{}", drive, path));
+    }
+    PathBuf::from(".")
+}
+
+/// Encode `text` as UTF-16LE with a byte-order mark.
+///
+/// `clip.exe` interprets raw stdin in the console codepage, which mangles
+/// anything non-ASCII, but it honours a BOM. A repo path with an accent in it is
+/// not exotic, so encode rather than hope.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut buf = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        buf.extend_from_slice(&unit.to_le_bytes());
+    }
+    buf
 }
 
 /// The PowerShell a pane runs: `pwsh.exe` when PowerShell 7 is installed, else
@@ -344,5 +407,97 @@ mod tests {
     #[test]
     fn a_command_with_no_prefix_survives_untouched() {
         assert_eq!(to_powershell("claude"), "claude");
+    }
+
+    // -----------------------------------------------------------------------
+    // The Windows-only logic, exercised here rather than on Windows. Each of
+    // these covers a function whose body a Mac never executes; taking the
+    // environment and the filesystem as parameters is what makes that possible.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn userprofile_names_home_and_the_older_pair_is_the_fallback() {
+        assert_eq!(
+            home_from(Some("C:\\Users\\dave"), None, None),
+            PathBuf::from("C:\\Users\\dave")
+        );
+        // Redirected profile wins: it is where the agent logs actually are.
+        assert_eq!(
+            home_from(Some("H:\\dave"), Some("C:"), Some("\\Users\\dave")),
+            PathBuf::from("H:\\dave")
+        );
+    }
+
+    #[test]
+    fn homedrive_and_homepath_join_without_losing_the_drive() {
+        // The bug this pins: HOMEPATH leads with a separator, and `PathBuf::push`
+        // reads a leading separator as "start again from the root" -- which drops
+        // the drive letter and yields `\Users\dave`, a path on the wrong volume.
+        let home = home_from(None, Some("C:"), Some("\\Users\\dave"));
+        assert_eq!(home, PathBuf::from("C:\\Users\\dave"));
+        assert!(home.to_string_lossy().starts_with("C:"));
+    }
+
+    #[test]
+    fn a_home_nobody_named_is_the_current_directory_not_a_panic() {
+        // Losing state under the wrong directory is recoverable; a watcher that
+        // refuses to start because an env var is unset is not.
+        assert_eq!(home_from(None, None, None), PathBuf::from("."));
+        // Set-but-empty counts as unset -- Windows does hand out empty vars.
+        assert_eq!(home_from(Some(""), Some(""), Some("")), PathBuf::from("."));
+        // A half-set pair is not enough to build a path from.
+        assert_eq!(home_from(None, Some("C:"), None), PathBuf::from("."));
+    }
+
+    // Candidates are built with `Path::join`, which uses the *host's* separator
+    // -- `\` on Windows, `/` here. So these express the expected hit the same way
+    // the code does rather than spelling a separator, which would assert on
+    // `Path`'s behaviour instead of on the search.
+    #[test]
+    fn a_cmd_shim_is_found_where_bare_exe_resolution_would_miss_it() {
+        // The actual bug: `Command::new("claude")` appends only `.exe`, and an
+        // npm-installed agent is `claude.cmd` -- a not-found for a program that
+        // runs fine when typed. `.EXE` is tried first and is absent here.
+        let dir = PathBuf::from("npm");
+        let shim = dir.join("claude.CMD");
+        let found = resolve_in("claude", &[dir], DEFAULT_PATHEXT, |p| p == shim);
+        assert_eq!(found, shim.to_string_lossy());
+    }
+
+    #[test]
+    fn resolution_takes_the_first_directory_that_has_it() {
+        let (a, b) = (PathBuf::from("A"), PathBuf::from("B"));
+        let in_a = a.join("claude.CMD");
+        let in_b = b.join("claude.EXE");
+        // A `.CMD` earlier on the PATH beats an `.EXE` later on it -- directory
+        // order wins over extension order, which is what the shell does, so
+        // sauron reaches the same program the user would.
+        let found = resolve_in("claude", &[a, b], ".EXE;.CMD", |p| p == in_a || p == in_b);
+        assert_eq!(found, in_a.to_string_lossy());
+    }
+
+    #[test]
+    fn an_unresolvable_name_comes_back_unchanged_rather_than_invented() {
+        let dirs = vec![PathBuf::from("nowhere")];
+        assert_eq!(resolve_in("claude", &dirs, DEFAULT_PATHEXT, |_| false), "claude");
+        // An explicit path is already an answer and is never searched for.
+        assert_eq!(
+            resolve_in("C:\\tools\\claude.exe", &dirs, DEFAULT_PATHEXT, |_| panic!("searched")),
+            "C:\\tools\\claude.exe",
+        );
+    }
+
+    #[test]
+    fn the_clipboard_encodes_utf16le_with_a_bom_so_clip_exe_does_not_mangle_it() {
+        // Byte-exact, because the whole point is what a program that is not Rust
+        // reads off the pipe.
+        assert_eq!(utf16le_with_bom("hi"), vec![0xFF, 0xFE, b'h', 0, b'i', 0]);
+        // The case the BOM exists for: a repo path with an accent in it.
+        assert_eq!(utf16le_with_bom("é"), vec![0xFF, 0xFE, 0xE9, 0x00]);
+        // And one outside the BMP, which is a surrogate pair rather than one unit.
+        assert_eq!(
+            utf16le_with_bom("\u{1F440}"),
+            vec![0xFF, 0xFE, 0x3D, 0xD8, 0x40, 0xDC]
+        );
     }
 }
