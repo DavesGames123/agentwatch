@@ -27,6 +27,30 @@
 //! say so out loud instead -- see `WORKSPACE_HOST` and the callers of
 //! `unsupported`.
 //!
+//! KEEPING THE OTHER PLATFORM COMPILING
+//! ------------------------------------
+//! Only two modules are cut on Windows, and everything else in the crate --
+//! including `host` and `web` -- is declared unconditionally. That is the right
+//! default and it has one failure mode: a unix-only call added anywhere in the
+//! portable majority breaks the Windows build, and nothing on a Mac notices,
+//! because `cargo test` on a Mac never compiles for the other target.
+//!
+//! The check is one command and takes half a minute:
+//!
+//! ```text
+//! rustup target add x86_64-pc-windows-gnu    # once; brew install mingw-w64
+//! cargo check --all-targets --target x86_64-pc-windows-gnu
+//! ```
+//!
+//! Run it after touching anything that reaches the machine -- a `Command`, a
+//! path, an env var, a process. It is the only evidence available on a Mac that
+//! the Windows half still builds, and it catches the whole class: `std::os::unix`
+//! imports, `exec`, `$HOME`, and a `/`-joined path.
+//!
+//! What it cannot tell you is whether the result *works*. Every `wt.exe`
+//! interaction, the clipboard, and PATHEXT resolution are unverified until
+//! someone runs them on Windows.
+//!
 //! grep targets:
 //!   fn home             -- $HOME / %USERPROFILE%
 //!   fn clipboard_write  -- native clipboard; OSC 52 stays the caller's fallback
