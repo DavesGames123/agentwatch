@@ -30,12 +30,22 @@
 //! rather than stubbed -- see `plat`'s header for why an empty impl would be the
 //! worse failure -- and the subcommands that reach them say so.
 //!
+//! WHERE THE BOARD IS DRAWN
+//! ------------------------
+//! `plat` abstracts the operating system. `host` abstracts something one level
+//! up: the *front end*, and what it can be asked for. There are two, and they
+//! share every line of drawing code -- `sauron` renders into the terminal it was
+//! launched from, `sauron serve` renders into a browser tab via `web`. The
+//! second is a backend swap, not a second UI; see `web`'s header for what that
+//! buys and the one thing it costs.
+//!
 //! grep targets:
 //!   mod beacon      -- publishing the board where a watched project can read it
 //!   mod board       -- the headless per-repo watcher, shared by both front ends
 //!   mod model       -- session model and status classification
-//!   mod plat        -- the host, behind one surface: home, clipboard, panes
+//!   mod plat        -- the host OS, behind one surface: home, clipboard, panes
 //!   mod scan        -- incremental log tailer
+//!   mod servant     -- which servant a session is: its name and its colour
 //!   mod store       -- ack persistence, safe against concurrent writers
 //!   mod gui         -- docking a project's own app window into the workspace [macOS]
 //!   mod mirror      -- drawing that window *inside* a pane, frame by frame [macOS]
@@ -58,6 +68,7 @@ pub mod plat;
 pub mod reply;
 pub mod route;
 pub mod scan;
+pub mod servant;
 pub mod scene;
 pub mod store;
 pub mod ui;

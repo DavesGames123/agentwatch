@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::servant;
 use crate::model::{ago, fmt_clock, fmt_duration, local_time, truncate, Status};
 use crate::Row;
 
@@ -764,6 +765,20 @@ fn card(row: &Row, selected: bool, now: i64, offset: i64, width: usize) -> ListI
         ));
         first_spans.push(Span::raw(" "));
     }
+    // The name is underlined in its servant colour -- the same colour the pane
+    // running it is tinted, computed from the session id by both sides rather
+    // than agreed between them (see `servant`). This is the join between the
+    // board and the screen: a row and a terminal are the same servant when the
+    // line under the name matches the pane.
+    //
+    // It is an underline and not the text colour because the text colour is
+    // already spoken for: `title_style` above says whether this needs you, and
+    // overwriting that to say *which* session it is would trade the more urgent
+    // fact for the less urgent one.
+    let (r, g, b) = servant::color_for(&row.id);
+    let title_style = title_style
+        .add_modifier(Modifier::UNDERLINED)
+        .underline_color(Color::Rgb(r, g, b));
     first_spans.push(Span::styled(truncate(&row.name, name_room), title_style));
     first_spans.push(Span::raw("  "));
     first_spans.push(Span::styled(age, Style::default().fg(DIM)));

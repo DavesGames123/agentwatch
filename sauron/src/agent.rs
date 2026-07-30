@@ -149,6 +149,48 @@ impl Agent {
         }
     }
 
+    /// Command a workspace pane runs to start a *new* session under an id sauron
+    /// chose, rather than one the agent invents.
+    ///
+    /// Choosing it is what lets a fresh pane be coloured at launch: the colour is
+    /// a function of the session id (see `servant`), and an id that does not
+    /// exist yet cannot be coloured. Claude Code validates the UUID, so
+    /// `mint_session_id` produces a well-formed v4 rather than any unique string.
+    ///
+    /// Codex has no equivalent, so its fresh panes run bare and are told apart by
+    /// their pane title alone.
+    pub fn fresh_cmd(self, session_id: &str) -> String {
+        match self {
+            Agent::Claude => format!("claude --session-id {session_id}"),
+            Agent::Codex => "codex".to_string(),
+        }
+    }
+
+    /// The flag that gives a pane's session a display name, or empty where the
+    /// agent has none.
+    ///
+    /// This is `/rename`, set at launch instead of typed. Claude Code shows the
+    /// name in the prompt box, the `/resume` picker, and -- the part that earns
+    /// this its place -- **the terminal title**. A column of eight identical
+    /// `claude` panes is the problem; one that reads `frodo`, `sam`, `merry` down
+    /// the side is not, and it costs one flag rather than a per-terminal
+    /// scripting layer that would have to be written twice.
+    ///
+    /// There is deliberately no colour counterpart. `/color` has no launch flag,
+    /// so setting it would mean driving the running session's keyboard -- exactly
+    /// the thing that cannot be done on Windows Terminal, and the reason `reply`
+    /// is macOS-only. A name works on both platforms or it is not worth having.
+    ///
+    /// Codex has no equivalent flag (unverified rather than known-absent: it is
+    /// not installed on the machine this was written on). Empty keeps one call
+    /// site, and its panes are still told apart by the terminal's own pane title.
+    pub fn name_flag(self, name: &str) -> String {
+        match self {
+            Agent::Claude => format!(" --name {name}"),
+            Agent::Codex => String::new(),
+        }
+    }
+
     /// The shell env-var prefix that redirects this agent's CLI to the local
     /// ("Mordor") model, or empty when not in Mordor mode. Prepended to a hobbit
     /// or orc pane command right before the `claude` word, so
@@ -193,6 +235,20 @@ impl Agent {
             Agent::Claude => (self.label(), vec![prompt.to_string()]),
             Agent::Codex => (self.label(), vec!["exec".into(), prompt.to_string()]),
         }
+    }
+
+    /// The same, with the session named so the pane can be told from its
+    /// neighbours -- see `name_flag`.
+    ///
+    /// The flag goes *before* the prompt, not after it. The prompt is positional
+    /// and a `--name` following it would be read as more prompt: the orc would
+    /// get two stray words appended to its charge and no name at all.
+    pub fn oneshot_argv_named(self, prompt: &str, name: &str) -> (&'static str, Vec<String>) {
+        let (prog, mut argv) = self.oneshot_argv(prompt);
+        if matches!(self, Agent::Claude) {
+            argv.splice(0..0, ["--name".to_string(), name.to_string()]);
+        }
+        (prog, argv)
     }
 
     // --- scanning hooks ---

@@ -24,6 +24,23 @@
 //! cold enough to hand it -- lives in `orc`, not here. This module only decides
 //! where the pane goes.
 //!
+//! CHECKING THE APPLESCRIPT ACTUALLY PARSES
+//! ----------------------------------------
+//! The tests here assert on the *text* of a script in another language, which
+//! catches a missing pane and not a syntax error. `osacompile` compiles without
+//! running, and is the only cheap way to learn that iTerm2 will accept what this
+//! emits:
+//!
+//! ```text
+//! WORKSPACE_PRINT_SCRIPT=1 sauron workspace 3 <repo> --yes | osacompile -o /tmp/x.scpt
+//! WORKSPACE_PRINT_SCRIPT=1 sauron workspace 3 <repo> --yes --gui=./run.sh | osacompile -o /tmp/x.scpt
+//! ```
+//!
+//! Worth doing after any edit to a script template. It caught a handler that
+//! referred to iTerm2's `background color` from outside a `tell application`
+//! block -- valid-looking text that every string assertion passed and that
+//! AppleScript rejects on sight.
+//!
 //! A repo that declares a GUI (`.sauron/gui.conf`, see `gui`) gets the second
 //! layout instead: four quarter-width columns, with the middle two left as a
 //! hole for the application's own window. Every other repo takes the original
@@ -626,6 +643,42 @@ fn as_list(cmds: &[String]) -> String {
         .join(", ")
 }
 
+/// How far the servant colour is dialled down to become a pane background.
+///
+/// The colour has to be recognisably the one underlining the name on the board
+/// while leaving the pane readable, and those pull opposite ways. At full
+/// strength a teal background makes an agent's output unreadable; at a tenth it
+/// is a tint you can name at a glance and never notice while working. Measured
+/// by eye against iTerm2's default dark profile.
+#[cfg(unix)]
+const TINT: f32 = 0.10;
+
+/// The pane background colours, as an AppleScript list of RGB triples, one per
+/// command -- `{{r, g, b}, {r, g, b}}`.
+///
+/// iTerm2's colour components are 16-bit, not 8-bit; passing 0-255 here yields a
+/// pane so near black that the whole feature looks broken rather than subtle.
+///
+/// A pane whose command carries no session id keeps the profile's own background
+/// (`missing value`), because there is no honest colour for it: the board cannot
+/// colour that row either, and inventing one here would put a colour on screen
+/// that nothing on the board agrees with.
+#[cfg(unix)]
+fn as_tint_list(cmds: &[String]) -> String {
+    pane_session_ids(cmds)
+        .into_iter()
+        .map(|id| match id {
+            Some(id) => {
+                let (r, g, b) = crate::servant::color_for(&id);
+                let scale = |c: u8| (c as f32 * TINT * 257.0) as u32;
+                format!("{{{}, {}, {}}}", scale(r), scale(g), scale(b))
+            }
+            None => "missing value".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build the AppleScript that opens the window, fullscreens it onto its own
 /// Space, and lays out the panes: the left column is one hobbit pane per
 /// `total`, and the right column is sauron on top with the orcs stacked beneath
@@ -657,6 +710,7 @@ fn applescript(
 
     let left_list = as_list(&left);
     let right_list = as_list(&right);
+    let left_tints = as_tint_list(&left);
     // The orcs are the leading right-column commands. They are staged (typed but
     // not run) so you review the target and press Enter to loose each one -- they
     // never begin refactoring the moment the window opens.
@@ -679,6 +733,7 @@ tell application "iTerm2"
   set t to current tab of w
   set leftTop to current session of t
   set leftCmds to {{{left_list}}}
+  set leftTints to {{{left_tints}}}
   set rightCmds to {{{right_list}}}
 
   -- Carve the right column off the left; sauron on top, the rest stacked below.
@@ -705,7 +760,13 @@ tell application "iTerm2"
   end repeat
 
   -- Left column: one pane per hobbit command.
+  --
+  -- Each pane is tinted with its servant's colour -- the same colour the board
+  -- underlines that session's name with, computed from the session id by both
+  -- sides rather than agreed between them. That is what lets you look at a row
+  -- and know which window it is without reading anything.
   tell leftTop to write text (item 1 of leftCmds)
+  my tint(leftTop, item 1 of leftTints)
   set leftPanes to {{leftTop}}
   repeat with i from 2 to (count of leftCmds)
     set tallest to item 1 of leftPanes
@@ -714,15 +775,33 @@ tell application "iTerm2"
     end repeat
     tell tallest to set newP to (split horizontally with default profile)
     tell newP to write text (item i of leftCmds)
+    my tint(newP, item i of leftTints)
     set end of leftPanes to newP
   end repeat
 
   -- Land focus on the first agent pane.
   select leftTop
 end tell
+
+{TINT_HANDLER}
 "#
     )
 }
+
+/// Tint one pane, or leave the profile alone when there is no colour for it.
+///
+/// A handler rather than an inline `set`, because it is called from two loops in
+/// two layouts and the `missing value` guard has to be in all four places. It is
+/// wrapped in a `try` for the same reason every other iTerm call in this file is:
+/// a colour that a profile refuses must not take the whole layout down with it,
+/// having already opened half the window.
+#[cfg(unix)]
+const TINT_HANDLER: &str = r#"on tint(sess, c)
+  if c is missing value then return
+  try
+    tell application "iTerm2" to tell sess to set background color to c
+  end try
+end tint"#;
 
 /// The agent column's commands: resume each in-flight session, a fresh agent for
 /// the rest. In Mordor mode each hobbit carries the local-model env before the
@@ -731,6 +810,52 @@ end tell
 ///
 /// Shared by both layouts, because the *column* is the same thing in each; only
 /// the geometry around it differs.
+/// The servants, in the order the agent column is filled.
+///
+/// A name per pane, not a number, because the point is telling them apart at a
+/// glance and `frodo` reads at a glance where `agent-4` does not. The roster is
+/// the repo's own cast (see the README) rather than an invention: the panes have
+/// been "hobbits" in the prose since before they had names.
+///
+/// Order is fixed and slot-indexed, so the pane in a given position is called
+/// the same thing every launch -- a name that moved between runs would be worse
+/// than a number.
+const HOBBITS: &[&str] = &[
+    "frodo", "sam", "merry", "pippin", "gandalf", "aragorn", "legolas", "gimli", "boromir",
+    "bilbo", "faramir", "eowyn", "theoden", "treebeard", "elrond", "galadriel", "radagast",
+    "beregond",
+];
+
+/// The orcs, kept apart from the hobbits so a glance at a name says which kind
+/// of servant a pane holds as well as which one.
+const ORCS: &[&str] = &[
+    "grishnakh", "ugluk", "shagrat", "gorbag", "lugdush", "muzgash", "snaga", "mauhur", "azog",
+    "bolg",
+];
+
+/// Slot index -> the name that pane's session carries.
+///
+/// Past the end of a roster the names repeat with a company number rather than
+/// wrapping silently onto a duplicate -- two panes both called `frodo` would
+/// defeat the whole purpose.
+fn servant_name(roster: &[&str], index: usize) -> String {
+    let name = roster[index % roster.len()];
+    match index / roster.len() {
+        0 => name.to_string(),
+        n => format!("{name}-{}", n + 1),
+    }
+}
+
+/// The name the agent pane in slot `index` is given.
+pub fn hobbit_name(index: usize) -> String {
+    servant_name(HOBBITS, index)
+}
+
+/// The name the orc pane in slot `index` is given.
+pub fn orc_name(index: usize) -> String {
+    servant_name(ORCS, index)
+}
+
 fn left_commands(
     repo: &str,
     sauron_exe: &str,
@@ -767,8 +892,47 @@ fn left_commands(
                     false,
                 )
             }
-            Some((id, _)) => format!("cd {repo} && {env}{}", agent.resume_cmd(id)),
-            None => format!("cd {repo} && {env}{}", agent.label()),
+            // The name rides on the end of the agent's own command, which is why
+            // it survives Mordor mode and resume alike: both are still the agent
+            // word plus flags, and this adds one more.
+            Some((id, _)) => format!(
+                "cd {repo} && {env}{}{}",
+                agent.resume_cmd(id),
+                agent.name_flag(crate::servant::name_for(id))
+            ),
+            // A fresh pane is given its session id rather than left to invent
+            // one, so its colour is knowable now instead of one tick after the
+            // agent first writes a log. Without this the newest pane -- the one
+            // you are most likely to be looking for -- is the only one the board
+            // cannot colour.
+            None => {
+                let id = crate::servant::mint_session_id();
+                format!(
+                    "cd {repo} && {env}{}{}",
+                    agent.fresh_cmd(&id),
+                    agent.name_flag(crate::servant::name_for(&id))
+                )
+            }
+        })
+        .collect()
+}
+
+/// The panes' session ids, in column order, so the launcher can colour each pane
+/// to match the row the board will draw for it.
+///
+/// Recomputed from `left_commands`' own output rather than threaded alongside
+/// it: two lists that must stay in step are one bug away from being wrong, and
+/// the id is already in the command text.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn pane_session_ids(commands: &[String]) -> Vec<Option<String>> {
+    commands
+        .iter()
+        .map(|cmd| {
+            let at = cmd.find("--session-id ").or_else(|| cmd.find("--resume "))?;
+            cmd[at..]
+                .split_whitespace()
+                .nth(1)
+                .map(|id| id.to_string())
         })
         .collect()
 }
@@ -811,6 +975,19 @@ fn wt_layout_argv(
 ) -> Vec<String> {
     let lefts = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
     let window = wt_window_name(repo);
+    // Windows Terminal cannot tint one pane -- `--tabColor` colours the whole
+    // tab, and `--colorScheme` needs a scheme already defined in the user's
+    // settings.json, which sauron has no business writing. So the servant is
+    // carried by the pane *title* here rather than by a colour, and the board's
+    // underline is the only place the colour appears on this platform.
+    let titles: Vec<String> = pane_session_ids(&lefts)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| match id {
+            Some(id) => crate::servant::name_for(&id).to_string(),
+            None => format!("agent-{}", i + 1),
+        })
+        .collect();
 
     // Pane 0 is the first agent pane; pane 1 is the Eye. Both are consequences of
     // the build order above, and `SAURON_WT_PANE` below hands the second one to
@@ -824,7 +1001,7 @@ fn wt_layout_argv(
         // The agent column starts as the whole window.
         "new-tab".to_string(),
         "--title".to_string(),
-        "agent".to_string(),
+        titles[0].clone(),
         "-d".to_string(),
         repo.to_string(),
         "--".to_string(),
@@ -863,7 +1040,7 @@ fn wt_layout_argv(
 
     // Back to the agent column for the remaining hobbits. `move-focus first`
     // returns to pane 0, which the build order guarantees is in that column.
-    for cmd in lefts.iter().skip(1) {
+    for (i, cmd) in lefts.iter().enumerate().skip(1) {
         argv.push(";".to_string());
         argv.push("move-focus".to_string());
         argv.push("first".to_string());
@@ -871,7 +1048,7 @@ fn wt_layout_argv(
             &mut argv,
             "--horizontal",
             repo,
-            "agent",
+            &titles[i],
             pane_shell(cmd, &window, SAURON_PANE),
         );
     }
@@ -975,6 +1152,7 @@ fn gui_applescript(
 ) -> String {
     let left = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
     let left_list = as_list(&left);
+    let left_tints = as_tint_list(&left);
     let orc_list = as_list(orc_cmds);
     let sauron_flag = agent.label();
 
@@ -1012,6 +1190,7 @@ tell application "iTerm2"
   set t to current tab of w
   set agentTop to current session of t
   set leftCmds to {{{left_list}}}
+  set leftTints to {{{left_tints}}}
   set orcCmds to {{{orc_list}}}
 
   -- Three equal columns: agents | the app's hole | the Eye. Both splits come
@@ -1056,6 +1235,7 @@ tell application "iTerm2"
   -- Agent column: one pane per hobbit command, splitting the tallest each step
   -- so the column stays even instead of halving the newest pane every time.
   tell agentTop to write text (item 1 of leftCmds)
+  my tint(agentTop, item 1 of leftTints)
   set leftPanes to {{agentTop}}
   repeat with i from 2 to (count of leftCmds)
     set tallest to item 1 of leftPanes
@@ -1064,11 +1244,14 @@ tell application "iTerm2"
     end repeat
     tell tallest to set newP to (split horizontally with default profile)
     tell newP to write text (item i of leftCmds)
+    my tint(newP, item i of leftTints)
     set end of leftPanes to newP
   end repeat
 
   select agentTop
 end tell
+
+{TINT_HANDLER}
 "#
     )
 }
@@ -1413,6 +1596,7 @@ fn osascript(script: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::servant;
 
     // Asserts on generated AppleScript; there is none off macOS.
     #[cfg(unix)]
@@ -1510,7 +1694,111 @@ mod tests {
         assert_eq!(s.matches("cd /repo && claude").count(), 3); // resume line counts too
         // The sauron pane runs this binary against the repo, watching the agent.
         assert!(s.contains("cd /repo && /bin/sauron --claude"));
-        assert!(s.contains("set leftCmds to {\"cd /repo && claude --resume id-1\", "));
+        // Every pane's session is named, so the column is eight distinguishable
+        // windows rather than eight identical ones.
+        let named = servant::name_for("id-1");
+        assert!(s.contains(&format!(
+            "set leftCmds to {{\"cd /repo && claude --resume id-1 --name {named}\", "
+        )));
+    }
+
+    #[test]
+    fn every_pane_gets_its_own_session_and_its_own_name() {
+        // The differentiation itself: no two panes may share a session id or a
+        // display name, or the terminal titles collide and the colours with them.
+        let work = vec![("id-1".to_string(), "t".to_string())];
+        let cmds = left_commands("/repo", "/bin/sauron", 6, &work, Agent::Claude, None, false);
+        assert_eq!(cmds.len(), 6);
+
+        let ids = pane_session_ids(&cmds);
+        assert!(ids.iter().all(|i| i.is_some()), "every pane needs an id: {ids:?}");
+        let unique: std::collections::BTreeSet<_> = ids.iter().flatten().collect();
+        assert_eq!(unique.len(), 6, "session ids must not repeat: {ids:?}");
+
+        // The resumed one keeps the id it was resumed from -- minting a new one
+        // would start a second conversation and orphan the work being watched.
+        assert_eq!(ids[0].as_deref(), Some("id-1"));
+
+        // And each command names its session after that id, so the board and the
+        // terminal title agree without either being told.
+        for (cmd, id) in cmds.iter().zip(ids.iter().flatten()) {
+            assert!(
+                cmd.ends_with(&format!("--name {}", servant::name_for(id))),
+                "{cmd}"
+            );
+        }
+    }
+
+    // Windows Terminal cannot tint a single pane, so there is no tint list off
+    // macOS -- the servant travels as the pane title there instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_panes_tint_is_the_colour_the_board_underlines_it_with() {
+        // The join this whole feature rests on: two processes, no shared state,
+        // same answer. If these ever disagree the colours become noise.
+        let work = vec![("id-1".to_string(), "t".to_string())];
+        let cmds = left_commands("/repo", "/bin/sauron", 3, &work, Agent::Claude, None, false);
+        let tints = as_tint_list(&cmds);
+
+        for id in pane_session_ids(&cmds).iter().flatten() {
+            let (r, g, b) = servant::color_for(id);
+            let scale = |c: u8| (c as f32 * TINT * 257.0) as u32;
+            assert!(
+                tints.contains(&format!("{{{}, {}, {}}}", scale(r), scale(g), scale(b))),
+                "no tint for {id} in {tints}"
+            );
+        }
+        // iTerm2's components are 16-bit. An 8-bit value here is a pane that
+        // looks black and a feature that looks broken.
+        assert!(
+            !tints.contains("missing value"),
+            "every pane here has an id, so every pane has a colour"
+        );
+    }
+
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
+    #[test]
+    fn every_script_that_tints_a_pane_also_defines_the_handler() {
+        // An undefined handler is not a colour that fails to appear -- it is an
+        // AppleScript error partway through the layout, with the window already
+        // open and half its panes missing. Both layouts call `my tint`, and the
+        // two spawn scripts must not, so this checks the implication in both
+        // directions rather than that some string is present somewhere.
+        let work = vec![("id-1".to_string(), "t".to_string())];
+        let gui = crate::gui::Gui {
+            cmd: "./run.sh".into(),
+            ..crate::gui::Gui::default()
+        };
+        let scripts = [
+            applescript("/repo", "/bin/sauron", 2, &work, &[], Agent::Claude, None, false),
+            gui_applescript(
+                "/repo", "/bin/sauron", 2, &work, &[], Agent::Claude, None, false, &gui.cmd,
+            ),
+            spawn_script("UUID-1", "cd /repo && claude", false),
+            orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs"),
+        ];
+        for s in &scripts {
+            if s.contains("my tint(") {
+                assert!(
+                    s.contains("on tint(sess, c)"),
+                    "calls my tint but never defines it"
+                );
+            }
+        }
+        // And the two layouts really do tint, so this test cannot pass by the
+        // feature having quietly disappeared.
+        assert!(scripts[0].contains("my tint("), "ordinary layout must tint");
+        assert!(scripts[1].contains("my tint("), "gui layout must tint");
+    }
+
+    #[test]
+    fn codex_panes_are_left_unnamed_rather_than_given_a_flag_it_lacks() {
+        // Codex has no --name, and inventing one would make every pane fail to
+        // start. They are told apart by the pane title instead.
+        let cmds = left_commands("/repo", "/bin/sauron", 2, &[], Agent::Codex, None, false);
+        assert!(cmds.iter().all(|c| !c.contains("--name")), "{cmds:?}");
+        assert!(cmds.iter().all(|c| !c.contains("--session-id")), "{cmds:?}");
     }
 
     // Asserts on generated AppleScript; there is none off macOS.
@@ -1836,9 +2124,21 @@ mod tests {
             None,
             false,
         );
-        // One `new-tab` plus three `--title agent` splits: four agent panes.
-        let agents = argv.iter().filter(|a| a.as_str() == "agent").count();
-        assert_eq!(agents, 4);
+        // Four agent panes, each titled with its own servant rather than a
+        // shared word -- the pane title is the only servant marker Windows
+        // Terminal can carry, so a repeated one loses the distinction entirely.
+        let lefts = left_commands("C:\\r", "sauron.exe", 4, &[], Agent::Claude, None, false);
+        let want: Vec<String> = pane_session_ids(&lefts)
+            .into_iter()
+            .flatten()
+            .map(|id| servant::name_for(&id).to_string())
+            .collect();
+        assert_eq!(want.len(), 4);
+        let titled = argv
+            .iter()
+            .filter(|a| servant::NAMES.contains(&a.as_str()))
+            .count();
+        assert_eq!(titled, 4, "argv: {argv:?}");
         // Each of the later three is reached by returning to the column first.
         let returns = argv.windows(2).filter(|w| *w == ["move-focus", "first"]).count();
         assert_eq!(returns, 3);

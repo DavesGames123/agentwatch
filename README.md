@@ -94,6 +94,11 @@ A subcommand of the same binary. One command, a whole cockpit:
 - `sauron` wired into the top-right, shells below
 - Panes stay evenly sized no matter the agent count
 
+### 🌐 `sauron serve`
+The same board, drawn into a **browser tab** instead of this terminal — see
+[below](#-sauron-serve--the-board-in-a-browser-tab). A backend swap, not a
+second UI: one keymap, one layout, one Eye.
+
 </td>
 </tr>
 </table>
@@ -101,6 +106,18 @@ A subcommand of the same binary. One command, a whole cockpit:
 ---
 
 ## 🚀 Quick start
+
+```bash
+# the shortest path: build, serve, and open the board in a browser
+./run.sh
+```
+
+<sub>`./run.sh /path/to/repo` for a specific one · `--tui` for the terminal front
+end instead · `--no-open` to serve without launching a browser · `--help` for
+the rest. It walks up from port 7373 if that one is taken, so a second repo in a
+second tab needs no arguments.</sub>
+
+Or drive the binary yourself:
 
 ```bash
 # 1 · build the sidecar and Agent Clipboard
@@ -118,6 +135,50 @@ Drop it on your `PATH` to call it from anywhere:
 ```bash
 cp sauron/target/release/sauron sauron/target/release/clip /usr/local/bin/
 ```
+
+---
+
+## 🌐 `sauron serve` — the board in a browser tab
+
+Same board. Same keys. Same Eye, same mountain, same block letters. It is not a
+second front end with its own layout to keep in sync — it is the *same* front
+end with the terminal swapped out underneath it, so anything that changes on one
+changes on both.
+
+```bash
+./run.sh                          # build, serve, open a tab — the usual way in
+
+# or drive it directly:
+sauron serve                      # → http://127.0.0.1:7373
+
+sauron serve --port 8080          # somewhere else
+sauron serve /path/to/repo        # a specific repo
+```
+
+Open the URL it prints. Type into the tab exactly as you would into the TUI —
+<kbd>j</kbd>/<kbd>k</kbd>, <kbd>a</kbd>, <kbd>D</kbd>, <kbd>q</kbd>. Clicking a
+row copies its resume command **to the clipboard of the machine holding the
+browser**, which is the one you would paste it into. Several repos, several
+tabs: each tab is titled with its repo.
+
+**Two things a tab cannot do.** <kbd>n</kbd>, <kbd>⏎</kbd> and the orc dispatch
+open panes in a live iTerm2 window on the machine sauron is running on, and a
+web page has no way to reach one. Those keys say so in the footer rather than
+doing nothing quietly. (The orc dispatch still lands — it falls back to putting
+the command on your clipboard, same as it does outside a workspace window.)
+
+**It binds loopback, and it has no password.** The stream carries your prompts
+and your file paths, and the input endpoint acks and dismisses work on your
+board — anyone who can reach the port is holding your keyboard. `--bind` will
+open it wider if you have decided that is fine, and warns you once on the way
+past. Over an untrusted network, forward the port over ssh instead:
+
+```bash
+ssh -N -L 7373:127.0.0.1:7373 you@thatbox   # then open http://127.0.0.1:7373
+```
+
+Rebuilds are handled: the watcher re-execs itself when the binary changes, the
+tab reconnects on its own and asks for a full repaint.
 
 ---
 
@@ -427,6 +488,39 @@ not carry it.
   fullscreen toggle.
 
 </details>
+
+---
+
+## 🎨 Telling the panes apart
+
+A column of eight identical `claude` panes is a column you have to read to
+navigate. Every session sauron opens is therefore given a **servant** — a name
+and a colour — derived from its session id:
+
+```
+sauron panel                          the agent column
+─────────────────────────────────    ──────────────────
+● frodo    NEEDS TEST  src/a.rs       [frodo ]  teal pane
+  ^teal underline      ^gold status   [sam   ]  violet pane
+▲ sam      BLOCKED     waiting        [merry ]  amber pane
+  ^violet underline    ^red status    [pippin]  green pane
+```
+
+- **The name** comes from `claude --name`, so it shows in the session's prompt
+  box, its `/resume` picker entry, and the terminal title.
+- **The colour** underlines that session's name on the board and tints its pane
+  in iTerm2. Both sides compute it from the session id, so they agree without
+  talking to each other — and keep agreeing across restarts.
+- Fresh panes are launched with `--session-id`, so a brand-new pane has its
+  colour from the first frame instead of one tick later.
+
+The servant colour answers *which session is this*; the status colour on the
+glyph and the status word still answers *what state is it in*. They never
+collide — the palette deliberately excludes red, gold and grey.
+
+> On Windows the servant travels as the **pane title** only. Windows Terminal
+> can't tint one pane: `--tabColor` colours the whole tab, and `--colorScheme`
+> needs a scheme predefined in your `settings.json`, which sauron won't write.
 
 ---
 
@@ -784,7 +878,14 @@ sauron/src/
   scan.rs       ·  incremental log tailer + the Claude Code reader
   codex.rs      ·  the Codex rollout reader
   model.rs      ·  session model, status classification (agent-agnostic)
-  ui.rs         ·  the TUI
+  ui.rs         ·  the board's drawing — shared by both front ends
+  host.rs       ·  terminal or browser: where events come from, what the host can do
+  web/          ·  `sauron serve`: the same board, drawn into a browser tab
+    mod.rs      ·    the hub tabs subscribe to, the shared size, the entry point
+    backend.rs  ·    a ratatui Backend that pushes cells at a page, not a tty
+    wire.rs     ·    cells → JSON: colour and reverse-video resolved before they leave
+    input.rs    ·    a browser's keys and clicks, wearing crossterm's clothes
+    http.rs     ·    enough HTTP + server-sent events to hand a page a screen
   scene/        ·  Mordor: the Eye, Orodruin, the tower, the war, the cast
     mod.rs      ·    World (what the agents are doing) + the four compositors
     eye.rs      ·    the Eye's poses — burning, and banked when idle
@@ -800,6 +901,12 @@ sauron/src/
   gui.rs        ·  .sauron/gui.conf, the docked app window, `sauron gui`
   mirror.rs     ·  `--mirror`: the app drawn inside a pane, frame by frame
   orc.rs        ·  the orc charge, cold-file ranking, `sauron orc <file>`
+run.sh          ·  build, serve, wait for the bind, open the tab
+sauron/assets/
+  sauron_web.html   ·  the page: a cell grid, a measurement, two message pumps
+  sauron_panel.rs.in ·  the in-app egui pane `sauron panel install` writes
+sauron/tests/
+  page_render.mjs   ·  the page, run against real frames from a real server
 docs/AGENTS.md  ·  using Codex, and adding another agent
 ```
 
