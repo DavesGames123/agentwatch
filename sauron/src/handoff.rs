@@ -250,7 +250,9 @@ fn spawn_agent(
     repo: &Path,
     prompt: &str,
 ) -> io::Result<ExitStatus> {
-    let mut command = Command::new(agent.label());
+    // Not `agent.label()` directly: on Windows the agent is usually a `.cmd`
+    // shim, which `Command::new` will not find on its own.
+    let mut command = Command::new(crate::plat::resolve_program(agent.label()));
     match (agent, non_interactive, resume) {
         (Agent::Claude, _, Some(id)) => {
             command.args(["--resume", id]).arg(prompt);

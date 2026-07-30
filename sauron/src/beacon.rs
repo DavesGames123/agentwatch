@@ -180,13 +180,18 @@ pub fn beacon_dir() -> PathBuf {
 
 /// Repo root -> its beacon path.
 ///
-/// The encoding is the one Claude Code uses for `~/.claude/projects` and that
-/// `scan::project_dir_for` already relies on: separators and dots become
-/// dashes. Reusing it rather than hashing keeps the reader dependency-free --
-/// a host project can compute this path with `String::replace` and no sha2 --
-/// and keeps the file greppable by eye when something looks wrong.
+/// The encoding is the one Claude Code uses for `~/.claude/projects`, via the
+/// same `scan::encode_path` that `project_dir_for` calls. Reusing it rather than
+/// hashing keeps the reader dependency-free -- a host project can compute this
+/// path with `String::replace` and no sha2 -- and keeps the file greppable by
+/// eye when something looks wrong.
+///
+/// The installed panel computes this path itself, with its own copy of the
+/// encoder (`assets/sauron_panel.rs.in`, `fn beacon_path`), because it must not
+/// depend on this crate. The two must agree: change one and change the other, or
+/// a panel goes quietly blank against a beacon it can no longer name.
 pub fn path_for(repo_root: &Path) -> PathBuf {
-    let encoded = repo_root.to_string_lossy().replace(['/', '.'], "-");
+    let encoded = crate::scan::encode_path(repo_root);
     beacon_dir().join(format!("{encoded}.beacon"))
 }
 

@@ -447,15 +447,95 @@ pub(crate) fn repo_relative(raw: &str, repo_root: &Path) -> Option<String> {
 
 /// Claude Code encodes the project path by replacing separators with dashes:
 /// `/Users/you/code/my-repo` -> `-Users-you-code-my-repo`.
-pub fn project_dir_for(repo_root: &Path) -> PathBuf {
-    let encoded = repo_root.to_string_lossy().replace(['/', '.'], "-");
-    home().join(".claude").join("projects").join(encoded)
+/// Fold a repo path into the flat directory name Claude Code files its logs
+/// under: `/a/b/c.d` -> `-a-b-c-d`.
+///
+/// Windows adds two characters the macOS form never sees. Backslash is the
+/// separator, and the drive letter brings a colon, which is not legal in a
+/// filename at all -- so `C:\Users\d\repo` has to fold to `C--Users-d-repo` for
+/// the name to exist. Both are folded on every platform rather than under a
+/// `cfg`, because the function is also asked about paths that came out of a log
+/// file rather than off this disk.
+pub fn encode_path(path: &Path) -> String {
+    path.to_string_lossy().replace(['/', '\\', ':', '.'], "-")
 }
 
+/// Repo root -> the directory holding its Claude Code session logs.
+///
+/// The encoding above is a *reconstruction* of Claude Code's, and on macOS it is
+/// a verified one. On Windows it is not: nobody has yet pasted back a real
+/// `~/.claude/projects` listing from a Windows machine, and the failure mode if
+/// the guess is wrong is the worst kind -- a board that draws perfectly and is
+/// simply empty, with nothing anywhere going red.
+///
+/// So the guess is checked, and when it misses, the directory is searched for a
+/// name that matches the repo path once both sides are stripped to their
+/// alphanumerics. That answers correctly whatever separator convention turns out
+/// to be in use. When the probe also finds nothing the guess is returned anyway,
+/// so callers report a concrete path they can go and look at rather than a
+/// silence.
+///
+/// The probe is one `read_dir` of a directory with one entry per project, and it
+/// only runs when the guess missed. Delete it, and this function's Windows
+/// branch with it, once a real listing confirms the encoding.
+pub fn project_dir_for(repo_root: &Path) -> PathBuf {
+    let projects = home().join(".claude").join("projects");
+    let guess = projects.join(encode_path(repo_root));
+    if guess.is_dir() {
+        return guess;
+    }
+    // macOS deliberately does not probe. There the encoding is verified, so a
+    // miss means the repo genuinely has no sessions yet -- and the probe's
+    // fuzzy match would happily marry `my-repo` to a `myrepo` sitting next to
+    // it. Risk with no upside is not a fallback.
+    #[cfg(windows)]
+    {
+        return probe_project_dir(&projects, repo_root).unwrap_or(guess);
+    }
+    #[cfg(not(windows))]
+    guess
+}
+
+/// Find the entry of `projects` whose name is this repo path under some other
+/// separator convention. `None` when nothing matches, or when the match is not
+/// unique -- an ambiguous answer here would attach the board to another repo's
+/// sessions, which is worse than showing none.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn probe_project_dir(projects: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let want = alphanumeric_key(&repo_root.to_string_lossy());
+    if want.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| alphanumeric_key(&e.file_name().to_string_lossy()) == want)
+        .map(|e| e.path())
+        .collect();
+    hits.sort();
+    match hits.len() {
+        1 => hits.pop(),
+        _ => None,
+    }
+}
+
+/// A path reduced to its lowercase alphanumerics, so `/a/b/my-repo`,
+/// `-a-b-my-repo`, and `C:\a\b\my-repo` all compare equal on the part that
+/// carries the meaning. Separators, dots and dashes are exactly what the two
+/// conventions disagree about, so they are exactly what this drops.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn alphanumeric_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// The user's home directory. Delegates to `plat`, which knows that Windows
+/// calls it `%USERPROFILE%` and that a domain-joined machine may redirect it.
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::plat::home()
 }
 
 #[cfg(test)]

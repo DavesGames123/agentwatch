@@ -248,7 +248,8 @@ platform data directory.
 
 ## 🪟 `sauron workspace` — the multi-agent cockpit
 
-> **macOS + iTerm2 only.**
+> **macOS + iTerm2**, or **Windows + Windows Terminal** — see
+> [Windows](#-windows) for what the second one does and does not do.
 
 ```bash
 sauron workspace                  # the repo you're standing in, with a quick prompt
@@ -424,6 +425,47 @@ not carry it.
 - Accessibility permission granted to iTerm2
   (**System Settings → Privacy & Security → Accessibility**) — needed for the
   fullscreen toggle.
+
+</details>
+
+---
+
+## 🪟 Windows
+
+The watcher is the whole product, and the watcher is portable: the board,
+statuses, acks, baselines, the Eye, `clip`, `panel`, `route`, and `handoff` all
+run on **Windows Terminal + PowerShell** exactly as they do on macOS. State lives
+under `%USERPROFILE%\.claude\sauron`.
+
+`sauron workspace` works too, driven by `wt.exe` instead of AppleScript. It is
+the same layout — agents down the left, the Eye and its shells on the right,
+orcs beneath the Eye — reached by a different route, and the route costs three
+things worth knowing before you rely on them:
+
+| | macOS / iTerm2 | Windows / Windows Terminal |
+|:--|:--|:--|
+| Which pane a split lands on | the tallest in the column, measured | the column's first pane — `wt` cannot report a pane's size |
+| Handing focus back to the Eye | by session id | by pane index, recorded at launch — closing a pane by hand shifts it |
+| Staging an orc | typed in, Enter withheld | pushed onto the shell history, one **Up** from running |
+
+Three things are **macOS only** and say so rather than failing quietly:
+
+- **`sauron gui`** — docking a project's own window into the pane grid needs a
+  scriptable window server.
+- **`sauron gui --mirror`** — same reason.
+- **`sauron reply`** — delivery finds the terminal a process is typing into by
+  joining on the session's `tty`, which iTerm2 publishes. Windows Terminal
+  publishes nothing and accepts no text, so there is no route back. The outbox
+  stays empty on Windows instead of filling with messages nothing will carry.
+
+<details>
+<summary><b>Requirements</b></summary>
+
+<br>
+
+- Windows Terminal (`wt.exe` on `PATH`)
+- PowerShell 5.1 or 7 — `pwsh` is used when present, else the built-in
+- `git` on `PATH`, as on any platform
 
 </details>
 

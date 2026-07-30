@@ -337,26 +337,11 @@ return """#
     }
 }
 
-/// Minimal standard-alphabet base64. Shared with `main.rs`'s OSC 52 clipboard
-/// write -- one encoder, because two would disagree the first time either was
-/// touched, and both feed escape sequences to the same terminal.
-pub fn base64(input: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(A[(n >> 18 & 63) as usize] as char);
-        out.push(A[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
-    }
-    out
-}
+/// The encoder moved to `plat` when the clipboard fallback -- which needs it on
+/// every platform -- outlived this macOS-only module. Re-exported here because
+/// `sauron::mirror::base64` was the public path and the mirror is still its
+/// heaviest user, running it thousands of times.
+pub use crate::plat::base64;
 
 fn osascript(script: &str) -> Result<String, String> {
     run_impl(&[], script)

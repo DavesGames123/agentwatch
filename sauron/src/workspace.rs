@@ -32,9 +32,11 @@
 use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use crate::agent::{Agent, Mordor};
+#[cfg(unix)]
 use crate::gui::Gui;
 use crate::scan::home;
 
@@ -215,6 +217,7 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
     // still needs the conf for the rest of its settings, so an inline command is
     // the only way to dock a repo that has declared nothing.
     let forced = matches!(gui_flag, Some(None));
+    #[cfg(unix)]
     let gui: Option<Gui> = if no_gui {
         None
     } else {
@@ -226,6 +229,7 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
             Some(None) | None => crate::gui::config(&repo),
         }
     };
+    #[cfg(unix)]
     if gui.is_none() && forced {
         eprintln!(
             "sauron workspace: --gui, but {} declares nothing to launch.",
@@ -233,6 +237,20 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
         );
         eprintln!("  pass the command inline instead:  --gui='./run.sh'");
         std::process::exit(2);
+    }
+    // The docked-window layout needs a window server this platform does not
+    // expose (see `plat`). A repo that declares a GUI still opens -- it opens the
+    // ordinary layout, and is told why, rather than opening a four-column layout
+    // with a permanent hole in the middle of it. There is deliberately no `gui`
+    // binding on this path: the type belongs to the module that was compiled
+    // out, and the three places that read it are cut with it.
+    #[cfg(not(unix))]
+    {
+        let _ = no_gui;
+        if gui_flag.is_some() || forced {
+            eprintln!("{}", crate::plat::unsupported("the docked-window layout"));
+            eprintln!("  opening the ordinary layout instead.");
+        }
     }
 
     let work = crate::in_flight_tasks(repo.clone(), agent);
@@ -321,6 +339,7 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
             );
         }
         println!("SAURON={}", sauron_exe.display());
+        #[cfg(unix)]
         if let Some(g) = &gui {
             println!("GUI={}", g.cmd);
             println!("GUI_KEEP={:?}", g.keep);
@@ -331,38 +350,69 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
         return Ok(());
     }
 
-    let script = match &gui {
-        Some(_) => gui_applescript(
-            &repo_s,
-            &sauron_exe.to_string_lossy(),
-            total,
-            &work,
-            &orc_cmds,
-            agent,
-            mordor.as_ref(),
-            clipboard_handoff,
-            &crate::gui::stage_command(&sauron_exe, &repo_s),
-        ),
-        None => applescript(
-            &repo_s,
-            &sauron_exe.to_string_lossy(),
-            total,
-            &work,
-            &orc_cmds,
-            agent,
-            mordor.as_ref(),
-            clipboard_handoff,
-        ),
-    };
-    // The layout is a program in another language, and a unit test on the string
-    // it produces is not evidence that iTerm2 accepts it. This prints the script
-    // instead of running it, so the real thing can be executed and the resulting
-    // window measured.
-    if std::env::var_os("WORKSPACE_PRINT_SCRIPT").is_some() {
-        print!("{script}");
-        return Ok(());
+    // The layout is the one genuinely per-platform thing left in this function.
+    // Everything above -- which repo, which agent, how many panes, which files
+    // the orcs get -- is policy and is decided identically everywhere; only the
+    // act of carving a window into panes differs, and it differs completely.
+    #[cfg(unix)]
+    {
+        let script = match &gui {
+            Some(_) => gui_applescript(
+                &repo_s,
+                &sauron_exe.to_string_lossy(),
+                total,
+                &work,
+                &orc_cmds,
+                agent,
+                mordor.as_ref(),
+                clipboard_handoff,
+                &crate::gui::stage_command(&sauron_exe, &repo_s),
+            ),
+            None => applescript(
+                &repo_s,
+                &sauron_exe.to_string_lossy(),
+                total,
+                &work,
+                &orc_cmds,
+                agent,
+                mordor.as_ref(),
+                clipboard_handoff,
+            ),
+        };
+        // The layout is a program in another language, and a unit test on the
+        // string it produces is not evidence that iTerm2 accepts it. This prints
+        // the script instead of running it, so the real thing can be executed and
+        // the resulting window measured.
+        if std::env::var_os("WORKSPACE_PRINT_SCRIPT").is_some() {
+            print!("{script}");
+            return Ok(());
+        }
+        osascript(&script)?;
     }
-    osascript(&script)?;
+    #[cfg(not(unix))]
+    {
+        let argv = wt_layout_argv(
+            &repo_s,
+            &sauron_exe.to_string_lossy(),
+            total,
+            &work,
+            &orc_cmds,
+            agent,
+            mordor.as_ref(),
+            clipboard_handoff,
+        );
+        // Same escape hatch, same reason: the argv is checked by unit tests, and
+        // a unit test on an argv is not evidence that Windows Terminal accepts
+        // it. Printed one element per line, because `wt`'s own `;` separators are
+        // argv elements and a single joined line would hide where they fall.
+        if std::env::var_os("WORKSPACE_PRINT_SCRIPT").is_some() {
+            for a in &argv {
+                println!("{a}");
+            }
+            return Ok(());
+        }
+        crate::plat::run_wt_layout(&argv)?;
+    }
 
     let resumed = total.min(work.len());
     let orc_note = if orc_cmds.is_empty() {
@@ -380,6 +430,7 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
             m.model, m.base_url
         );
     }
+    #[cfg(unix)]
     if let Some(g) = &gui {
         println!(
             "  GUI: the middle two columns are held open for '{}' — press Enter in the app pane to launch it.",
@@ -567,6 +618,7 @@ fn read_line() -> Option<String> {
 /// Quote a shell command for embedding in an AppleScript string list. Repo/exe
 /// paths and commands are assumed double-quote-free (the shell version assumed
 /// the same), so they drop straight in.
+#[cfg(unix)]
 fn as_list(cmds: &[String]) -> String {
     cmds.iter()
         .map(|c| format!("\"{c}\""))
@@ -579,6 +631,7 @@ fn as_list(cmds: &[String]) -> String {
 /// `total`, and the right column is sauron on top with the orcs stacked beneath
 /// it (plus a shell). Both columns split the currently-tallest pane each step so
 /// they stay balanced rather than shrinking geometrically.
+#[cfg(unix)]
 fn applescript(
     repo: &str,
     sauron_exe: &str,
@@ -720,6 +773,169 @@ fn left_commands(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The Windows Terminal layout.
+//
+// Same two columns as the iTerm layout -- agents on the left, the Eye and its
+// shells on the right -- reached by a completely different route, because `wt`
+// can only ever split *the pane that currently has focus*.
+//
+// That forces the build order. The right column is carved off FIRST, as a single
+// vertical split of the one pane the window opens with, so that it runs the full
+// height. Subdividing it afterwards keeps it that way. Doing it the other way
+// round -- growing the agent column and then splitting for the Eye -- would give
+// a right column only as tall as whichever agent pane happened to be focused.
+//
+// Pane indices come out of that order, and `focus-pane --target` is the only way
+// to hand focus to a specific pane later, so sauron's index is a fact the layout
+// knows and the panes are told (`SAURON_WT_PANE`). Close a pane by hand and the
+// indices behind it shift; nothing here can observe that.
+//
+// Compiled on every platform, called only on Windows, so that the tests below
+// run on the machine doing the porting rather than only on the target.
+// ---------------------------------------------------------------------------
+
+/// The `wt.exe` argv that opens the workspace. `;` elements are `wt`'s own
+/// subcommand separators and must stay separate argv entries.
+#[cfg_attr(unix, allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn wt_layout_argv(
+    repo: &str,
+    sauron_exe: &str,
+    total: usize,
+    work: &[(String, String)],
+    orc_cmds: &[String],
+    agent: Agent,
+    mordor: Option<&Mordor>,
+    clipboard_handoff: bool,
+) -> Vec<String> {
+    let lefts = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
+    let window = wt_window_name(repo);
+
+    // Pane 0 is the first agent pane; pane 1 is the Eye. Both are consequences of
+    // the build order above, and `SAURON_WT_PANE` below hands the second one to
+    // the TUI so a later spawn can give focus back.
+    const SAURON_PANE: u32 = 1;
+
+    let mut argv = vec![
+        "-w".to_string(),
+        window.clone(),
+        "--fullscreen".to_string(),
+        // The agent column starts as the whole window.
+        "new-tab".to_string(),
+        "--title".to_string(),
+        "agent".to_string(),
+        "-d".to_string(),
+        repo.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(pane_shell(&lefts[0], &window, SAURON_PANE));
+
+    // Carve the Eye's column off the whole height, before anything subdivides.
+    push_split(
+        &mut argv,
+        "--vertical",
+        repo,
+        "sauron",
+        pane_shell(&format!("{sauron_exe} {repo}"), &window, SAURON_PANE),
+    );
+
+    // The rest of the right column, beneath the Eye: the orcs, then two shells --
+    // the same contents and the same order as the iTerm layout puts there.
+    for cmd in orc_cmds {
+        push_split(
+            &mut argv,
+            "--horizontal",
+            repo,
+            "orc",
+            pane_shell(cmd, &window, SAURON_PANE),
+        );
+    }
+    for _ in 0..2 {
+        push_split(
+            &mut argv,
+            "--horizontal",
+            repo,
+            "shell",
+            vec![crate::plat::shell_exe()],
+        );
+    }
+
+    // Back to the agent column for the remaining hobbits. `move-focus first`
+    // returns to pane 0, which the build order guarantees is in that column.
+    for cmd in lefts.iter().skip(1) {
+        argv.push(";".to_string());
+        argv.push("move-focus".to_string());
+        argv.push("first".to_string());
+        push_split(
+            &mut argv,
+            "--horizontal",
+            repo,
+            "agent",
+            pane_shell(cmd, &window, SAURON_PANE),
+        );
+    }
+
+    // Leave the user looking at the Eye, which is where the iTerm layout leaves
+    // them too.
+    argv.push(";".to_string());
+    argv.push("focus-pane".to_string());
+    argv.push("--target".to_string());
+    argv.push(SAURON_PANE.to_string());
+    argv
+}
+
+/// Append one `; split-pane <axis> -d <repo> --title <title> -- <cmd...>`.
+#[cfg_attr(unix, allow(dead_code))]
+fn push_split(argv: &mut Vec<String>, axis: &str, repo: &str, title: &str, cmd: Vec<String>) {
+    argv.push(";".to_string());
+    argv.push("split-pane".to_string());
+    argv.push(axis.to_string());
+    argv.push("-d".to_string());
+    argv.push(repo.to_string());
+    argv.push("--title".to_string());
+    argv.push(title.to_string());
+    argv.push("--".to_string());
+    argv.extend(cmd);
+}
+
+/// A pane's commandline: a PowerShell that publishes which window and which pane
+/// this workspace is, then runs the pane's own command.
+///
+/// The two env vars are the whole of what replaces `$ITERM_SESSION_ID`. iTerm
+/// tells a process which session it is running in; `wt` tells it nothing, so the
+/// launch that *knows* has to say so here, and a sauron started by hand outside a
+/// workspace correctly finds neither.
+#[cfg_attr(unix, allow(dead_code))]
+fn pane_shell(cmd: &str, window: &str, sauron_pane: u32) -> Vec<String> {
+    let prelude = format!(
+        "$env:SAURON_WT_WINDOW='{}'; $env:SAURON_WT_PANE='{sauron_pane}'; ",
+        window.replace('\'', "''"),
+    );
+    vec![
+        crate::plat::shell_exe(),
+        "-NoExit".to_string(),
+        "-NoLogo".to_string(),
+        "-Command".to_string(),
+        format!("{prelude}{}", crate::plat::to_powershell(cmd)),
+    ]
+}
+
+/// The `wt` window name this repo's workspace owns. Named rather than `0` (the
+/// most-recently-used window) so that two workspaces open at once each grow
+/// themselves instead of racing for whichever the user last touched.
+#[cfg_attr(unix, allow(dead_code))]
+fn wt_window_name(repo: &str) -> String {
+    let leaf: String = repo
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("repo")
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("sauron-{leaf}")
+}
+
 /// The layout for a repo that has an application of its own: three equal
 /// columns -- agents, the application, the Eye -- with the middle one held open
 /// and the app's own window docked into it by `sauron gui`.
@@ -745,6 +961,7 @@ fn left_commands(
 /// an agent behind a game. Each is marked with a session variable, which --
 /// unlike a pane title -- no program's escape sequences can overwrite.
 #[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 fn gui_applescript(
     repo: &str,
     sauron_exe: &str,
@@ -923,6 +1140,21 @@ fn orc_command(
 /// Returns the message to show on failure -- this runs inside the TUI event
 /// loop, so nothing here may print or exit.
 pub fn spawn_left_pane(cmd: &str, focus: bool) -> Result<(), String> {
+    // `wt` cannot be asked which pane is tallest, or which are ahead of this
+    // one, so the Windows path splits the column's first pane instead. The
+    // difference shows up on a crowded column, where iTerm would have found room
+    // and this will be refused -- see `plat::win`'s header.
+    #[cfg(not(unix))]
+    return crate::plat::spawn_agent_pane(&crate::plat::to_powershell(cmd), focus);
+
+    #[cfg(unix)]
+    {
+        spawn_left_pane_iterm(cmd, focus)
+    }
+}
+
+#[cfg(unix)]
+fn spawn_left_pane_iterm(cmd: &str, focus: bool) -> Result<(), String> {
     let Some(me) = iterm_session_id() else {
         return Err("not running in an iTerm2 pane".into());
     };
@@ -947,6 +1179,21 @@ pub fn spawn_left_pane(cmd: &str, focus: bool) -> Result<(), String> {
 /// the same contract `--orcs N` has at launch, kept identical here so a
 /// GUI-dispatched orc is not a more dangerous thing than a launch-dispatched one.
 pub fn spawn_orc_pane(cmd: &str) -> Result<(), String> {
+    // Staged, not run, on both platforms -- reached differently. iTerm types the
+    // line and withholds the Enter; `wt` cannot type into a pane at all, so the
+    // pane opens with the command on the history stack and a banner saying so.
+    // One keystroke either way, and neither runs by itself.
+    #[cfg(not(unix))]
+    return crate::plat::spawn_orc_pane(&crate::plat::to_powershell(cmd));
+
+    #[cfg(unix)]
+    {
+        spawn_orc_pane_iterm(cmd)
+    }
+}
+
+#[cfg(unix)]
+fn spawn_orc_pane_iterm(cmd: &str) -> Result<(), String> {
     let Some(me) = iterm_session_id() else {
         return Err("not running in an iTerm2 pane".into());
     };
@@ -960,6 +1207,7 @@ pub fn spawn_orc_pane(cmd: &str) -> Result<(), String> {
 }
 
 /// The right-column split script. Answers `OK`, or `ERR <why>`.
+#[cfg(unix)]
 fn orc_spawn_script(session_uuid: &str, cmd: &str) -> String {
     let me = as_str_literal(session_uuid);
     let cmd = as_str_literal(cmd);
@@ -1021,6 +1269,7 @@ return "OK"
 
 /// This pane's session UUID. iTerm2 exports `w<win>t<tab>p<pane>:<uuid>`, and
 /// the uuid tail is exactly the `id` the AppleScript session class reports.
+#[cfg(unix)]
 fn iterm_session_id() -> Option<String> {
     let raw = std::env::var("ITERM_SESSION_ID").ok()?;
     let uuid = raw.rsplit_once(':').map(|(_, u)| u).unwrap_or(&raw).trim();
@@ -1028,12 +1277,14 @@ fn iterm_session_id() -> Option<String> {
 }
 
 /// Escape a Rust string into an AppleScript string literal body.
+#[cfg(unix)]
 fn as_str_literal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The split script. Answers `OK`, or `ERR <why>` -- every failure is a message
 /// the footer can show, never a silent no-op.
+#[cfg(unix)]
 fn spawn_script(session_uuid: &str, cmd: &str, focus: bool) -> String {
     let me = as_str_literal(session_uuid);
     let cmd = as_str_literal(cmd);
@@ -1102,6 +1353,7 @@ return "OK"
 /// panes in question are running shells, which do exactly that on every prompt.
 /// In a workspace with no GUI nothing carries the mark, so every pane answers
 /// false and both scripts behave exactly as they did before.
+#[cfg(unix)]
 const GUI_HANDLER: &str = r#"on isGuiPane(s)
   set paneRole to ""
   try
@@ -1116,6 +1368,7 @@ end isGuiPane"#;
 
 /// Pipe the AppleScript to `osascript` on stdin and hand back its stdout. Unlike
 /// `osascript`, this never prints or exits -- its caller is the TUI.
+#[cfg(unix)]
 fn osascript_out(script: &str) -> std::io::Result<String> {
     let mut child = Command::new("osascript")
         .stdin(Stdio::piped())
@@ -1138,6 +1391,7 @@ fn osascript_out(script: &str) -> std::io::Result<String> {
 }
 
 /// Pipe the AppleScript to `osascript` on stdin, exactly as the shell heredoc did.
+#[cfg(unix)]
 fn osascript(script: &str) -> std::io::Result<()> {
     let mut child = match Command::new("osascript").stdin(Stdio::piped()).spawn() {
         Ok(c) => c,
@@ -1160,6 +1414,8 @@ fn osascript(script: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn spawn_script_targets_this_pane_and_splits_the_column_left_of_it() {
         let s = spawn_script("UUID-1", "cd /repo && claude", false);
@@ -1173,6 +1429,8 @@ mod tests {
         assert!(s.contains(r#"write text "cd /repo && claude""#));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn spawn_script_only_steals_focus_when_asked() {
         let bare = spawn_script("UUID-1", "cd /repo && claude", false);
@@ -1187,6 +1445,8 @@ mod tests {
     /// If this ever writes the command with a newline, a GUI-dispatched orc
     /// starts rewriting a file the instant the pane appears, with nobody having
     /// read which file it picked.
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn orc_spawn_script_stages_the_command_instead_of_running_it() {
         let s = orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs");
@@ -1198,6 +1458,8 @@ mod tests {
         assert!(s.contains("select newP"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn orc_spawn_script_takes_sauron_own_column_not_the_hobbits() {
         let s = orc_spawn_script("UUID-1", "cd /repo && /bin/sauron orc src/big.rs");
@@ -1210,6 +1472,8 @@ mod tests {
         assert!(s.contains("if (rows of (item k of rights)) > (rows of tallest)"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn spawn_script_never_dereferences_a_session_with_contents_of() {
         // `contents` is a real property of iTerm2's session class -- the visible
@@ -1227,12 +1491,16 @@ mod tests {
         assert!(code.contains("item k of ss"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn spawn_script_escapes_the_command_into_the_applescript_literal() {
         let s = spawn_script("UUID-1", r#"cd "/re po" && claude"#, false);
         assert!(s.contains(r#"write text "cd \"/re po\" && claude""#));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn applescript_lists_one_command_per_pane() {
         let work = vec![("id-1".to_string(), "task one".to_string())];
@@ -1245,6 +1513,8 @@ mod tests {
         assert!(s.contains("set leftCmds to {\"cd /repo && claude --resume id-1\", "));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn applescript_stacks_orcs_beneath_sauron() {
         let work = vec![("id-1".into(), "t".into())];
@@ -1267,6 +1537,8 @@ mod tests {
         assert!(s.contains("write text (item i of rightCmds) newline no"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn codex_agent_swaps_the_spawn_commands() {
         let work = vec![("id-1".into(), "t".into())];
@@ -1285,6 +1557,8 @@ mod tests {
         assert!(s.contains("/bin/sauron --codex")); // watcher pane watches codex
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn mordor_wires_hobbits_and_orcs_to_the_local_model_but_not_the_eye() {
         let m = Mordor {
@@ -1324,6 +1598,8 @@ mod tests {
         assert!(!c.contains('\''), "orc command must be single-quote-free: {c}");
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn strict_clipboard_mode_wraps_fresh_and_resumed_panes() {
         let work = vec![("id-1".to_string(), "task one".to_string())];
@@ -1345,6 +1621,8 @@ mod tests {
 
     /// The isolation contract, stated as a test: a repo with no GUI gets the
     /// layout it always got. If this fails, the hook has leaked.
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn a_repo_without_a_gui_gets_the_original_layout_untouched() {
         let work = vec![("id-1".to_string(), "task one".to_string())];
@@ -1355,6 +1633,8 @@ mod tests {
         assert!(!s.contains("sauron gui"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn gui_layout_holds_the_middle_column_open_for_the_app() {
         let work = vec![("id-1".into(), "t".into())];
@@ -1387,6 +1667,8 @@ mod tests {
     /// languages. If one moves without the other, the application lands over the
     /// Eye or over the agent column, which is the failure that looks like a bug
     /// in the docking rather than in the layout.
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn the_hole_and_the_docking_rect_agree_on_thirds() {
         let (x, y, w, h) = crate::gui::DEFAULT_RECT;
@@ -1402,6 +1684,8 @@ mod tests {
         assert!(s.contains("set guiPanes to {hole, holeMid, appLog}"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn gui_layout_cannot_use_native_fullscreen() {
         // A fullscreen Space holds one window. Going fullscreen here would put
@@ -1416,6 +1700,8 @@ mod tests {
         assert!(s.contains("set bounds of w to {") || s.contains("set zoomed of w to true"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn gui_layout_tags_every_pane_the_app_covers() {
         let s = gui_applescript(
@@ -1427,6 +1713,8 @@ mod tests {
 
     /// Same contract as an orc, for the same reason: `run.sh` is a release
     /// build, and opening a window is not consent to start one.
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn gui_launcher_is_staged_not_run() {
         let s = gui_applescript(
@@ -1438,6 +1726,8 @@ mod tests {
         );
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn gui_layout_stacks_orcs_under_the_eye_not_in_the_hole() {
         let orcs = vec![orc_command(
@@ -1456,6 +1746,8 @@ mod tests {
         assert!(s.contains("tell newP to write text (item i of orcCmds) newline no"));
     }
 
+    // Asserts on generated AppleScript; there is none off macOS.
+    #[cfg(unix)]
     #[test]
     fn both_spawn_scripts_skip_the_panes_under_a_docked_app() {
         let left = spawn_script("UUID-1", "cd /repo && claude", false);
@@ -1474,5 +1766,177 @@ mod tests {
         assert_eq!(expand("/abs/path"), PathBuf::from("/abs/path"));
         assert!(expand("~/x").starts_with(home()));
         assert_eq!(expand("~"), home());
+    }
+
+    // -----------------------------------------------------------------------
+    // The Windows Terminal layout. These run on every platform, deliberately:
+    // the builder is a string function, and the machine doing the porting is
+    // the one that needs to be able to check it. What they cannot establish is
+    // that `wt` accepts the result -- only a Windows run does that.
+    // -----------------------------------------------------------------------
+
+    /// Index of the first argv element equal to `needle`.
+    fn at(argv: &[String], needle: &str) -> usize {
+        argv.iter().position(|a| a == needle).expect(needle)
+    }
+
+    #[test]
+    fn wt_layout_carves_the_eyes_column_before_it_subdivides_anything() {
+        // The load-bearing ordering constraint. `wt` splits whatever pane has
+        // focus, so the full-height right column can only be made by splitting
+        // the window's one original pane. Any horizontal split reaching `wt`
+        // first would leave the Eye's column as tall as one agent pane.
+        let work = vec![("s1".to_string(), "t".to_string())];
+        let argv = wt_layout_argv(
+            "C:\\code\\repo",
+            "sauron.exe",
+            3,
+            &work,
+            &["orc one".to_string()],
+            Agent::Claude,
+            None,
+            false,
+        );
+        let vertical = at(&argv, "--vertical");
+        let first_horizontal = at(&argv, "--horizontal");
+        assert!(
+            vertical < first_horizontal,
+            "the vertical carve must precede every horizontal split"
+        );
+    }
+
+    #[test]
+    fn wt_layout_opens_one_named_fullscreen_window_per_repo() {
+        let argv = wt_layout_argv(
+            "C:\\code\\my repo",
+            "sauron.exe",
+            1,
+            &[],
+            &[],
+            Agent::Claude,
+            None,
+            false,
+        );
+        assert_eq!(argv[0], "-w");
+        // Named, not `0`: two workspaces open at once must each grow themselves
+        // rather than race for whichever window was last touched.
+        assert_eq!(argv[1], "sauron-my-repo");
+        assert!(argv.contains(&"--fullscreen".to_string()));
+    }
+
+    #[test]
+    fn wt_layout_gives_every_pane_the_agent_column_asked_for() {
+        let argv = wt_layout_argv(
+            "C:\\r",
+            "sauron.exe",
+            4,
+            &[],
+            &[],
+            Agent::Claude,
+            None,
+            false,
+        );
+        // One `new-tab` plus three `--title agent` splits: four agent panes.
+        let agents = argv.iter().filter(|a| a.as_str() == "agent").count();
+        assert_eq!(agents, 4);
+        // Each of the later three is reached by returning to the column first.
+        let returns = argv.windows(2).filter(|w| *w == ["move-focus", "first"]).count();
+        assert_eq!(returns, 3);
+    }
+
+    #[test]
+    fn wt_layout_tells_every_pane_which_window_and_which_pane_the_eye_is() {
+        // This pair is the whole of what stands in for $ITERM_SESSION_ID. Without
+        // it a sauron inside the workspace cannot tell which window to grow, and
+        // silently falls back to "whichever was last used".
+        let argv = wt_layout_argv(
+            "C:\\r",
+            "sauron.exe",
+            2,
+            &[],
+            &[],
+            Agent::Claude,
+            None,
+            false,
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("$env:SAURON_WT_WINDOW='sauron-r';"));
+        assert!(joined.contains("$env:SAURON_WT_PANE='1';"));
+        // And the layout leaves the user on that pane.
+        assert!(argv.windows(2).any(|w| w == ["--target", "1"]));
+    }
+
+    #[test]
+    fn wt_layout_puts_the_orcs_in_the_eyes_column_not_the_hobbits() {
+        let argv = wt_layout_argv(
+            "C:\\r",
+            "sauron.exe",
+            2,
+            &[],
+            &["orc a".to_string(), "orc b".to_string()],
+            Agent::Claude,
+            None,
+            false,
+        );
+        // Both orcs are placed after the vertical carve and before the layout
+        // goes back to the agent column -- which is what "beneath the Eye" means
+        // in a tree that can only be built by splitting the focused pane.
+        let vertical = at(&argv, "--vertical");
+        let back_to_agents = at(&argv, "move-focus");
+        let orcs: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "orc")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(orcs.len(), 2);
+        assert!(orcs.iter().all(|&i| i > vertical && i < back_to_agents));
+    }
+
+    #[test]
+    fn wt_layout_never_hands_a_bare_semicolon_to_a_pane_command() {
+        // `wt` reads a lone `;` argv element as a subcommand separator. A pane
+        // command carrying one as *text* would be torn in half and the tail run
+        // as a second wt subcommand, so every command must arrive as one element.
+        let argv = wt_layout_argv(
+            "C:\\r",
+            "sauron.exe",
+            1,
+            &[],
+            &[],
+            Agent::Claude,
+            None,
+            false,
+        );
+        // The prelude that sets the env vars contains semicolons by construction;
+        // assert it survives as a single argument rather than as separators.
+        let prelude = argv
+            .iter()
+            .find(|a| a.contains("$env:SAURON_WT_WINDOW"))
+            .expect("prelude");
+        assert!(prelude.contains(';'));
+        assert_ne!(prelude.as_str(), ";");
+    }
+
+    #[test]
+    fn wt_layout_translates_the_panes_shell_syntax_rather_than_shipping_it() {
+        // `left_commands` emits `cd '<repo>' && ...`, which PowerShell 5.1 cannot
+        // parse. The pane's starting directory replaces it.
+        let work = vec![("abc".to_string(), "t".to_string())];
+        let argv = wt_layout_argv(
+            "C:\\r",
+            "sauron.exe",
+            1,
+            &work,
+            &[],
+            Agent::Claude,
+            None,
+            false,
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("claude --resume abc"));
+        assert!(!joined.contains("&&"));
+        // The directory did not simply vanish -- it moved to `-d`.
+        assert!(argv.windows(2).any(|w| w == ["-d", "C:\\r"]));
     }
 }

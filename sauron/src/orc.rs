@@ -24,7 +24,6 @@
 //!   fn run               -- the `sauron orc <file>` subcommand itself
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -412,8 +411,10 @@ pub fn run(args: &[String], explicit_agent: Option<Agent>) -> std::io::Result<()
     }
 
     let (prog, argv) = agent.oneshot_argv(&charge);
-    // exec only returns on failure, and then it returns the error.
-    Err(Command::new(prog).args(argv).current_dir(&repo).exec())
+    // This process becomes the agent. Only returns on failure, and then it
+    // returns why -- `plat` picks exec or spawn-wait-exit per platform, and the
+    // pane cannot tell the difference.
+    Err(crate::plat::run_in_place(prog, &argv, &repo))
 }
 
 fn usage(why: &str) -> std::io::Result<()> {

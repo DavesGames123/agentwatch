@@ -18,7 +18,6 @@
 //!   fn App::resync      -- refresh that also picks up another process's acks
 //!   fn main             -- terminal lifecycle and event loop
 
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -32,7 +31,10 @@ use ratatui::widgets::ListState;
 use sauron::agent::Agent;
 use sauron::board::{Board, Dismissal};
 use sauron::model::{self, now_ms, Status};
-use sauron::{beacon, clip, git_root, gui, handoff, orc, panel, ui, workspace};
+use sauron::plat;
+#[cfg(unix)]
+use sauron::{gui, reply};
+use sauron::{beacon, clip, git_root, handoff, orc, panel, ui, workspace};
 
 /// How often the logs are re-tailed. Only appended bytes are parsed, so this is
 /// cheap even with 10MB session files.
@@ -457,19 +459,14 @@ fn hit_test(
     None
 }
 
-/// Put text on the system clipboard. Tries pbcopy first (macOS), then falls
-/// back to an OSC 52 escape so it still works over SSH or on a bare terminal.
+/// Put text on the system clipboard. Tries the platform's own mechanism first
+/// (`pbcopy`, `clip.exe`), then falls back to an OSC 52 escape so it still works
+/// over SSH or on a bare terminal.
 fn copy_to_clipboard(text: &str) -> bool {
     use std::io::Write;
-    use std::process::{Command, Stdio};
 
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        if child.wait().map(|s| s.success()).unwrap_or(false) {
-            return true;
-        }
+    if plat::clipboard_write(text) {
+        return true;
     }
 
     // OSC 52: ESC ] 52 ; c ; <base64> BEL -- ask the terminal to set the
@@ -480,10 +477,10 @@ fn copy_to_clipboard(text: &str) -> bool {
 }
 
 /// OSC 52 and the mirror's OSC 1337 both base64 a payload for the same
-/// terminal, so they share one encoder -- it lives in `mirror`, which is the
-/// one that runs it thousands of times.
-use sauron::mirror::base64;
-use sauron::reply;
+/// terminal, so they share one encoder. It lives in `plat` rather than `mirror`
+/// because the clipboard needs it on every platform and the mirror is macOS
+/// only.
+use sauron::plat::base64;
 use sauron::route;
 
 fn main() -> std::io::Result<()> {
@@ -529,7 +526,18 @@ fn main() -> std::io::Result<()> {
     // window into the hole the workspace layout leaves for it. This is what the
     // app-log pane runs, and it is inert in any repo with no `.sauron/gui.conf`.
     if args.first().map(|s| s.as_str()) == Some("gui") {
+        #[cfg(unix)]
         return gui::run(&args[1..]);
+        // Docking a window into the pane grid is the window server's job, and
+        // this platform's has no scripting surface to ask. Said out loud rather
+        // than treated as an unknown subcommand: the difference between "sauron
+        // cannot do this here" and "you typed it wrong" is the difference
+        // between one minute and twenty.
+        #[cfg(not(unix))]
+        {
+            eprintln!("{}", plat::unsupported("sauron gui"));
+            return Ok(());
+        }
     }
 
     // `sauron panel ...` -- install the in-app attention pane into a Rust
@@ -552,7 +560,17 @@ fn main() -> std::io::Result<()> {
     // terminal. Beside `route` for the same reason: it is about the board, not
     // the pane, and must work with no pane installed anywhere.
     if args.first().map(|s| s.as_str()) == Some("reply") {
+        #[cfg(unix)]
         return reply::run(&args[1..]);
+        // Delivery needs to find the window a pid is typing into. iTerm2 answers
+        // that by publishing each session's tty; Windows Terminal publishes
+        // nothing and accepts no text. Queuing the message anyway would be the
+        // worse failure -- it would sit in the outbox looking sent.
+        #[cfg(not(unix))]
+        {
+            eprintln!("{}", plat::unsupported("sauron reply"));
+            return Ok(());
+        }
     }
 
     let once = args.iter().any(|a| a == "--once");
@@ -772,6 +790,12 @@ fn main() -> std::io::Result<()> {
             // of receiving it is then picked up by the resync below, which is
             // what makes the board move without a second round trip.
             //   grep -n "fn drain"  src/reply.rs
+            //
+            // Nothing to drain where there is no delivery hop -- see the `reply`
+            // subcommand above, which refuses rather than queues, so the outbox
+            // stays empty on this platform instead of filling with messages
+            // no tick will ever carry.
+            #[cfg(unix)]
             for id in reply::drain() {
                 app.board.ack(&id);
             }
@@ -896,14 +920,14 @@ fn exe_mtime() -> Option<SystemTime> {
 
 /// Replace this process with a fresh copy of the (rebuilt) binary, same args.
 /// Terminal state is restored first so the new process starts on a clean tty and
-/// a failed exec does not strand the terminal in raw mode. On Unix, exec() only
-/// returns if it failed; the returned error is surfaced by the caller.
+/// a failed handoff does not strand the terminal in raw mode. Only returns if it
+/// failed; the returned error is surfaced by the caller.
 fn reload() -> std::io::Error {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sauron"));
     let args: Vec<String> = std::env::args().skip(1).collect();
-    std::process::Command::new(exe).args(args).exec()
+    plat::reload(exe, args)
 }
 
 #[cfg(test)]

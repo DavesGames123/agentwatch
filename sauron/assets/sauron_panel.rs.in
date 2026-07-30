@@ -716,17 +716,30 @@ pub fn route_steps() -> Vec<(String, String, String, Vec<String>)> {
 /// `$SAURON_BEACON` if set, otherwise `~/.claude/sauron/beacons/<encoded>` for
 /// the git root above the current directory.
 ///
-/// The encoding is Claude Code's: every `/` and `.` in the absolute path becomes
-/// `-`. Reusing it rather than hashing is what keeps this file dependency-free —
-/// a hash would mean pulling in sha2 to render a debug pane.
+/// The encoding is Claude Code's: every `/`, `\`, `:` and `.` in the absolute
+/// path becomes `-`. Reusing it rather than hashing is what keeps this file
+/// dependency-free — a hash would mean pulling in sha2 to render a debug pane.
+///
+/// This is a deliberate copy of `scan::encode_path` in the sauron crate, which
+/// this file must not depend on. The two must agree, or the panel goes blank
+/// against a beacon it can no longer name.
 fn beacon_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("SAURON_BEACON") {
         return Some(PathBuf::from(explicit));
     }
     let root = git_root()?;
     let root = root.canonicalize().unwrap_or(root);
-    let encoded = root.to_string_lossy().replace(['/', '.'], "-");
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let encoded = root.to_string_lossy().replace(['/', '\\', ':', '.'], "-");
+    // Windows-first, not first-set-wins: Git Bash sets HOME on Windows to an
+    // MSYS-form path (`/c/Users/you`) that no Rust `PathBuf` resolves, so asking
+    // HOME first there would find nothing. On Unix USERPROFILE is unset and this
+    // falls straight through.
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    }
+    .map(PathBuf::from)?;
     Some(
         home.join(".claude")
             .join("sauron")

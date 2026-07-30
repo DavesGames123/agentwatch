@@ -51,7 +51,7 @@
 //!   const MAX_AGE_MS  -- how long an undeliverable message keeps trying
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::model::now_ms;
 use crate::scan::home;

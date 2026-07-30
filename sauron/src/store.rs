@@ -674,23 +674,17 @@ mod tests {
     }
 
     /// Backdate a file's mtime without pulling in a crate to do it.
+    ///
+    /// This used to shell out to `touch -t $(date -r ...)`, which is two
+    /// BSD-only invocations and no test at all on a platform that has neither.
+    /// `File::set_modified` is std, has been since 1.75, and says the same thing
+    /// in one call.
     fn filetime_set(path: &Path, when: SystemTime) {
-        let secs = when
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let stamp = std::process::Command::new("touch")
-            .arg("-t")
-            .arg(
-                std::process::Command::new("date")
-                    .args(["-r", &secs.to_string(), "+%Y%m%d%H%M.%S"])
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap(),
-            )
-            .arg(path)
-            .status();
-        assert!(stamp.is_ok());
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for restamping");
+        file.set_modified(when).expect("set mtime");
     }
 
     #[test]
