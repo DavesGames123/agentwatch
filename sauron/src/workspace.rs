@@ -643,23 +643,59 @@ fn as_list(cmds: &[String]) -> String {
         .join(", ")
 }
 
-/// How far the servant colour is dialled down to become a pane background.
+/// How much of the servant colour survives into a pane background.
 ///
 /// The colour has to be recognisably the one underlining the name on the board
 /// while leaving the pane readable, and those pull opposite ways. At full
-/// strength a teal background makes an agent's output unreadable; at a tenth it
-/// is a tint you can name at a glance and never notice while working. Measured
-/// by eye against iTerm2's default dark profile.
+/// strength a teal background makes an agent's output unreadable; mixed this far
+/// into the dark base it is a tint you can name at a glance and never notice
+/// while working. Measured by eye against iTerm2's default dark profile.
 #[cfg(unix)]
-const TINT: f32 = 0.10;
+const TINT: f32 = 0.16;
 
-/// The pane background colours, as an AppleScript list of RGB triples, one per
-/// command -- `{{r, g, b}, {r, g, b}}`.
+/// What the tint is mixed *into*: the near-black the panes sit on, and the same
+/// base the browser front end mixes over, so a pane and a web panel running the
+/// same servant are the same shade rather than two guesses at one.
+#[cfg(unix)]
+const TINT_BASE: (u8, u8, u8) = (10, 12, 16);
+
+/// One pane's background: the servant colour mixed `TINT` of the way from the
+/// dark base towards it.
 ///
-/// iTerm2's colour components are 16-bit, not 8-bit; passing 0-255 here yields a
-/// pane so near black that the whole feature looks broken rather than subtle.
+/// Mixing rather than scaling is the whole of this function. `colour * 0.16`
+/// walks towards *black*, so every servant arrives at the same near-black and
+/// the pane looks untinted -- which is what it did. Interpolating from the base
+/// keeps the hue at low brightness, which is the only thing that makes two panes
+/// tellable apart.
+#[cfg(unix)]
+fn tinted(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mix = |c: u8, base: u8| (base as f32 + (c as f32 - base as f32) * TINT) as u8;
+    (
+        mix(c.0, TINT_BASE.0),
+        mix(c.1, TINT_BASE.1),
+        mix(c.2, TINT_BASE.2),
+    )
+}
+
+/// One colour as an AppleScript RGB triple. iTerm2's colour components are
+/// 16-bit, not 8-bit; passing 0-255 here yields a pane so near black that the
+/// whole feature looks broken rather than subtle.
+#[cfg(unix)]
+fn as_rgb(c: (u8, u8, u8)) -> String {
+    let wide = |c: u8| c as u32 * 257;
+    format!("{{{}, {}, {}}}", wide(c.0), wide(c.1), wide(c.2))
+}
+
+/// The pane colours, as an AppleScript list of `{background, cursor}` pairs, one
+/// per command.
 ///
-/// A pane whose command carries no session id keeps the profile's own background
+/// Two colours and not one, because a background dark enough to read against is
+/// too dark to *identify*, and the cursor is the one glyph on screen that can
+/// carry the colour at full strength without touching the agent's own output.
+/// The browser panels do exactly this (`sauron_web.html`, `fn theme`), so a pane
+/// and a panel are recognisably the same servant.
+///
+/// A pane whose command carries no session id keeps the profile's own colours
 /// (`missing value`), because there is no honest colour for it: the board cannot
 /// colour that row either, and inventing one here would put a colour on screen
 /// that nothing on the board agrees with.
@@ -669,9 +705,8 @@ fn as_tint_list(cmds: &[String]) -> String {
         .into_iter()
         .map(|id| match id {
             Some(id) => {
-                let (r, g, b) = crate::servant::color_for(&id);
-                let scale = |c: u8| (c as f32 * TINT * 257.0) as u32;
-                format!("{{{}, {}, {}}}", scale(r), scale(g), scale(b))
+                let c = crate::servant::color_for(&id);
+                format!("{{{}, {}}}", as_rgb(tinted(c)), as_rgb(c))
             }
             None => "missing value".to_string(),
         })
@@ -791,15 +826,19 @@ end tell
 /// Tint one pane, or leave the profile alone when there is no colour for it.
 ///
 /// A handler rather than an inline `set`, because it is called from two loops in
-/// two layouts and the `missing value` guard has to be in all four places. It is
-/// wrapped in a `try` for the same reason every other iTerm call in this file is:
-/// a colour that a profile refuses must not take the whole layout down with it,
+/// two layouts and the `missing value` guard has to be in all four places. Each
+/// `set` is wrapped in its own `try` for the same reason every other iTerm call
+/// in this file is, and separately: a profile that refuses the cursor colour must
+/// still get the background, and neither may take the whole layout down with it
 /// having already opened half the window.
 #[cfg(unix)]
 const TINT_HANDLER: &str = r#"on tint(sess, c)
   if c is missing value then return
   try
-    tell application "iTerm2" to tell sess to set background color to c
+    tell application "iTerm2" to tell sess to set background color to (item 1 of c)
+  end try
+  try
+    tell application "iTerm2" to tell sess to set cursor color to (item 2 of c)
   end try
 end tint"#;
 
@@ -1741,10 +1780,9 @@ mod tests {
         let tints = as_tint_list(&cmds);
 
         for id in pane_session_ids(&cmds).iter().flatten() {
-            let (r, g, b) = servant::color_for(id);
-            let scale = |c: u8| (c as f32 * TINT * 257.0) as u32;
+            let c = servant::color_for(id);
             assert!(
-                tints.contains(&format!("{{{}, {}, {}}}", scale(r), scale(g), scale(b))),
+                tints.contains(&format!("{{{}, {}}}", as_rgb(tinted(c)), as_rgb(c))),
                 "no tint for {id} in {tints}"
             );
         }
@@ -1753,6 +1791,38 @@ mod tests {
         assert!(
             !tints.contains("missing value"),
             "every pane here has an id, so every pane has a colour"
+        );
+    }
+
+    // The bug this replaced: `colour * TINT` walks every servant towards black,
+    // so ten distinct hues arrive as ten shades of the same near-black and no
+    // pane on screen looks tinted at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_tint_keeps_the_hue_instead_of_walking_it_to_black() {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in servant::PALETTE {
+            let t = tinted(*c);
+            // Dark enough to read an agent's output against.
+            assert!(
+                t.0 as u16 + t.1 as u16 + t.2 as u16 <= 3 * 60,
+                "{c:?} tinted to {t:?}, which is too bright to work in"
+            );
+            // Light enough to be a colour. Every palette entry has a channel at
+            // 214 or above, and scaling drove the brightest of them to 25 --
+            // ten hues arriving as one near-black. Mixing floors that channel at
+            // 44, so the threshold here separates the two mechanisms rather than
+            // restating whichever one is compiled.
+            assert!(
+                t.0.max(t.1).max(t.2) >= 35,
+                "{c:?} tinted to {t:?}, which is indistinguishable from black"
+            );
+            seen.insert(t);
+        }
+        assert_eq!(
+            seen.len(),
+            servant::PALETTE.len(),
+            "two servants share a pane colour: {seen:?}"
         );
     }
 
