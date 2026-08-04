@@ -7,6 +7,7 @@ edition = "2021"
 # workspace -- building sauron must never perturb the host project's build.
 
 [dependencies]
+portable-pty = "0.9"
 # ratatui re-exports the crossterm version it was built against; depending on
 # it through ratatui::crossterm avoids the classic version-skew breakage.
 ratatui = "0.29"

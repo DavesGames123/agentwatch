@@ -1,0 +1,657 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{LABEL}} · sauron</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<!--
+  The web front end.
+
+  It is a real page, not a picture of a terminal. The board arrives as data and
+  is laid out here as HTML; the agents arrive as bytes and are drawn by xterm.js.
+  Nothing in this file re-derives anything sauron already decided: statuses,
+  relative times, servant names and servant colours all come over the wire
+  already computed, because a second implementation of any of them would drift
+  from the terminal board the first time either was tuned.
+-->
+<style>
+  :root {
+    --bg:        #0b0d11;
+    --panel:     #12151b;
+    --panel-2:   #171b22;
+    --line:      #232935;
+    --ink:       #e6eaf1;
+    --muted:     #8b93a3;
+    --faint:     #5b6273;
+
+    --errored:   #f05ac8;
+    --blocked:   #ff5c6e;
+    --ack:       #ffb042;
+    --needs-test:#e2ca60;
+    --working:   #56cde2;
+    --delegated: #968ceb;
+    --clear:     #7ec878;
+    --orc:       #7a9e4a;
+    --chrome:    #78aaff;
+    --flame:     #ff7a18;
+
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    --radius: 10px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 var(--ui);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  /* ---------- the bar ---------- */
+  #bar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px;
+    background: linear-gradient(180deg, #14181f, #0f1218);
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  #eye {
+    width: 22px; height: 22px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 50%, #2a0d05 0 22%, var(--flame) 23% 62%, #b84a10 63% 100%);
+    box-shadow: 0 0 12px rgba(255,122,24,.45);
+    flex: 0 0 auto;
+    transition: opacity .6s, box-shadow .6s;
+  }
+  #eye.lidded { opacity: .28; box-shadow: none; }
+  .repo { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+  .repo b { font-size: 15px; letter-spacing: .2px; }
+  .repo span { color: var(--faint); font: 11px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #tallies { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .tally {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    font: 500 12px var(--ui); white-space: nowrap;
+  }
+  .tally i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; font-style: normal; }
+  .tally.loud { font-weight: 650; }
+
+  /* ---------- tabs ---------- */
+  #tabs {
+    display: flex; align-items: stretch; gap: 2px;
+    padding: 0 10px; background: #0e1116;
+    border-bottom: 1px solid var(--line);
+    overflow-x: auto; scrollbar-width: thin;
+    flex: 0 0 auto;
+  }
+  .tab {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 14px; border: none; background: transparent;
+    color: var(--muted); font: 500 13px var(--ui); cursor: pointer;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+    max-width: 260px;
+  }
+  .tab:hover { color: var(--ink); background: #131820; }
+  .tab.on { color: var(--ink); background: var(--panel); border-bottom-color: var(--dot, var(--chrome)); }
+  .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--chrome)); flex: 0 0 auto; }
+  .tab .dot.pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .tab .label { overflow: hidden; text-overflow: ellipsis; }
+  .tab .x {
+    opacity: 0; margin-left: 2px; padding: 0 3px; border-radius: 4px;
+    color: var(--faint); font-size: 15px; line-height: 1;
+  }
+  .tab:hover .x { opacity: 1; }
+  .tab .x:hover { color: var(--blocked); background: #2a1a1e; }
+  .tab.dead .label { text-decoration: line-through; opacity: .55; }
+  #newtab { color: var(--faint); font-size: 17px; padding: 9px 13px; }
+  #newtab:hover { color: var(--ink); }
+
+  /* ---------- views ---------- */
+  main { flex: 1 1 auto; min-height: 0; position: relative; }
+  .view { position: absolute; inset: 0; }
+  .view[hidden] { display: none; }
+
+  /* ---------- the board ---------- */
+  #board { overflow-y: auto; padding: 20px 18px 40px; }
+  .band { margin-bottom: 26px; }
+  .band > h2 {
+    display: flex; align-items: center; gap: 10px;
+    margin: 0 0 12px; font: 600 11px/1 var(--ui);
+    letter-spacing: .1em; text-transform: uppercase; color: var(--c);
+  }
+  .band > h2::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--c), transparent); opacity: .35; }
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); }
+
+  .card {
+    position: relative; overflow: hidden;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px 16px 14px 18px;
+    transition: border-color .15s, transform .15s;
+  }
+  .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--servant, var(--faint)); }
+  .card:hover { border-color: #313a4a; }
+  .card.attention { border-color: color-mix(in srgb, var(--c) 45%, var(--line)); }
+  .card .top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .card .who { font: 600 12px var(--mono); color: var(--servant, var(--muted)); letter-spacing: .04em; }
+  .card .tag {
+    font: 600 10px var(--ui); letter-spacing: .08em; text-transform: uppercase;
+    color: var(--c); padding: 2px 7px; border-radius: 5px;
+    background: color-mix(in srgb, var(--c) 14%, transparent);
+  }
+  .card .when { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+  .card h3 { margin: 0 0 8px; font: 600 14px/1.35 var(--ui); }
+  .card .why { margin: 0 0 10px; font: 12.5px/1.5 var(--ui); color: var(--c); }
+  .card .said {
+    margin: 0 0 10px; padding-left: 10px; border-left: 2px solid var(--line);
+    font: 12.5px/1.5 var(--ui); color: var(--muted);
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .files { margin: 0 0 12px; padding: 0; list-style: none; font: 11.5px/1.7 var(--mono); }
+  .files li { display: flex; gap: 8px; color: #cfd6e2; }
+  .files li span { color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .files .more { color: var(--faint); }
+  .acts { display: flex; gap: 7px; flex-wrap: wrap; }
+  button.act {
+    padding: 5px 11px; border-radius: 7px; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--ink);
+    font: 500 12px var(--ui);
+  }
+  button.act:hover { background: #1e2430; border-color: #39424f; }
+  button.act.primary { background: color-mix(in srgb, var(--c) 18%, var(--panel-2)); border-color: color-mix(in srgb, var(--c) 45%, var(--line)); color: var(--c); }
+  button.act.primary:hover { background: color-mix(in srgb, var(--c) 28%, var(--panel-2)); }
+  button.act.quiet { color: var(--faint); }
+  button.act.quiet:hover { color: var(--ink); }
+
+  .empty { color: var(--faint); text-align: center; padding: 60px 20px; font-size: 13px; }
+  .empty b { display: block; color: var(--muted); font-size: 15px; margin-bottom: 6px; }
+  #boardfoot { display: flex; gap: 8px; justify-content: center; padding-top: 4px; }
+
+  /* ---------- terminals ---------- */
+  .term { position: absolute; inset: 0; padding: 8px 10px; background: #0a0c10; }
+  .term[hidden] { display: none; }
+  .xterm .xterm-viewport { background: transparent !important; }
+
+  /* ---------- menu + toast ---------- */
+  #menu {
+    position: absolute; z-index: 40; min-width: 220px; padding: 6px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: 0 14px 40px rgba(0,0,0,.5);
+  }
+  #menu[hidden] { display: none; }
+  #menu button {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 8px 10px; border: none; border-radius: 7px; cursor: pointer;
+    background: transparent; color: var(--ink); font: 13px var(--ui); text-align: left;
+  }
+  #menu button:hover { background: #232a36; }
+  #menu button small { margin-left: auto; color: var(--faint); font: 11px var(--mono); }
+  #menu hr { border: none; border-top: 1px solid var(--line); margin: 5px 2px; }
+  #menu .head { padding: 6px 10px 4px; color: var(--faint); font: 600 10px var(--ui); letter-spacing: .1em; text-transform: uppercase; }
+  #menu .scroll { max-height: 300px; overflow-y: auto; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%) translateY(10px);
+    padding: 9px 16px; border-radius: 9px; font: 500 13px var(--ui);
+    background: #1c2230; border: 1px solid var(--line); color: var(--ink);
+    opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 60;
+  }
+  #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.warn { border-color: #5a3a1c; background: #2a1c14; color: var(--ack); }
+  #toast.error { border-color: #5a2028; background: #2a1418; color: var(--blocked); }
+
+  #conn {
+    position: fixed; right: 14px; bottom: 14px; z-index: 60;
+    padding: 5px 12px; border-radius: 999px; font: 500 12px var(--ui);
+    background: #2a1c14; border: 1px solid #5a3a1c; color: var(--ack);
+  }
+  #conn[hidden] { display: none; }
+</style>
+
+<div id="app">
+  <header id="bar">
+    <div id="eye" title="the Eye"></div>
+    <div class="repo"><b id="repo">…</b><span id="path"></span></div>
+    <div id="tallies"></div>
+  </header>
+  <nav id="tabs"></nav>
+  <main>
+    <section id="board" class="view"></section>
+    <section id="terms" class="view" hidden></section>
+  </main>
+</div>
+<div id="menu" hidden></div>
+<div id="toast"></div>
+<div id="conn">connecting…</div>
+
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script>
+"use strict";
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const rgb = (c) => (c ? `rgb(${c[0]},${c[1]},${c[2]})` : "var(--faint)");
+
+  // ---- state ---------------------------------------------------------------
+  let ws = null, board = null, tabs = [], active = "board", stopped = false;
+  const terms = new Map();   // pane id -> { term, fit, wrap, attached }
+
+  // Status order and prose. The order is attention order, the same one the
+  // terminal board groups by -- it is a product decision, not a style, so the
+  // two front ends must not disagree about it.
+  const BANDS = [
+    ["errored",    "errored"],
+    ["blocked",    "waiting on you"],
+    ["ack",        "to acknowledge"],
+    ["needs-test", "to test"],
+    ["working",    "working"],
+    ["delegated",  "delegated"],
+    ["clear",      "clear"],
+  ];
+
+  // ---- talking to sauron ---------------------------------------------------
+  function send(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  }
+  function sendKeys(pane, data) {
+    if (!ws || ws.readyState !== 1) return;
+    const bytes = new TextEncoder().encode(data);
+    const frame = new Uint8Array(bytes.length + 1);
+    frame[0] = pane;
+    frame.set(bytes, 1);
+    ws.send(frame);
+  }
+
+  function toast(text, level) {
+    const t = $("toast");
+    t.textContent = text;
+    t.className = "on" + (level ? " " + level : "");
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => (t.className = ""), level === "error" ? 5000 : 2600);
+  }
+
+  // ---- the board -----------------------------------------------------------
+  function drawBar() {
+    if (!board) return;
+    $("repo").textContent = board.repo;
+    $("path").textContent = board.path;
+    document.title = `${board.repo} · sauron`;
+
+    const c = board.counts;
+    const busy = c.working + c.delegated;
+    // The Eye lids when nothing is running and nothing wants a human -- the
+    // same `World::repose` signal the terminal scene uses to change state.
+    const wants = c.errored + c.blocked + c.ack + c.needsTest;
+    $("eye").classList.toggle("lidded", busy === 0 && wants === 0);
+
+    const bar = $("tallies");
+    bar.replaceChildren();
+    const add = (key, n, word, loud) => {
+      if (!n) return;
+      const t = el("span", "tally" + (loud ? " loud" : ""));
+      t.style.color = `var(--${key})`;
+      t.append(el("i"), el("span", null, `${n} ${word}`));
+      t.querySelector("span:last-child").style.color = loud ? `var(--${key})` : "var(--ink)";
+      bar.append(t);
+    };
+    add("errored", c.errored, "errored", true);
+    add("blocked", c.blocked, "waiting on you", true);
+    add("ack", c.ack, "to acknowledge", true);
+    add("needs-test", c.needsTest, "to test", true);
+    add("working", c.working, "working");
+    add("delegated", c.delegated, "delegated");
+    add("clear", c.clear, "clear");
+    if (!bar.children.length) add("clear", 1, "all caught up");
+  }
+
+  function card(r) {
+    const open = tabs.some((t) => t.session === r.id);
+    const n = el("div", "card" + (["errored", "blocked", "ack", "needs-test"].includes(r.status) ? " attention" : ""));
+    n.style.setProperty("--c", `var(--${r.status})`);
+    n.style.setProperty("--servant", rgb(r.color));
+
+    const top = el("div", "top");
+    top.append(el("span", "who", r.orc ? `orc · ${r.servant}` : r.servant));
+    top.append(el("span", "tag", r.tag));
+    const when = el("span", "when", r.elapsed ? `${r.elapsed} · started ${r.startedAt}` : r.ago);
+    top.append(when);
+    n.append(top);
+
+    n.append(el("h3", null, r.name));
+    if (r.error) n.append(el("p", "why", r.error));
+    else if (r.blocked) n.append(el("p", "why", r.blocked));
+    if (r.prompt) n.append(el("p", "said", `“${r.prompt}”`));
+
+    if (r.pending && r.pending.length) {
+      const ul = el("ul", "files");
+      for (const f of r.pending.slice(0, 5)) {
+        const li = el("li");
+        li.append(el("code", null, f));
+        const prev = r.previews && r.previews[f];
+        if (prev && prev.length) li.append(el("span", null, prev[prev.length - 1]));
+        ul.append(li);
+      }
+      if (r.pending.length > 5) ul.append(el("li", "more", `… and ${r.pending.length - 5} more`));
+      n.append(ul);
+    } else if (r.edits) {
+      n.append(el("p", "said", `${r.edits} file${r.edits === 1 ? "" : "s"}, all acknowledged`));
+    }
+
+    const acts = el("div", "acts");
+    const act = (label, cls, fn) => {
+      const b = el("button", "act " + cls, label);
+      b.onclick = fn;
+      acts.append(b);
+      return b;
+    };
+    if (open) {
+      act("go to tab", "primary", () => show(tabs.find((t) => t.session === r.id).id));
+    } else {
+      act("open a terminal", "primary", () => send({ t: "open", kind: "agent", session: r.id, cols: 120, rows: 32 }));
+    }
+    if (r.status === "needs-test" || r.status === "ack" || r.status === "blocked" || r.status === "errored") {
+      act("acknowledge", "", () => send({ t: "ack", id: r.id }));
+    }
+    if (r.status === "clear" || r.status === "needs-test" || r.status === "ack") {
+      act("dismiss", "quiet", () => send({ t: "dismiss", id: r.id }));
+    }
+    act("copy resume", "quiet", () => copy(r.continueCmd));
+    n.append(acts);
+    return n;
+  }
+
+  function drawBoard() {
+    const host = $("board");
+    host.replaceChildren();
+    if (!board) return;
+
+    if (!board.rows.length) {
+      const e = el("div", "empty");
+      e.append(el("b", null, "nothing to attend to"));
+      e.append(el("div", null, "No agent sessions with repo edits yet. Open one with the + above."));
+      host.append(e);
+    }
+
+    for (const [key, word] of BANDS) {
+      const rows = board.rows.filter((r) => r.status === key);
+      if (!rows.length) continue;
+      const band = el("section", "band");
+      band.style.setProperty("--c", `var(--${key})`);
+      band.append(el("h2", null, `${rows.length} ${word}`));
+      const grid = el("div", "cards");
+      rows.forEach((r) => grid.append(card(r)));
+      band.append(grid);
+      host.append(band);
+    }
+
+    const foot = el("div", "", "");
+    foot.id = "boardfoot";
+    const t = (label, what) => {
+      const b = el("button", "act quiet", label);
+      b.onclick = () => send({ t: "toggle", what });
+      foot.append(b);
+    };
+    t(board.showClear ? "hide cleared sessions" : `show ${board.counts.clear} cleared`, "clear");
+    if (board.hiddenStale) t(`show ${board.hiddenStale} older`, "stale");
+    if (board.counts.needsTest + board.counts.ack > 1) {
+      const b = el("button", "act quiet", "acknowledge everything");
+      b.onclick = () => send({ t: "ackAll" });
+      foot.append(b);
+    }
+    host.append(foot);
+  }
+
+  // ---- tabs ----------------------------------------------------------------
+  function drawTabs() {
+    const nav = $("tabs");
+    nav.replaceChildren();
+
+    const b = el("button", "tab" + (active === "board" ? " on" : ""));
+    b.style.setProperty("--dot", "var(--chrome)");
+    b.append(el("span", "dot"), el("span", "label", "board"));
+    b.onclick = () => show("board");
+    nav.append(b);
+
+    for (const tab of tabs) {
+      const row = board && board.rows.find((r) => r.id === tab.session);
+      const t = el("button", "tab" + (active === tab.id ? " on" : "") + (tab.dead ? " dead" : ""));
+      t.style.setProperty("--dot", rgb(tab.color));
+      const dot = el("span", "dot" + (row && row.status === "working" ? " pulse" : ""));
+      t.append(dot, el("span", "label", tab.title));
+      const x = el("span", "x", "×");
+      x.title = "end this agent";
+      x.onclick = (e) => {
+        e.stopPropagation();
+        if (tab.dead || confirm(`End ${tab.title}? The agent is stopped for good.`)) {
+          send({ t: "close", pane: tab.id });
+        }
+      };
+      t.append(x);
+      t.onclick = () => show(tab.id);
+      nav.append(t);
+    }
+
+    const plus = el("button", "tab");
+    plus.id = "newtab";
+    plus.textContent = "+";
+    plus.title = "open something";
+    plus.onclick = (e) => openMenu(e.currentTarget);
+    nav.append(plus);
+  }
+
+  // ---- terminals -----------------------------------------------------------
+  function ensureTerm(id) {
+    let t = terms.get(id);
+    if (t) return t;
+    const wrap = el("div", "term");
+    wrap.hidden = true;
+    $("terms").append(wrap);
+    const term = new Terminal({
+      fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+      fontSize: 13,
+      lineHeight: 1.15,
+      cursorBlink: true,
+      scrollback: 8000,
+      allowProposedApi: true,
+      theme: {
+        background: "#0a0c10", foreground: "#e6eaf1", cursor: "#ff7a18",
+        selectionBackground: "#2a3446",
+        black: "#12151b", red: "#ff5c6e", green: "#7ec878", yellow: "#e2ca60",
+        blue: "#78aaff", magenta: "#f05ac8", cyan: "#56cde2", white: "#e6eaf1",
+        brightBlack: "#5b6273", brightRed: "#ff8a96", brightGreen: "#9fdc9a",
+        brightYellow: "#f0dd8a", brightBlue: "#9dc2ff", brightMagenta: "#f78ad9",
+        brightCyan: "#8fdeec", brightWhite: "#ffffff",
+      },
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(wrap);
+    term.onData((d) => sendKeys(id, d));
+    t = { term, fit, wrap, attached: false };
+    terms.set(id, t);
+    return t;
+  }
+
+  function fitTerm(id) {
+    const t = terms.get(id);
+    if (!t || t.wrap.hidden) return;
+    try { t.fit.fit(); } catch (_) { return; }
+    send({ t: "resize", pane: id, cols: t.term.cols, rows: t.term.rows });
+  }
+
+  function show(what) {
+    active = what;
+    const isBoard = what === "board";
+    $("board").hidden = !isBoard;
+    $("terms").hidden = isBoard;
+    for (const [id, t] of terms) t.wrap.hidden = isBoard || id !== what;
+    if (!isBoard) {
+      const t = ensureTerm(what);
+      t.wrap.hidden = false;
+      // Measure only once visible -- a hidden element has no size, and fitting
+      // against zero puts the pty at 1x1 and reflows the agent's TUI to nothing.
+      requestAnimationFrame(() => {
+        fitTerm(what);
+        if (!t.attached) {
+          t.attached = true;
+          send({ t: "attach", pane: what });
+        }
+        t.term.focus();
+      });
+    }
+    drawTabs();
+  }
+
+  // ---- the + menu ----------------------------------------------------------
+  function openMenu(anchor) {
+    const m = $("menu");
+    m.replaceChildren();
+    const item = (label, hint, fn) => {
+      const b = el("button");
+      b.append(el("span", null, label));
+      if (hint) b.append(el("small", null, hint));
+      b.onclick = () => { closeMenu(); fn(); };
+      m.append(b);
+    };
+    item("New agent", "claude", () => send({ t: "open", kind: "agent", cols: 120, rows: 32 }));
+    item("Shell at the repo", "$", () => send({ t: "open", kind: "shell", cols: 120, rows: 32 }));
+    m.append(el("hr"));
+    item("Loose an orc…", "cold files", () => send({ t: "survey" }));
+
+    const r = anchor.getBoundingClientRect();
+    m.hidden = false;
+    m.style.left = Math.min(r.left, window.innerWidth - m.offsetWidth - 12) + "px";
+    m.style.top = r.bottom + 4 + "px";
+    setTimeout(() => document.addEventListener("mousedown", onAway), 0);
+  }
+  function onAway(e) { if (!$("menu").contains(e.target)) closeMenu(); }
+  function closeMenu() {
+    $("menu").hidden = true;
+    document.removeEventListener("mousedown", onAway);
+  }
+
+  function showSurvey(msg) {
+    const m = $("menu");
+    m.replaceChildren();
+    m.append(el("div", "head", `cold files · ${msg.hot} hot, ${msg.dirty} dirty excluded`));
+    if (!msg.cold.length) {
+      m.append(el("div", "head", "nothing safe to loose an orc on"));
+    }
+    const scroll = el("div", "scroll");
+    for (const f of msg.cold) {
+      const b = el("button");
+      b.append(el("span", null, f));
+      b.onclick = () => { closeMenu(); send({ t: "open", kind: "orc", target: f, cols: 120, rows: 32 }); };
+      scroll.append(b);
+    }
+    m.append(scroll);
+    m.hidden = false;
+    setTimeout(() => document.addEventListener("mousedown", onAway), 0);
+  }
+
+  // ---- clipboard -----------------------------------------------------------
+  function copy(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(() => toast("copied"), () => prompt("Copy this:", text));
+    } else {
+      prompt("Copy this:", text);
+    }
+  }
+
+  // ---- the socket ----------------------------------------------------------
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => { $("conn").hidden = true; };
+    ws.onclose = () => {
+      if (stopped) return;
+      $("conn").hidden = false;
+      $("conn").textContent = "reconnecting…";
+      setTimeout(connect, 900);
+    };
+    ws.onmessage = (e) => {
+      if (typeof e.data !== "string") {
+        // Pty output: pane index, then the bytes exactly as the fd gave them.
+        const buf = new Uint8Array(e.data);
+        const t = terms.get(buf[0]);
+        if (t) t.term.write(buf.subarray(1));
+        return;
+      }
+      const m = JSON.parse(e.data);
+      switch (m.t) {
+        case "board":
+          board = m;
+          drawBar(); drawBoard(); drawTabs();
+          break;
+        case "tabs": {
+          const had = new Set(tabs.map((t) => t.id));
+          tabs = m.tabs;
+          // A tab that went away takes its terminal with it.
+          for (const [id, t] of [...terms]) {
+            if (!tabs.some((x) => x.id === id)) { t.term.dispose(); t.wrap.remove(); terms.delete(id); }
+          }
+          if (!tabs.some((t) => t.id === active) && active !== "board") show("board");
+          else drawTabs();
+          // Land on a tab the moment it is the first one to exist, so opening
+          // an agent from the board takes you to it rather than leaving you
+          // looking at the card you just clicked.
+          const fresh = tabs.find((t) => !had.has(t.id));
+          if (fresh && had.size === 0) show(fresh.id);
+          break;
+        }
+        case "opened": show(m.pane); break;
+        case "replay": {
+          // Everything that follows is the scrollback, not new output.
+          const t = terms.get(m.pane);
+          if (t) t.term.reset();
+          break;
+        }
+        case "exit": {
+          const t = terms.get(m.pane);
+          if (t) t.term.write("\r\n\x1b[2m— the agent exited. × on the tab to close it. —\x1b[0m\r\n");
+          break;
+        }
+        case "survey": showSurvey(m); break;
+        case "notice": toast(m.text, m.level); break;
+        case "bye":
+          stopped = true;
+          ws.close();
+          $("conn").hidden = false;
+          $("conn").textContent = "sauron has stopped";
+          break;
+      }
+    };
+  }
+
+  // ---- wiring --------------------------------------------------------------
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { if (active !== "board") fitTerm(active); }, 90);
+  });
+
+  document.addEventListener("keydown", (e) => {
+    // Terminals own the keyboard while one is showing; only the tab-switching
+    // chords are taken, and they are the ones a browser gives to tabs anyway.
+    if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "9") {
+      const i = Number(e.key) - 1;
+      const target = i === 0 ? "board" : tabs[i - 1] && tabs[i - 1].id;
+      if (target !== undefined) { e.preventDefault(); show(target); }
+    }
+    if (e.key === "Escape") closeMenu();
+  });
+
+  connect();
+  show("board");
+})();
+</script>

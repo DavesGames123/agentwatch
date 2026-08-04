@@ -30,14 +30,13 @@
 //! rather than stubbed -- see `plat`'s header for why an empty impl would be the
 //! worse failure -- and the subcommands that reach them say so.
 //!
-//! WHERE THE BOARD IS DRAWN
-//! ------------------------
-//! `plat` abstracts the operating system. `host` abstracts something one level
-//! up: the *front end*, and what it can be asked for. There are two, and they
-//! share every line of drawing code -- `sauron` renders into the terminal it was
-//! launched from, `sauron serve` renders into a browser tab via `web`. The
-//! second is a backend swap, not a second UI; see `web`'s header for what that
-//! buys and the one thing it costs.
+//! WHERE THE AGENTS RUN
+//! --------------------
+//! `workspace` opens agents as iTerm2 panes and then has no further relationship
+//! with them. `web` opens them as pseudo-terminals this process owns, and serves
+//! a browser that is the terminal on the end of them -- so the same agents can
+//! be run and watched with no terminal emulator and no macOS at all. Both drive
+//! the same `board`; neither re-derives what a session's state is.
 //!
 //! grep targets:
 //!   mod beacon      -- publishing the board where a watched project can read it
@@ -47,6 +46,7 @@
 //!   mod scan        -- incremental log tailer
 //!   mod servant     -- which servant a session is: its name and its colour
 //!   mod store       -- ack persistence, safe against concurrent writers
+//!   mod web         -- the board as a web app, with the agents running inside it
 //!   mod gui         -- docking a project's own app window into the workspace [macOS]
 //!   mod mirror      -- drawing that window *inside* a pane, frame by frame [macOS]
 
@@ -72,6 +72,7 @@ pub mod servant;
 pub mod scene;
 pub mod store;
 pub mod ui;
+pub mod web;
 pub mod workspace;
 
 pub use board::{git_root, hot_files, in_flight_tasks, Board, Row};

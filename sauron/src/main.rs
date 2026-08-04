@@ -8,6 +8,13 @@
 //! Usage:
 //!   sauron                  # watch the repo containing the cwd
 //!   sauron /path/to/repo    # watch a specific repo
+//!   sauron serve            # the board as a web app, agents running inside it
+//!
+//! `serve` is not this file's business past the dispatch below: it does not use
+//! `App`, it does not draw, and it owns the process once it is called. The two
+//! front ends share `board::Board` and nothing else, which is the split that
+//! lets one be a terminal and the other be a web application instead of forcing
+//! either to pretend to be the other. See `web`'s header.
 //!
 //! The watching itself lives in the library (`board::Board`), shared with the
 //! `muthur` multi-project front end; this file is the terminal around it.
@@ -34,7 +41,7 @@ use sauron::model::{self, now_ms, Status};
 use sauron::plat;
 #[cfg(unix)]
 use sauron::{gui, reply};
-use sauron::{beacon, clip, git_root, handoff, orc, panel, ui, workspace};
+use sauron::{beacon, clip, git_root, handoff, orc, panel, ui, web, workspace};
 
 /// How often the logs are re-tailed. Only appended bytes are parsed, so this is
 /// cheap even with 10MB session files.
@@ -48,6 +55,15 @@ const FRAME: Duration = Duration::from_millis(100);
 /// the first screenful or two is noise -- and the cap keeps the per-frame copy of
 /// it into the view cheap on a repository with thousands of source files.
 const PICK_LIMIT: usize = 40;
+/// The port `sauron serve` binds, on loopback.
+///
+/// Loopback is the default and not a suggestion. `serve` runs agents and shells
+/// on this machine on behalf of whoever is holding the page, so an open port is
+/// an open shell -- see the warning at the `--bind` site.
+const DEFAULT_PORT: u16 = 7373;
+/// How many in-flight sessions `serve` reopens as tabs when it starts, unless
+/// `--agents` says otherwise. Matches what a `sauron workspace` launch does.
+const DEFAULT_AGENTS: usize = 4;
 
 /// The TUI's state: a `Board` plus everything about *this window* -- where the
 /// cursor is, which banners are still up, where the last frame drew its rows.
@@ -484,7 +500,7 @@ use sauron::plat::base64;
 use sauron::route;
 
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     // The clipboard is available both as `sauron clip ...` and as the
     // standalone `clip` binary. Keep it before the watcher argument grammar.
@@ -573,6 +589,27 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // `sauron serve` -- the board as a web application, with the agents running
+    // as ptys this process owns. Taken out of `args` here (flags and values
+    // both) so the repo-path rule further down -- "the first argument that is
+    // not a flag" -- cannot resolve to `serve` or to a port number.
+    let serve = args.first().map(|s| s.as_str()) == Some("serve");
+    if serve {
+        args.remove(0);
+    }
+    let port: u16 = take_flag(&mut args, "--port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let bind = take_flag(&mut args, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
+    // How many already-running sessions to reopen as tabs at launch, the way
+    // `sauron workspace` reopens them as panes. Capped rather than unbounded: a
+    // repo with thirty historical sessions must not spawn thirty agents because
+    // someone opened a browser.
+    let agents: usize = take_flag(&mut args, "--agents")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_AGENTS)
+        .min(12);
+
     let once = args.iter().any(|a| a == "--once");
     let baseline = args.iter().any(|a| a == "--baseline");
     let list_working = args.iter().any(|a| a == "--list-working");
@@ -583,6 +620,21 @@ fn main() -> std::io::Result<()> {
     };
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     let agent = Agent::select(explicit_agent, &repo_root);
+
+    // The web front end owns the process from here: no `App`, no terminal, no
+    // event loop to come back to.
+    if serve {
+        if bind != "127.0.0.1" && bind != "localhost" {
+            // Not a refusal -- `--bind` was typed on purpose. But this now hands
+            // out live shells on this machine, not just a view of a board, so
+            // the person who typed it is told once, in the words that matter.
+            eprintln!(
+                "sauron: bound to {bind} with no authentication — anyone who can reach this \
+                 port can run commands on this machine as you."
+            );
+        }
+        return web::serve(repo_root, agent, (bind.as_str(), port), agents);
+    }
 
     let mut app = App::new(repo_root, agent);
 
@@ -907,6 +959,22 @@ fn print_once(app: &App) {
         }
         println!();
     }
+}
+
+/// `--port 7373`, `--port=7373`, or nothing -- and the flag *and its value* come
+/// out of `args` on the way.
+///
+/// Removing them is the point. The repo path is found as "the first argument
+/// that does not start with `--`", and a port left in the vector is exactly
+/// that: sauron would go looking for a repo called `7373`.
+fn take_flag(args: &mut Vec<String>, name: &str) -> Option<String> {
+    if let Some(i) = args.iter().position(|a| a == name) {
+        args.remove(i);
+        return (i < args.len() && !args[i].starts_with("--")).then(|| args.remove(i));
+    }
+    let prefix = format!("{name}=");
+    let i = args.iter().position(|a| a.starts_with(&prefix))?;
+    Some(args.remove(i)[prefix.len()..].to_string())
 }
 
 /// Modification time of this process's own executable, following a symlink to
