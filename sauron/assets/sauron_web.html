@@ -99,14 +99,22 @@
   .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--chrome)); flex: 0 0 auto; }
   .tab .dot.pulse { animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
-  .tab .label { overflow: hidden; text-overflow: ellipsis; }
+  /* Same underline as the board card, for the same reason -- a tab and a card
+     are two handles on one servant, so they carry one mark. */
+  .tab .label {
+    overflow: hidden; text-overflow: ellipsis;
+    text-decoration: underline;
+    text-decoration-color: var(--dot, transparent);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 4px;
+  }
   .tab .x {
     opacity: 0; margin-left: 2px; padding: 0 3px; border-radius: 4px;
     color: var(--faint); font-size: 15px; line-height: 1;
   }
   .tab:hover .x { opacity: 1; }
   .tab .x:hover { color: var(--blocked); background: #2a1a1e; }
-  .tab.dead .label { text-decoration: line-through; opacity: .55; }
+  .tab.dead .label { text-decoration: underline line-through; opacity: .55; }
   #newtab { color: var(--faint); font-size: 17px; padding: 9px 13px; }
   #newtab:hover { color: var(--ink); }
 
@@ -143,7 +151,18 @@
     background: color-mix(in srgb, var(--c) 14%, transparent);
   }
   .card .when { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
-  .card h3 { margin: 0 0 8px; font: 600 14px/1.35 var(--ui); }
+  /* The name is underlined in the servant's colour, exactly as the terminal
+     board draws it (`ui.rs`, `fn card`). It is an underline and not the text
+     colour because the text colour is spoken for: the card says whether this
+     needs you, and the line under the name says which servant it is. That line
+     is the join between a row here and the panel running it. */
+  .card h3 {
+    margin: 0 0 8px; font: 600 14px/1.35 var(--ui);
+    text-decoration: underline;
+    text-decoration-color: var(--servant, transparent);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 4px;
+  }
   .card .why { margin: 0 0 10px; font: 12.5px/1.5 var(--ui); color: var(--c); }
   .card .said {
     margin: 0 0 10px; padding-left: 10px; border-left: 2px solid var(--line);
@@ -171,8 +190,31 @@
   #boardfoot { display: flex; gap: 8px; justify-content: center; padding-top: 4px; }
 
   /* ---------- terminals ---------- */
-  .term { position: absolute; inset: 0; padding: 8px 10px; background: #0a0c10; }
+  /* A panel wears its servant's colour, because the panel is the one surface
+     you look at for minutes at a time. `--servant` is set per panel from the
+     tab's colour, which is the board row's colour, which is the iTerm pane's --
+     one number out of `servant.rs` that nothing here re-derives.
+     The rule at the top is the colour at full strength; the body is the same
+     colour at a tenth, which names the panel without making the agent's output
+     harder to read. */
+  .term {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    background: color-mix(in srgb, var(--servant, #88909c) 7%, #0a0c10);
+    border-top: 2px solid var(--servant, var(--chrome));
+  }
   .term[hidden] { display: none; }
+  .term > header {
+    display: flex; align-items: center; gap: 9px; flex: 0 0 auto;
+    padding: 6px 12px;
+    background: color-mix(in srgb, var(--servant, #88909c) 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--servant, #88909c) 28%, transparent);
+    font: 600 12px var(--mono); letter-spacing: .04em;
+    color: var(--servant, var(--muted));
+  }
+  .term > header i { width: 9px; height: 9px; border-radius: 50%; background: currentColor; font-style: normal; }
+  .term > header small { margin-left: auto; color: var(--faint); font: 11px var(--mono); letter-spacing: 0; }
+  .term > .screen { flex: 1 1 auto; min-height: 0; padding: 8px 10px; }
   .xterm .xterm-viewport { background: transparent !important; }
 
   /* ---------- menu + toast ---------- */
@@ -239,7 +281,24 @@
     if (text !== undefined) n.textContent = text;
     return n;
   };
-  const rgb = (c) => (c ? `rgb(${c[0]},${c[1]},${c[2]})` : "var(--faint)");
+  // A pane with no session -- a shell, an orc -- has no servant colour, because
+  // the board cannot colour that row either. Grey is the honest answer, and it
+  // is a real colour rather than `var(--faint)` so the same value can go to
+  // xterm.js, which parses colours itself and knows nothing about our CSS.
+  const GREY = [136, 144, 156];
+  const rgb = (c) => `rgb(${(c || GREY).join(",")})`;
+
+  // The panel body under the tint. Kept as numbers because xterm.js wants a hex
+  // string and CSS wants `color-mix`, and both have to land on the same colour
+  // or the terminal sits in a rectangle of a different shade to its own panel.
+  const PANEL_BASE = [10, 12, 16];
+  const blend = (c, amount) => {
+    const hex = (i) => {
+      const v = Math.round(PANEL_BASE[i] + ((c || GREY)[i] - PANEL_BASE[i]) * amount);
+      return v.toString(16).padStart(2, "0");
+    };
+    return `#${hex(0)}${hex(1)}${hex(2)}`;
+  };
 
   // ---- state ---------------------------------------------------------------
   let ws = null, board = null, tabs = [], active = "board", stopped = false;
@@ -449,12 +508,47 @@
   }
 
   // ---- terminals -----------------------------------------------------------
+  // The ANSI palette, which is the same in every panel: it is what the agent's
+  // own output means by "red", and a per-panel version of it would recolour the
+  // agent's diffs rather than the panel. Only the three colours the *panel*
+  // owns -- background, cursor, selection -- are servant-coloured, in `theme`.
+  const ANSI = {
+    foreground: "#e6eaf1",
+    black: "#12151b", red: "#ff5c6e", green: "#7ec878", yellow: "#e2ca60",
+    blue: "#78aaff", magenta: "#f05ac8", cyan: "#56cde2", white: "#e6eaf1",
+    brightBlack: "#5b6273", brightRed: "#ff8a96", brightGreen: "#9fdc9a",
+    brightYellow: "#f0dd8a", brightBlue: "#9dc2ff", brightMagenta: "#f78ad9",
+    brightCyan: "#8fdeec", brightWhite: "#ffffff",
+  };
+  const theme = (c) => ({
+    ...ANSI,
+    background: blend(c, 0.07),
+    cursor: rgb(c),
+    selectionBackground: blend(c, 0.3),
+  });
+
+  const tabOf = (id) => tabs.find((t) => t.id === id);
+
   function ensureTerm(id) {
     let t = terms.get(id);
     if (t) return t;
+    const tab = tabOf(id);
+    const colour = tab && tab.color;
+
     const wrap = el("div", "term");
     wrap.hidden = true;
+    // The panel says who it is in words as well as in colour. The colour tells
+    // you at a glance which of eight panels this is; the name is what you type
+    // when you talk about it, and it is the name the agent itself was launched
+    // under (`--name`, see `agent.rs`).
+    const head = el("header");
+    const who = el("span", "who");
+    const sub = el("small");
+    head.append(el("i"), who, sub);
+    const screen = el("div", "screen");
+    wrap.append(head, screen);
     $("terms").append(wrap);
+
     const term = new Terminal({
       fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
       fontSize: 13,
@@ -462,23 +556,43 @@
       cursorBlink: true,
       scrollback: 8000,
       allowProposedApi: true,
-      theme: {
-        background: "#0a0c10", foreground: "#e6eaf1", cursor: "#ff7a18",
-        selectionBackground: "#2a3446",
-        black: "#12151b", red: "#ff5c6e", green: "#7ec878", yellow: "#e2ca60",
-        blue: "#78aaff", magenta: "#f05ac8", cyan: "#56cde2", white: "#e6eaf1",
-        brightBlack: "#5b6273", brightRed: "#ff8a96", brightGreen: "#9fdc9a",
-        brightYellow: "#f0dd8a", brightBlue: "#9dc2ff", brightMagenta: "#f78ad9",
-        brightCyan: "#8fdeec", brightWhite: "#ffffff",
-      },
+      theme: theme(colour),
     });
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
-    term.open(wrap);
+    // Into the screen, not the panel: the header is a sibling of the terminal,
+    // so the fit addon measures the space left over rather than the whole panel
+    // and running the height of the header off the bottom.
+    term.open(screen);
     term.onData((d) => sendKeys(id, d));
-    t = { term, fit, wrap, attached: false };
+    t = { term, fit, wrap, screen, who, sub, attached: false, painted: null };
     terms.set(id, t);
+    paintTerm(id);
     return t;
+  }
+
+  // Put the servant's colour and name on a panel.
+  //
+  // Separate from `ensureTerm` because a panel can outlive the tab data it was
+  // built from: `opened` may reach a client before the `tabs` message that
+  // describes the new tab, and a panel that opened grey would stay grey for the
+  // life of the session. Idempotent, so every tabs message can call it.
+  function paintTerm(id) {
+    const t = terms.get(id);
+    if (!t) return;
+    const tab = tabOf(id);
+    const colour = tab && tab.color;
+    const mark = `${(colour || GREY).join(",")}|${tab ? tab.title : ""}`;
+    if (t.painted === mark) return;
+    t.painted = mark;
+
+    t.wrap.style.setProperty("--servant", rgb(colour));
+    t.who.textContent = tab ? tab.title : "";
+    t.sub.textContent = tab && tab.session ? tab.session.slice(0, 8) : tab ? tab.kind : "";
+    // xterm.js owns its own canvas, so the tint has to be handed to it as well
+    // as set in CSS. Guarded: an older build without the options setter must
+    // cost the panel its cursor colour, not its whole terminal.
+    try { t.term.options.theme = theme(colour); } catch (_) {}
   }
 
   function fitTerm(id) {
@@ -600,6 +714,8 @@
           for (const [id, t] of [...terms]) {
             if (!tabs.some((x) => x.id === id)) { t.term.dispose(); t.wrap.remove(); terms.delete(id); }
           }
+          // A panel built before its tab was described catches its colour here.
+          for (const id of terms.keys()) paintTerm(id);
           if (!tabs.some((t) => t.id === active) && active !== "board") show("board");
           else drawTabs();
           // Land on a tab the moment it is the first one to exist, so opening

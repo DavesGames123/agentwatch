@@ -42,7 +42,10 @@ const made = [];
 const node = (tag = "div") => {
   const n = {
     tagName: tag, className: "", id: "", textContent: "", hidden: false, title: "",
-    children: [], style: { setProperty() {} },
+    // Custom properties are recorded rather than dropped: the servant colour
+    // reaches the screen only as `--servant` and `--dot`, so a stub that
+    // swallows them cannot tell a coloured board from a grey one.
+    children: [], style: { props: {}, setProperty(k, v) { this.props[k] = v; } },
     classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
     append(...c) { this.children.push(...c); },
     replaceChildren(...c) { this.children = c; },
@@ -71,7 +74,12 @@ globalThis.location = { host: "127.0.0.1:7409" };
 globalThis.window = { innerWidth: 1440, innerHeight: 900, isSecureContext: true, addEventListener() {} };
 globalThis.requestAnimationFrame = (cb) => cb();
 Object.defineProperty(globalThis, "navigator", { value: { clipboard: {} }, configurable: true });
-globalThis.Terminal = class { constructor() {} loadAddon() {} open() {} onData() {} write() {} focus() {} reset() {} dispose() {} get cols(){return 80} get rows(){return 24} };
+const spawned = [];
+globalThis.Terminal = class {
+  constructor(opts) { this.options = { ...opts }; spawned.push(this); }
+  loadAddon() {} open(el) { this.host = el; } onData() {} write() {} focus() {} reset() {} dispose() {}
+  get cols(){return 80} get rows(){return 24}
+};
 globalThis.FitAddon = { FitAddon: class { fit() {} } };
 const sockets = [];
 globalThis.WebSocket = class {
@@ -110,9 +118,42 @@ check("every card carries actions you can click", cards.length > 0 && cards.ever
 check("the tab strip drew the board tab and the +", byId.tabs.children.length >= 2);
 check("cards are grouped into attention bands, not one flat list", bands.length >= 1);
 
-try { sock.fire("message", { data: JSON.stringify({ t: "tabs", tabs: [{ id: 1, title: "gimli", kind: "agent", session: "x", color: [205,165,255], dead: false }] }) });
+// --- the servant colour, from the wire to the screen ----------------------
+// The colour is a pure function of the session id (`servant.rs`) and is sent
+// with every row and every tab. It is worth nothing until something is painted
+// with it, and every one of these has been silently missing at some point.
+check("each card carries its servant colour", cards.length > 0 && cards.every((c) => {
+  const set = c.style.props["--servant"];
+  return set && /^rgb\(\d+,\d+,\d+\)$/.test(set);
+}), `--servant on the cards: ${cards.map((c) => c.style.props["--servant"]).join(" ")}`);
+check("a card's colour is the one sauron sent for that row", cards.every((c, i) =>
+  c.style.props["--servant"] === `rgb(${parsed.rows[i].color.join(",")})`));
+
+const TAB = { id: 1, title: "gimli", kind: "agent", session: "x8f21ba0c", color: [205, 165, 255], dead: false };
+const PURPLE = `rgb(${TAB.color.join(",")})`;
+try { sock.fire("message", { data: JSON.stringify({ t: "tabs", tabs: [TAB] }) });
   check("a tab message renders a tab", byId.tabs.children.length >= 3); }
 catch (e) { check("a tab message renders a tab", false, e.message); }
+
+const tabNode = byId.tabs.children.find((t) => t.style.props["--dot"] === PURPLE);
+check("the tab strip paints the tab in its servant colour", !!tabNode,
+  `--dot values: ${byId.tabs.children.map((t) => t.style.props["--dot"]).join(" ")}`);
+
+// Opening the panel is what the user does after clicking a tab, and the panel
+// is the surface they then stare at for an hour. It has to be the same colour.
+sock.fire("message", { data: JSON.stringify({ t: "opened", pane: TAB.id }) });
+const panel = byId.terms.children.find((n) => n.className === "term");
+check("opening a pane builds a panel", !!panel);
+check("the panel is tinted with its servant colour", !!panel && panel.style.props["--servant"] === PURPLE,
+  panel && `--servant is ${panel.style.props["--servant"]}`);
+check("the panel names its servant in its header", !!panel &&
+  panel.children.some((h) => h.tagName === "header" && h.children.some((k) => k.textContent === TAB.title)));
+const term = spawned[spawned.length - 1];
+check("the terminal's own cursor is the servant colour", !!term && term.options.theme.cursor === PURPLE,
+  term && `cursor is ${term.options.theme && term.options.theme.cursor}`);
+check("the terminal's background is tinted, not the flat panel black", !!term &&
+  term.options.theme.background !== "#0a0c10" && /^#[0-9a-f]{6}$/.test(term.options.theme.background),
+  term && `background is ${term.options.theme.background}`);
 
 console.log(failed ? `\n${failed} failed` : "\nall good");
 process.exit(failed ? 1 : 0);
