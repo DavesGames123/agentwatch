@@ -228,9 +228,18 @@ pub fn serve<A: ToSocketAddrs>(
             }
         }
 
+        let mut ids: Vec<String> = Vec::new();
         if let Ok(mut b) = state.board.lock() {
             b.resync();
             let _ = crate::beacon::publish(&b);
+            ids = b.rows.iter().map(|r| r.id.clone()).collect();
+        }
+        // A tab whose agent would not take a minted session id learns what it
+        // became here, from a session on the board that was not there before it
+        // opened. Before the broadcast, so the tab strip that goes out this tick
+        // already carries the name and the colour.
+        if let Ok(mut w) = state.workspace.lock() {
+            w.adopt(&ids);
         }
         state.broadcast();
 

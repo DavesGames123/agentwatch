@@ -15,6 +15,23 @@
 //! tick later. Without it the newest tab -- the one you just opened and are most
 //! likely to be looking for -- would be the only grey one.
 //!
+//! WHAT HAPPENS WHEN THE AGENT WILL NOT TAKE THE ID
+//! -----------------------------------------------
+//! Codex has no `--session-id`: `Agent::fresh_cmd` drops the minted id on the
+//! floor and returns a bare `codex`, and Codex then invents an id of its own.
+//! The tab used to record the minted id anyway. That was a lie with
+//! consequences -- the tab was coloured and named after a session that would
+//! never exist, `open_sessions` reported it as open so the board offered to open
+//! the real one again, and nothing the agent actually did could ever reach the
+//! tab claiming to be it.
+//!
+//! A tab now claims a session only when the built command carries the id, which
+//! is asked of the command itself rather than of a table that could drift from
+//! `fresh_cmd`. A tab that claims none opens grey, labelled with the agent's own
+//! word, and waits. `adopt` binds it on a later tick to the session that
+//! appeared because of it -- see that function for how a new session is told
+//! from one that was already there.
+//!
 //! WHY EVERY PANE GOES THROUGH A LOGIN *INTERACTIVE* SHELL
 //! -------------------------------------------------------
 //! `claude` and `codex` are usually installed by a version manager -- nvm, fnm,
@@ -44,9 +61,12 @@
 //!   fn open_shell      -- a plain shell at the repo root
 //!   fn close           -- end a tab and the agent in it
 //!   fn json            -- the tab strip, for the page
+//!   fn adopt           -- bind a waiting tab to the session it started
+//!   fn adoptable       -- which ids are new *and* unclaimed, the pure part
 //!   fn shell_argv      -- the flags, per shell, and the `exec` prefix
 //!   fn rc_flags        -- which shells are known to accept `-l` and `-i`
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,9 +99,13 @@ pub struct Pane {
     pub id: u8,
     pub title: String,
     pub kind: Kind,
-    /// The agent session this tab is, when it is one. `None` for a shell.
-    /// Present from launch for agent tabs -- see the module header on minting.
+    /// The agent session this tab is, when it is one and it is known. `None` for
+    /// a shell, and `None` for an agent tab that has not been bound yet -- see
+    /// the module header and `adopt`.
     pub session: Option<String>,
+    /// Set on an agent tab launched without a session id, and cleared by
+    /// `adopt`. A shell or an orc never carries it: neither is a session.
+    awaiting_session: bool,
     pub pty: Pty,
 }
 
@@ -93,6 +117,13 @@ pub struct Workspace {
     /// Monotonic. Ids are never reused, because a page holding a stale id for a
     /// tab that closed must miss, not land on whatever opened next.
     next: u8,
+    /// Every session id the board has ever shown this process. `adopt` reads it
+    /// to tell a session that appeared from one that was already there.
+    seen: HashSet<String>,
+    /// False until `adopt` has been called once. The first call only records
+    /// what already exists; without that, every session on the board at startup
+    /// would look new and the first waiting tab would take someone else's.
+    primed: bool,
 }
 
 impl Workspace {
@@ -103,6 +134,8 @@ impl Workspace {
             clients,
             panes: Vec::new(),
             next: 1,
+            seen: HashSet::new(),
+            primed: false,
         }
     }
 
@@ -130,27 +163,78 @@ impl Workspace {
         // Exactly `workspace::left_commands`' shape. Any divergence here would
         // mean a browser-launched agent behaving unlike an iTerm-launched one,
         // which is the failure this whole module exists to avoid.
-        let (id, cmd) = match session {
+        let (session, cmd) = match session {
             Some(id) => {
                 let cmd = format!(
                     "{}{}",
                     self.agent.resume_cmd(&id),
                     self.agent.name_flag(servant::name_for(&id))
                 );
-                (id, cmd)
+                (Some(id), cmd)
             }
             None => {
-                let id = servant::mint_session_id();
+                let minted = servant::mint_session_id();
                 let cmd = format!(
                     "{}{}",
-                    self.agent.fresh_cmd(&id),
-                    self.agent.name_flag(servant::name_for(&id))
+                    self.agent.fresh_cmd(&minted),
+                    self.agent.name_flag(servant::name_for(&minted))
                 );
-                (id, cmd)
+                // Whether the agent took the id is asked of the command, not of
+                // a list of which agents do. `fresh_cmd` is the only thing that
+                // decides, and a second statement of the same fact is one edit
+                // away from contradicting it.
+                (cmd.contains(&minted).then_some(minted), cmd)
             }
         };
-        let title = servant::name_for(&id).to_string();
-        self.spawn(Kind::Agent, title, Some(id), &cmd, cols, rows)
+        let title = match &session {
+            Some(id) => servant::name_for(id).to_string(),
+            // No id means no servant name yet. The agent's own word is a
+            // truthful label for a tab whose session is not known; `adopt`
+            // replaces it with the servant's name once it is.
+            None => self.agent.label().to_string(),
+        };
+        let awaiting = session.is_none();
+        let pane = self.spawn(Kind::Agent, title, session, &cmd, cols, rows)?;
+        if awaiting {
+            if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane) {
+                p.awaiting_session = true;
+            }
+        }
+        Ok(pane)
+    }
+
+    /// Bind each waiting tab to the session that appeared because of it.
+    ///
+    /// Called on the board's tick with every session id the board now shows. A
+    /// waiting tab is one whose agent would not take a minted id (Codex), so the
+    /// only way to learn what it became is to watch for a session that was not
+    /// there before it opened. `seen` is what "before" means -- a session
+    /// already on the board when the tab opened is not a candidate, however
+    /// recently it ran.
+    ///
+    /// Two known wrong answers, both preferred to the alternative of never
+    /// binding at all. A session started outside this workspace -- an iTerm pane
+    /// or a bare shell in the same repo -- while a tab is waiting will be
+    /// adopted by that tab. And two tabs waiting when two sessions appear on the
+    /// same tick may be bound the wrong way round, since nothing here can tell
+    /// which pty produced which rollout. Both cost a name and a colour; neither
+    /// sends anything to the wrong agent, because a tab writes to its own pty
+    /// and never addresses an agent by session id.
+    pub fn adopt(&mut self, ids: &[String]) {
+        if !self.primed {
+            self.primed = true;
+            self.seen.extend(ids.iter().cloned());
+            return;
+        }
+        let claimed: HashSet<String> = self.panes.iter().filter_map(|p| p.session.clone()).collect();
+        let mut queue = adoptable(ids, &self.seen, &claimed).into_iter();
+        for p in self.panes.iter_mut().filter(|p| p.awaiting_session) {
+            let Some(id) = queue.next() else { break };
+            p.title = servant::name_for(&id).to_string();
+            p.session = Some(id);
+            p.awaiting_session = false;
+        }
+        self.seen.extend(ids.iter().cloned());
     }
 
     /// Stage an orc on one cold file. Staged, not run: the tab opens holding the
@@ -207,6 +291,7 @@ impl Workspace {
             title,
             kind,
             session,
+            awaiting_session: false,
             pty,
         });
         Ok(id)
@@ -258,6 +343,25 @@ impl Workspace {
             .collect();
         format!("{{\"t\":\"tabs\",\"tabs\":[{}]}}", tabs.join(","))
     }
+}
+
+/// The ids a waiting tab may be bound to: on the board now, not on it before,
+/// and not already another tab's.
+///
+/// Split out of `adopt` because it is the whole of the decision and none of the
+/// state -- a `Workspace` cannot be built in a test without opening real
+/// pseudo-terminals, and the rule is worth testing more than the plumbing is.
+///
+/// Sorted, so two tabs waiting on the same tick are bound in an order that does
+/// not depend on how a `HashSet` happened to iterate.
+fn adoptable(ids: &[String], seen: &HashSet<String>, claimed: &HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .iter()
+        .filter(|id| !seen.contains(*id) && !claimed.contains(*id))
+        .cloned()
+        .collect();
+    out.sort();
+    out
 }
 
 /// The user's shell, or a sane default. `$SHELL` is what iTerm honours, so a
@@ -318,6 +422,66 @@ fn prompt_argv(shell: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_tab_claims_a_session_only_when_its_command_carries_the_id() {
+        // The rule `open_agent` applies, stated where `fresh_cmd` can break it.
+        // Codex drops the minted id, so a fresh Codex tab must claim nothing
+        // rather than name itself after a session that will never exist.
+        let id = servant::mint_session_id();
+        assert!(Agent::Claude.fresh_cmd(&id).contains(&id));
+        assert!(!Agent::Codex.fresh_cmd(&id).contains(&id));
+        // A resume carries the id in both, which is why a resumed tab never
+        // waits for adoption.
+        assert!(Agent::Claude.resume_cmd(&id).contains(&id));
+        assert!(Agent::Codex.resume_cmd(&id).contains(&id));
+    }
+
+    #[test]
+    fn only_a_session_that_was_not_there_before_can_be_adopted() {
+        let seen = set(&["old-1", "old-2"]);
+        let claimed = HashSet::new();
+        // The two already on the board are not candidates however busy they are.
+        assert_eq!(
+            adoptable(&ids(&["old-1", "old-2", "new-1"]), &seen, &claimed),
+            ids(&["new-1"])
+        );
+        // Nothing new, nothing to bind.
+        assert!(adoptable(&ids(&["old-1"]), &seen, &claimed).is_empty());
+    }
+
+    #[test]
+    fn a_session_another_tab_already_holds_is_not_offered_twice() {
+        // A tab resumed from the board holds its id from launch. A waiting tab
+        // must not be handed the same one just because the board only started
+        // showing it now.
+        let seen = HashSet::new();
+        let claimed = set(&["held-by-tab-2"]);
+        assert_eq!(
+            adoptable(&ids(&["held-by-tab-2", "loose"]), &seen, &claimed),
+            ids(&["loose"])
+        );
+    }
+
+    #[test]
+    fn two_new_sessions_are_offered_in_a_fixed_order() {
+        // Two tabs waiting on one tick may still be bound the wrong way round --
+        // nothing here knows which pty wrote which rollout -- but the order must
+        // not also vary run to run.
+        let (seen, claimed) = (HashSet::new(), HashSet::new());
+        assert_eq!(
+            adoptable(&ids(&["b", "c", "a"]), &seen, &claimed),
+            ids(&["a", "b", "c"])
+        );
+    }
 
     #[test]
     fn a_known_shell_gets_login_and_interactive_and_the_exec_prefix() {
