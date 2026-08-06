@@ -174,6 +174,26 @@ impl Agent {
         }
     }
 
+    /// The text a built pane command puts immediately before its session id.
+    ///
+    /// The launcher recovers the id by reading it back out of the command it
+    /// just built rather than carrying a second list alongside -- see
+    /// `workspace::pane_session_ids`. That read was written for Claude's two
+    /// flags and matched nothing a Codex pane runs, so every Codex pane came out
+    /// with no id: untinted under iTerm2, and titled `agent-1` rather than with
+    /// its servant name under Windows Terminal. A resumed Codex pane does carry
+    /// its id, and this is what finds it.
+    ///
+    /// Codex's marker keeps the program word because its subcommand is a bare
+    /// `resume`. Without it, a repo path containing " resume " would be read as
+    /// a session id. Claude's markers are flags and need no such guard.
+    pub fn id_markers(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["--session-id ", "--resume "],
+            Agent::Codex => &["codex resume "],
+        }
+    }
+
     /// The flag that gives a pane's session a display name, or empty where the
     /// agent has none.
     ///

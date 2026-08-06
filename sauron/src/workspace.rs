@@ -700,8 +700,8 @@ fn as_rgb(c: (u8, u8, u8)) -> String {
 /// colour that row either, and inventing one here would put a colour on screen
 /// that nothing on the board agrees with.
 #[cfg(unix)]
-fn as_tint_list(cmds: &[String]) -> String {
-    pane_session_ids(cmds)
+fn as_tint_list(cmds: &[String], agent: Agent) -> String {
+    pane_session_ids(cmds, agent)
         .into_iter()
         .map(|id| match id {
             Some(id) => {
@@ -745,7 +745,7 @@ fn applescript(
 
     let left_list = as_list(&left);
     let right_list = as_list(&right);
-    let left_tints = as_tint_list(&left);
+    let left_tints = as_tint_list(&left, agent);
     // The orcs are the leading right-column commands. They are staged (typed but
     // not run) so you review the target and press Enter to loose each one -- they
     // never begin refactoring the moment the window opens.
@@ -962,15 +962,24 @@ fn left_commands(
 /// Recomputed from `left_commands`' own output rather than threaded alongside
 /// it: two lists that must stay in step are one bug away from being wrong, and
 /// the id is already in the command text.
+/// The markers are the agent's own (`Agent::id_markers`), because the command
+/// this reads was built from that agent's launch forms. Reading Claude's flags
+/// out of a Codex pane found nothing, which is why Codex panes were the grey
+/// ones.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn pane_session_ids(commands: &[String]) -> Vec<Option<String>> {
+fn pane_session_ids(commands: &[String], agent: Agent) -> Vec<Option<String>> {
     commands
         .iter()
         .map(|cmd| {
-            let at = cmd.find("--session-id ").or_else(|| cmd.find("--resume "))?;
-            cmd[at..]
+            let (at, marker) = agent
+                .id_markers()
+                .iter()
+                .find_map(|m| cmd.find(m).map(|at| (at, *m)))?;
+            // Past the marker, not past its first word: Codex's marker is two
+            // words (`codex resume `) and Claude's is one.
+            cmd[at + marker.len()..]
                 .split_whitespace()
-                .nth(1)
+                .next()
                 .map(|id| id.to_string())
         })
         .collect()
@@ -1019,7 +1028,7 @@ fn wt_layout_argv(
     // settings.json, which sauron has no business writing. So the servant is
     // carried by the pane *title* here rather than by a colour, and the board's
     // underline is the only place the colour appears on this platform.
-    let titles: Vec<String> = pane_session_ids(&lefts)
+    let titles: Vec<String> = pane_session_ids(&lefts, agent)
         .into_iter()
         .enumerate()
         .map(|(i, id)| match id {
@@ -1191,7 +1200,7 @@ fn gui_applescript(
 ) -> String {
     let left = left_commands(repo, sauron_exe, total, work, agent, mordor, clipboard_handoff);
     let left_list = as_list(&left);
-    let left_tints = as_tint_list(&left);
+    let left_tints = as_tint_list(&left, agent);
     let orc_list = as_list(orc_cmds);
     let sauron_flag = agent.label();
 
@@ -1749,7 +1758,7 @@ mod tests {
         let cmds = left_commands("/repo", "/bin/sauron", 6, &work, Agent::Claude, None, false);
         assert_eq!(cmds.len(), 6);
 
-        let ids = pane_session_ids(&cmds);
+        let ids = pane_session_ids(&cmds, Agent::Claude);
         assert!(ids.iter().all(|i| i.is_some()), "every pane needs an id: {ids:?}");
         let unique: std::collections::BTreeSet<_> = ids.iter().flatten().collect();
         assert_eq!(unique.len(), 6, "session ids must not repeat: {ids:?}");
@@ -1777,9 +1786,9 @@ mod tests {
         // same answer. If these ever disagree the colours become noise.
         let work = vec![("id-1".to_string(), "t".to_string())];
         let cmds = left_commands("/repo", "/bin/sauron", 3, &work, Agent::Claude, None, false);
-        let tints = as_tint_list(&cmds);
+        let tints = as_tint_list(&cmds, Agent::Claude);
 
-        for id in pane_session_ids(&cmds).iter().flatten() {
+        for id in pane_session_ids(&cmds, Agent::Claude).iter().flatten() {
             let c = servant::color_for(id);
             assert!(
                 tints.contains(&format!("{{{}, {}}}", as_rgb(tinted(c)), as_rgb(c))),
@@ -1869,6 +1878,50 @@ mod tests {
         let cmds = left_commands("/repo", "/bin/sauron", 2, &[], Agent::Codex, None, false);
         assert!(cmds.iter().all(|c| !c.contains("--name")), "{cmds:?}");
         assert!(cmds.iter().all(|c| !c.contains("--session-id")), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_resumed_codex_pane_yields_its_id_the_way_a_claude_one_does() {
+        // The bug: `pane_session_ids` looked for `--session-id ` and `--resume `,
+        // which are Claude's spellings. `codex resume id-1` matched neither, so
+        // every Codex pane came back with no id -- untinted under iTerm2 and
+        // titled `agent-1` under Windows Terminal, even when sauron knew exactly
+        // which session the pane was.
+        let work = vec![("id-1".into(), "t".into())];
+        let cmds = left_commands("/repo", "/bin/sauron", 2, &work, Agent::Codex, None, false);
+        let ids = pane_session_ids(&cmds, Agent::Codex);
+        assert_eq!(ids[0].as_deref(), Some("id-1"), "{cmds:?}");
+        // A *fresh* Codex pane still has none, and that is not this bug: Codex
+        // takes no session id at launch, so there is nothing in the command to
+        // read. See `Agent::fresh_cmd`.
+        assert_eq!(ids[1], None, "{cmds:?}");
+
+        // Claude's reader must not have widened. `codex resume ` carries the
+        // program word so a repo path cannot be mistaken for a launch form.
+        let claude = left_commands("/repo", "/bin/sauron", 1, &work, Agent::Claude, None, false);
+        assert_eq!(
+            pane_session_ids(&claude, Agent::Claude)[0].as_deref(),
+            Some("id-1")
+        );
+        let trap = vec!["cd /work/resume drafts && codex".to_string()];
+        assert_eq!(pane_session_ids(&trap, Agent::Codex)[0], None, "{trap:?}");
+    }
+
+    // Tint is macOS-only; Windows Terminal carries the servant as a pane title.
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_codex_pane_is_tinted_like_the_board_row_it_is() {
+        let work = vec![("id-1".into(), "t".into())];
+        let cmds = left_commands("/repo", "/bin/sauron", 2, &work, Agent::Codex, None, false);
+        let tints = as_tint_list(&cmds, Agent::Codex);
+        let c = servant::color_for("id-1");
+        assert!(
+            tints.contains(&format!("{{{}, {}}}", as_rgb(tinted(c)), as_rgb(c))),
+            "no tint for the resumed pane in {tints}"
+        );
+        // The fresh pane has no id and therefore no colour; `missing value` is
+        // the handler's "leave the profile alone", not a failure.
+        assert!(tints.contains("missing value"), "{tints}");
     }
 
     // Asserts on generated AppleScript; there is none off macOS.
@@ -2198,7 +2251,7 @@ mod tests {
         // shared word -- the pane title is the only servant marker Windows
         // Terminal can carry, so a repeated one loses the distinction entirely.
         let lefts = left_commands("C:\\r", "sauron.exe", 4, &[], Agent::Claude, None, false);
-        let want: Vec<String> = pane_session_ids(&lefts)
+        let want: Vec<String> = pane_session_ids(&lefts, Agent::Claude)
             .into_iter()
             .flatten()
             .map(|id| servant::name_for(&id).to_string())
