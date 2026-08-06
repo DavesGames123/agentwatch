@@ -106,8 +106,16 @@ impl Mordor {
 
 impl Agent {
     /// Pick the agent: an explicit choice wins, then `$SAURON_AGENT`, then
-    /// auto-detect from whichever agent actually has logs for this repo (Claude's
-    /// per-repo directory, then a Codex install). Defaults to Claude.
+    /// auto-detect from whichever agent actually has logs **for this repo**.
+    /// Defaults to Claude.
+    ///
+    /// Both probes ask the same question, and that is the point. The Codex arm
+    /// used to test `~/.codex/sessions` for existence, which answers "is Codex
+    /// installed" -- a far weaker claim. Anyone with the CLI on their machine
+    /// got a whole workspace of Codex panes the moment they opened a repo they
+    /// had never used Claude in, including repos they had never used Codex in
+    /// either. A rollout recorded in this repo is the evidence that Codex is the
+    /// agent working here; an installed binary is not.
     pub fn select(explicit: Option<Agent>, repo: &Path) -> Agent {
         if let Some(a) = explicit {
             return a;
@@ -118,7 +126,7 @@ impl Agent {
         if scan::project_dir_for(repo).is_dir() {
             return Agent::Claude;
         }
-        if crate::codex::sessions_root().is_dir() {
+        if crate::codex::has_session_for(repo) {
             return Agent::Codex;
         }
         Agent::Claude

@@ -14,14 +14,30 @@
 //!   - user / assistant messages -> last prompt + turn completion
 //!   - apply_patch tool calls -> the write-set (files touched)
 //!
+//! WHY THE CWD PROBE IS CACHED
+//! ---------------------------
+//! Claude Code keeps one directory per repo, so "which files are mine" is a
+//! single `read_dir`. Codex keeps one flat store for every repo on the machine,
+//! so the same question means opening every rollout and reading its header --
+//! and `Scanner::refresh` asks it on every 2s tick. On a store with a few
+//! hundred rollouts that is a few hundred opens and up to eight parsed JSON
+//! lines each, twice a second, forever; a codex session-meta header carries the
+//! whole instructions blob, so those lines are not small. The header of a
+//! rollout never changes once written, so the verdict is remembered per file and
+//! the probe runs once per rollout instead of once per tick.
+//!
 //! grep targets:
 //!   fn session_files   -- rollouts whose cwd is this repo
+//!   fn has_session_for -- the same question, answered on the first hit
+//!   fn rollout_cwd     -- the cached header probe
 //!   fn fold            -- one rollout record -> Session mutation
 //!   fn patch_paths     -- files out of an apply_patch envelope
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -54,6 +70,23 @@ pub fn session_files(repo: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Whether Codex has ever run in this repo. This is the agent-selection
+/// question, and it is not the same as "is Codex installed": a `~/.codex`
+/// directory says the user has the CLI, not that *this* repo is one they use it
+/// in. Answering the weaker question is what made a repo with no Claude logs
+/// open a column of Codex panes the user never asked for.
+///
+/// Stops at the first match rather than building the whole list -- the answer is
+/// a boolean and the store is every repo on the machine.
+pub fn has_session_for(repo: &Path) -> bool {
+    let repo_s = repo.to_string_lossy();
+    let mut files = Vec::new();
+    collect_jsonl(&sessions_root(), &mut files, 5);
+    files
+        .iter()
+        .any(|p| rollout_cwd(p).as_deref() == Some(repo_s.as_ref()))
+}
+
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -70,9 +103,38 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
+/// Remembered answers from [`rollout_cwd`], keyed by rollout path.
+///
+/// `None` is cached as well as `Some`. A rollout belonging to another repo is
+/// the common case and is exactly the one worth not re-reading; caching only the
+/// hits would leave every miss re-parsed on every tick, which is the whole cost.
+fn cwd_cache() -> &'static Mutex<HashMap<PathBuf, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// The cwd a rollout was recorded in, from its session-meta header (scanned over
-/// the first few lines, wherever the meta lands).
+/// the first few lines, wherever the meta lands). Read once per rollout; see the
+/// module header.
 fn rollout_cwd(path: &Path) -> Option<String> {
+    if let Ok(cache) = cwd_cache().lock() {
+        if let Some(hit) = cache.get(path) {
+            return hit.clone();
+        }
+    }
+    let found = read_rollout_cwd(path);
+    // A file whose header has not been written yet must not be remembered as
+    // "no cwd" -- codex creates the rollout and writes the meta line a moment
+    // later, and a cached `None` would hide that session for the process's life.
+    if found.is_some() {
+        if let Ok(mut cache) = cwd_cache().lock() {
+            cache.insert(path.to_path_buf(), found.clone());
+        }
+    }
+    found
+}
+
+fn read_rollout_cwd(path: &Path) -> Option<String> {
     let f = File::open(path).ok()?;
     let mut reader = BufReader::new(f);
     let mut line = String::new();
@@ -248,6 +310,36 @@ mod tests {
             "input": "*** Begin Patch\n*** Update File: lib/x.ts\n+a\n*** End Patch"
         });
         assert_eq!(patch_paths(&item), vec!["lib/x.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_rollout_header_is_read_once_and_a_missing_one_is_not_remembered() {
+        let dir = std::env::temp_dir().join(format!("sauron-codex-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-08-06T10-00-00-11111111-2222-4333-8444-555555555555.jsonl");
+
+        // A rollout whose meta line has not landed yet answers "unknown", and
+        // that answer must not stick -- codex writes the header a moment after
+        // it creates the file, and a cached `None` would hide the session.
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(rollout_cwd(&path), None);
+        std::fs::write(
+            &path,
+            b"{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/repo/one\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(rollout_cwd(&path).as_deref(), Some("/repo/one"));
+
+        // A header that *was* read is not read again: rewriting the file with a
+        // different cwd changes nothing, which is the cache doing its job.
+        std::fs::write(
+            &path,
+            b"{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/repo/two\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(rollout_cwd(&path).as_deref(), Some("/repo/one"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
