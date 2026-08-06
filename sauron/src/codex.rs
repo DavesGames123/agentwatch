@@ -45,7 +45,7 @@ use crate::agent::codex_home;
 use crate::model::{parse_rfc3339_ms, Session};
 use crate::scan::repo_relative;
 
-/// `~/.codex/sessions`.
+/// `<codex home>/sessions` -- `~/.codex/sessions` unless `$CODEX_HOME` moved it.
 pub fn sessions_root() -> PathBuf {
     codex_home().join("sessions")
 }

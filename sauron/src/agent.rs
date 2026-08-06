@@ -296,9 +296,18 @@ impl Agent {
     }
 }
 
-/// `~/.codex` -- exposed here so selection can probe for a Codex install.
+/// Where Codex keeps its state: `$CODEX_HOME` if the user set it, else
+/// `~/.codex`. Exposed here so the rollout reader can find the session store.
+///
+/// The env var is not a nicety. Codex reads it itself, and a user who has moved
+/// their Codex home -- to a synced directory, or to keep work and personal
+/// installs apart -- would otherwise have sauron look at an empty `~/.codex` and
+/// report no sessions for a repo they are actively working in.
 pub(crate) fn codex_home() -> PathBuf {
-    home().join(".codex")
+    match std::env::var("CODEX_HOME") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => home().join(".codex"),
+    }
 }
 
 #[cfg(test)]
