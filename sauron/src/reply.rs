@@ -303,14 +303,23 @@ fn collapse(s: &str) -> String {
 /// resolved a real session to a `/bin/zsh -c ...` wrapper, and had it been
 /// allowed to deliver, it would have typed the reply into a shell.
 ///
-/// So the line must actually look like an agent resuming that session: the
-/// program's basename is `claude` or `codex`, and the id follows the subcommand
-/// that takes it. Anything else is not an agent and must not be typed at.
+/// So the line must actually look like an agent running that session: the
+/// program's basename is `claude` or `codex`, and the id follows a flag or
+/// subcommand that takes one. Anything else is not an agent and must not be
+/// typed at.
 ///
-/// A session started fresh rather than resumed does not carry its id in argv
-/// and is therefore not addressable this way. That is a real limitation, and
-/// the reason `deliver` reports failure rather than falling back to a guess --
-/// a wrong window is worse than no delivery.
+/// WHAT IS STILL NOT ADDRESSABLE, AND WHY IT IS ONLY CODEX NOW
+/// ----------------------------------------------------------
+/// A process is addressable only if its session id is in its argv. Claude Code
+/// panes all are: a resumed one carries `--resume`, and a fresh one carries
+/// `--session-id`, because sauron mints the id and hands it over so the pane can
+/// be coloured at launch. Codex takes no session id at launch -- `fresh_cmd`
+/// returns a bare `codex` and Codex invents its own id -- so a fresh Codex pane
+/// has nothing to match on and stays unaddressable for its whole life. Resume it
+/// from the board and replies land from then on.
+///
+/// `deliver` reports failure rather than falling back to a guess. A wrong window
+/// is worse than no delivery.
 ///
 ///   grep -n "fn pid_for"  src/reply.rs
 fn pid_for(session: &str) -> Option<u32> {
@@ -327,15 +336,21 @@ fn pid_for(session: &str) -> Option<u32> {
             let pid: u32 = pid.parse().ok()?;
             (pid != me).then_some((pid, cmd.trim()))
         })
-        .find(|(_, cmd)| is_resume_of(cmd, session))
+        .find(|(_, cmd)| is_agent_for(cmd, session))
         .map(|(pid, _)| pid)
 }
 
-/// Whether `cmd` is an agent CLI resuming `session`, rather than any old
+/// Whether `cmd` is an agent CLI *running* `session`, rather than any old
 /// process that happens to mention it.
 ///
-///   grep -n "fn is_resume_of"  src/reply.rs
-fn is_resume_of(cmd: &str, session: &str) -> bool {
+/// The accepted words are wider than the ones `Agent::id_markers` lists, and
+/// deliberately not shared with it. That function reads back a command sauron
+/// built, so it need only know sauron's own spellings. This one has to
+/// recognise a process however it was started, including by hand -- which is
+/// why `-r` is here and is not there.
+///
+///   grep -n "fn is_agent_for"  src/reply.rs
+fn is_agent_for(cmd: &str, session: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let Some(prog) = words.next() else { return false };
     // Basename, so an absolute path to the binary still matches.
@@ -349,7 +364,12 @@ fn is_resume_of(cmd: &str, session: &str) -> bool {
             .any(|w| w[0] == kw && w[1] == session)
     };
     match prog {
-        "claude" => follows("--resume") || follows("-r"),
+        // `--session-id` is how every *fresh* sauron pane launches Claude Code,
+        // and it was missing here. Since minting landed, a workspace opened on
+        // an idle repo is all fresh panes, so this matched none of them and
+        // every reply into that window failed with "no live process".
+        "claude" => follows("--session-id") || follows("--resume") || follows("-r"),
+        // Codex has no fresh-launch equivalent; see `pid_for`.
         "codex" => follows("resume"),
         _ => false,
     }
@@ -671,22 +691,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_real_resume_command_is_a_delivery_target() {
+    fn only_a_real_agent_command_is_a_delivery_target() {
         let id = "4dcde696-4bca-4371-98cb-cd9edefc9157";
 
-        assert!(is_resume_of(&format!("claude --resume {id}"), id));
-        assert!(is_resume_of(&format!("/usr/local/bin/claude --resume {id}"), id));
-        assert!(is_resume_of(&format!("codex resume {id}"), id));
+        assert!(is_agent_for(&format!("claude --resume {id}"), id));
+        assert!(is_agent_for(&format!("/usr/local/bin/claude --resume {id}"), id));
+        assert!(is_agent_for(&format!("codex resume {id}"), id));
+
+        // A *fresh* Claude pane. sauron mints the id and launches with
+        // `--session-id` so the pane can be coloured from the frame it opens --
+        // and this did not accept it, so a workspace opened on an idle repo was
+        // all fresh panes and every one of them refused delivery.
+        assert!(is_agent_for(&format!("claude --session-id {id} --name frodo"), id));
+        assert!(is_agent_for(&format!("claude -r {id}"), id));
+
+        // A fresh Codex pane, which takes no id at launch and therefore cannot
+        // be found. This is the limitation `pid_for` documents, pinned so it is
+        // read as known rather than as an oversight.
+        assert!(!is_agent_for("codex", id));
 
         // The regression this exists for. A shell wrapper quoting a command
         // that mentions the id resolved as the agent itself, and delivering to
         // it would have typed the reply into a shell.
-        assert!(!is_resume_of(&format!("/bin/zsh -c ps -Ao pid= | grep {id}"), id));
-        assert!(!is_resume_of(&format!("grep {id}"), id));
-        assert!(!is_resume_of(&format!("sauron reply --where {id}"), id));
+        assert!(!is_agent_for(&format!("/bin/zsh -c ps -Ao pid= | grep {id}"), id));
+        assert!(!is_agent_for(&format!("grep {id}"), id));
+        assert!(!is_agent_for(&format!("sauron reply --where {id}"), id));
         // Right program, but the id is not what it is resuming.
-        assert!(!is_resume_of(&format!("claude --resume other-id --add-dir {id}"), id));
-        assert!(!is_resume_of("claude", id));
+        assert!(!is_agent_for(&format!("claude --resume other-id --add-dir {id}"), id));
+        assert!(!is_agent_for("claude", id));
     }
 
     #[test]
