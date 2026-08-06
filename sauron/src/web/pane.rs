@@ -15,13 +15,26 @@
 //! tick later. Without it the newest tab -- the one you just opened and are most
 //! likely to be looking for -- would be the only grey one.
 //!
-//! WHY EVERY PANE GOES THROUGH A LOGIN SHELL
-//! -----------------------------------------
-//! `claude` is usually installed by a version manager whose PATH is set in a
-//! profile. An iTerm pane gets that for free because iTerm runs a login shell;
-//! spawning the agent binary directly would work on the developer's machine and
-//! fail on everyone else's with "command not found". Running `$SHELL -lc` is
-//! what makes a tab and a pane the same environment as well as the same command.
+//! WHY EVERY PANE GOES THROUGH A LOGIN *INTERACTIVE* SHELL
+//! -------------------------------------------------------
+//! `claude` and `codex` are usually installed by a version manager -- nvm, fnm,
+//! mise, asdf -- and every one of them sets PATH from the *interactive* rc file,
+//! not the login profile. `zsh -lc` reads `.zprofile` and `.zlogin` and skips
+//! `.zshrc`; `bash -lc` reads `.bash_profile` and skips `.bashrc`. A pane opened
+//! that way gets a PATH that is missing exactly the directory the agent lives
+//! in, and the tab dies on "command not found" -- on a machine where typing the
+//! same word in iTerm works. An iTerm pane is login *and* interactive, so the
+//! tab has to be both as well: `-l -i -c`.
+//!
+//! WHY THE COMMAND IS PREFIXED WITH `exec`
+//! ---------------------------------------
+//! `-i` turns job control on, and a shell with job control forks the command
+//! instead of replacing itself with it. That would put a shell between sauron
+//! and the agent, and `Pty::kill` kills the child it spawned -- the shell --
+//! leaving the agent alive, detached, and holding its memory with no tab left to
+//! close it from. `exec` collapses the two back into one process: the rc files
+//! are read, then the shell image is replaced by the agent, so the pid sauron
+//! holds is the agent's pid and closing a tab ends it.
 //!
 //! grep targets:
 //!   struct Pane        -- one tab: its pty, its title, the row it belongs to
@@ -31,6 +44,8 @@
 //!   fn open_shell      -- a plain shell at the repo root
 //!   fn close           -- end a tab and the agent in it
 //!   fn json            -- the tab strip, for the page
+//!   fn shell_argv      -- the flags, per shell, and the `exec` prefix
+//!   fn rc_flags        -- which shells are known to accept `-l` and `-i`
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,10 +160,11 @@ impl Workspace {
     pub fn open_orc(&mut self, target: &str, cols: u16, rows: u16) -> std::io::Result<u8> {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sauron"));
         let cmd = crate::orc::stage_command(&exe, &self.repo.to_string_lossy(), target, "");
-        // `-i` rather than `-lc`: the line is typed onto the prompt and left
-        // there, so the shell has to stay interactive instead of running it.
-        let shell = login_shell();
-        let argv = vec![shell.clone(), "-i".into()];
+        // No `-c`: the line is typed onto the prompt and left there, so the
+        // shell has to sit at a prompt instead of running anything. The rc files
+        // still have to be read -- the staged line names `sauron`, and the orc
+        // it starts names the agent.
+        let argv = prompt_argv(&login_shell());
         let id = self.spawn_argv(Kind::Orc, format!("orc · {target}"), None, &argv, cols, rows)?;
         if let Some(p) = self.get(id) {
             p.pty.write(cmd.as_bytes());
@@ -157,7 +173,7 @@ impl Workspace {
     }
 
     pub fn open_shell(&mut self, cols: u16, rows: u16) -> std::io::Result<u8> {
-        let argv = vec![login_shell(), "-l".into()];
+        let argv = prompt_argv(&login_shell());
         self.spawn_argv(Kind::Shell, "shell".into(), None, &argv, cols, rows)
     }
 
@@ -170,7 +186,7 @@ impl Workspace {
         cols: u16,
         rows: u16,
     ) -> std::io::Result<u8> {
-        let argv = vec![login_shell(), "-lc".into(), cmd.to_string()];
+        let argv = shell_argv(&login_shell(), cmd);
         self.spawn_argv(kind, title, session, &argv, cols, rows)
     }
 
@@ -248,4 +264,107 @@ impl Workspace {
 /// tab lands in the same shell a pane would have.
 fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// The `-l -i` pair, but only for the shells known to accept both.
+///
+/// `-l` is not portable. `dash` -- which is `/bin/sh` on most Linux boxes and is
+/// the fallback when `$SHELL` is unset -- rejects it outright, and `bash` in
+/// `sh` mode accepts `-i` while printing "no job control in this shell" onto the
+/// tab before anything else runs. Neither is worth a broken pane, so an
+/// unrecognised shell gets the plain `-c` this module used to give everyone, and
+/// loses only the rc file it may not have had.
+///
+/// Given as two separate words rather than a bundled `-li`. `zsh -lic` and
+/// `bash -lic` both parse, but `fish` and `nu` take long options with a single
+/// dash and do not bundle at all, so the separated form is the one that is
+/// correct everywhere it is used.
+fn rc_flags(shell: &str) -> &'static [&'static str] {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    match name {
+        "zsh" | "bash" | "fish" => &["-l", "-i"],
+        _ => &[],
+    }
+}
+
+/// The argv that runs `cmd` in the user's shell with the environment an iTerm
+/// pane would have had. See the module header for `-i` and for `exec`.
+fn shell_argv(shell: &str, cmd: &str) -> Vec<String> {
+    let mut argv = vec![shell.to_string()];
+    argv.extend(rc_flags(shell).iter().map(|f| f.to_string()));
+    argv.push("-c".into());
+    // `exec` is POSIX and is a builtin in every shell `rc_flags` admits, so this
+    // is the same word in all of them.
+    argv.push(format!("exec {cmd}"));
+    argv
+}
+
+/// The argv for a shell that must stop at a prompt instead of running a command:
+/// the orc tab, which is handed its line to press Enter on, and the plain shell
+/// tab. No `-c`, and therefore no `exec` -- there is nothing yet to exec.
+fn prompt_argv(shell: &str) -> Vec<String> {
+    let mut argv = vec![shell.to_string()];
+    let flags = rc_flags(shell);
+    if flags.is_empty() {
+        // An unrecognised shell reading no rc file is still a shell at a prompt;
+        // `-i` alone is what makes it one when stdin's tty is not enough.
+        argv.push("-i".into());
+    } else {
+        argv.extend(flags.iter().map(|f| f.to_string()));
+    }
+    argv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_known_shell_gets_login_and_interactive_and_the_exec_prefix() {
+        // The bug this fixes: `-lc` skips `.zshrc`, which is where nvm/fnm/mise
+        // put the directory `claude` and `codex` live in.
+        assert_eq!(
+            shell_argv("/bin/zsh", "codex resume abc"),
+            vec!["/bin/zsh", "-l", "-i", "-c", "exec codex resume abc"]
+        );
+        assert_eq!(
+            shell_argv("/opt/homebrew/bin/bash", "claude --resume abc"),
+            vec![
+                "/opt/homebrew/bin/bash",
+                "-l",
+                "-i",
+                "-c",
+                "exec claude --resume abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_shell_keeps_the_plain_c_rather_than_a_flag_it_rejects() {
+        // `dash -l` is an error, not a no-op, and a pane that fails to open is
+        // worse than one whose PATH is short.
+        assert_eq!(
+            shell_argv("/bin/sh", "claude"),
+            vec!["/bin/sh", "-c", "exec claude"]
+        );
+        assert_eq!(shell_argv("/usr/bin/dash", "claude")[1], "-c");
+    }
+
+    #[test]
+    fn the_exec_prefix_is_always_present_so_the_pty_child_is_the_agent() {
+        // Without it, an interactive shell forks the agent and `Pty::kill` ends
+        // the shell while the agent keeps running -- one orphan per closed tab.
+        for shell in ["/bin/zsh", "/bin/bash", "/bin/sh", "/usr/local/bin/fish"] {
+            let argv = shell_argv(shell, "codex");
+            assert_eq!(argv.last().unwrap(), "exec codex", "shell {shell}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_shell_runs_no_command_and_still_reads_its_rc() {
+        assert_eq!(prompt_argv("/bin/zsh"), vec!["/bin/zsh", "-l", "-i"]);
+        assert!(!prompt_argv("/bin/zsh").iter().any(|a| a == "-c"));
+        // Unknown shell: interactive is the part that matters at a prompt.
+        assert_eq!(prompt_argv("/bin/sh"), vec!["/bin/sh", "-i"]);
+    }
 }
