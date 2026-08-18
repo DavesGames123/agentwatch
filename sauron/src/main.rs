@@ -23,6 +23,9 @@
 //!   struct App          -- a Board plus this window's cursor and banners
 //!   fn App::refresh     -- rebuild rows, keeping the cursor on its session
 //!   fn App::resync      -- refresh that also picks up another process's acks
+//!   fn App::jump_table  -- Tab, from one of the board's tables to the next
+//!   fn App::scroll_at   -- the wheel, which moves a table and not the cursor
+//!   fn hit_test         -- a clicked row of the screen -> the session in it
 //!   fn main             -- terminal lifecycle and event loop
 
 use std::path::PathBuf;
@@ -33,7 +36,6 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::widgets::ListState;
 
 use sauron::agent::Agent;
 use sauron::board::{Board, Dismissal};
@@ -74,7 +76,10 @@ const DEFAULT_AGENTS: usize = 4;
 /// front end has its own cursor and its own geometry.
 struct App {
     board: Board,
-    list_state: ListState,
+    /// Index into `board.rows` of the row the cursor is on. The board draws that
+    /// list as three tables in row order, so one index is still the whole
+    /// cursor: `j`/`k` spill from the foot of one table into the head of the
+    /// next without either side having to know where the boundary is.
     selected: usize,
     saved_until: Option<Instant>,
     /// Transient "copied" banner deadline.
@@ -84,13 +89,18 @@ struct App {
     /// only the last one matters.
     spawn_msg: Option<(String, bool)>,
     spawn_until: Option<Instant>,
-    /// Per-frame list geometry, refreshed each draw, so a mouse click can be
-    /// mapped back to the row under it. Heights and row-mapping run parallel to
-    /// the items the list widget draws, in the same order.
-    frame_item_heights: Vec<u16>,
-    frame_item_rows: Vec<Option<usize>>,
-    list_top: u16,
-    list_height: u16,
+    /// Per table, the first row it is showing. Rewritten from the frame geometry
+    /// after every draw -- only the drawing knows how many rows a table got --
+    /// and carried here so a wheel event has something to move.
+    scroll: [usize; ui::GROUPS],
+    /// Whether the next frame should scroll to keep the cursor on screen. Set by
+    /// everything that moves the cursor, cleared by the wheel. Without it the
+    /// wheel would appear dead: the frame after a scroll would chase the
+    /// selection straight back to where it was.
+    follow: bool,
+    /// Where the last frame put each table, so a click or a wheel event resolves
+    /// to the row -- or the table -- under the pointer.
+    tables: Vec<ui::TableGeometry>,
     /// The machine's UTC offset in seconds, read once at launch so task start
     /// times render on the local wall clock without re-shelling `date` per frame.
     local_offset: i64,
@@ -126,16 +136,14 @@ impl App {
     fn new(repo_root: PathBuf, agent: Agent) -> Self {
         let mut app = Self {
             board: Board::new(repo_root, agent),
-            list_state: ListState::default(),
             selected: 0,
             saved_until: None,
             copied_until: None,
             spawn_msg: None,
             spawn_until: None,
-            frame_item_heights: Vec::new(),
-            frame_item_rows: Vec::new(),
-            list_top: 0,
-            list_height: 0,
+            scroll: [0; ui::GROUPS],
+            follow: true,
+            tables: Vec::new(),
             local_offset: model::local_offset_secs(),
             orc_pick: None,
             last_dismissed: None,
@@ -158,7 +166,7 @@ impl App {
         for want in order {
             if let Some(i) = self.board.rows.iter().position(|r| r.status == want) {
                 self.selected = i;
-                self.sync_list_state();
+                self.follow_selection();
                 return;
             }
         }
@@ -193,15 +201,60 @@ impl App {
             .and_then(|id| self.board.rows.iter().position(|r| r.id == id))
             .unwrap_or(0)
             .min(self.board.rows.len().saturating_sub(1));
-        self.sync_list_state();
+        self.follow_selection();
     }
 
-    fn sync_list_state(&mut self) {
-        if self.board.rows.is_empty() {
-            self.list_state.select(None);
-        } else {
-            self.list_state.select(Some(self.selected));
+    /// Ask the next frame to bring the cursor back on screen.
+    ///
+    /// Called by everything that moves the cursor rather than scrolling a table
+    /// under it. The tables clamp their own offsets, so this is a request and not
+    /// a scroll: the drawing is the only thing that knows how many rows each
+    /// table ended up with.
+    fn follow_selection(&mut self) {
+        self.follow = true;
+    }
+
+    /// `Tab` -- put the cursor on the head of the next table.
+    ///
+    /// `j`/`k` already cross the boundaries, but a board with a long WORKING
+    /// table makes reaching the one below it a held key. Driven off the rows'
+    /// own grouping rather than off the drawn geometry: a pane too short to draw
+    /// every table still has to be able to reach the ones it left off.
+    fn jump_table(&mut self, dir: isize) {
+        let groups: Vec<ui::Group> = self
+            .board
+            .rows
+            .iter()
+            .map(|r| ui::group_of(r.status))
+            .collect();
+        if let Some(i) = next_table_row(&groups, self.selected, dir) {
+            self.selected = i;
+            self.follow_selection();
         }
+    }
+
+    /// Scroll the table under the pointer, leaving the cursor where it is.
+    ///
+    /// The wheel used to move the selection, which on a board of separately
+    /// scrolled tables would mean the wheel could only ever reach whichever
+    /// table the cursor happened to be in. It moves a viewport now; the cursor
+    /// answers to the keyboard. With the pointer off the tables -- the gap
+    /// between them, the detail pane -- the cursor's own table is scrolled, so a
+    /// wheel roll is never simply ignored.
+    fn scroll_at(&mut self, y: u16, delta: isize) {
+        let target = table_at(y, &self.tables)
+            .or_else(|| self.tables.iter().find(|t| t.rows.contains(&self.selected)))
+            .map(|t| {
+                (
+                    t.group.index(),
+                    t.rows.len().saturating_sub(t.body_height as usize),
+                )
+            });
+        let Some((slot, max)) = target else {
+            return;
+        };
+        self.scroll[slot] = (self.scroll[slot] as isize + delta).clamp(0, max as isize) as usize;
+        self.follow = false;
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -210,7 +263,7 @@ impl App {
         }
         let last = self.board.rows.len() - 1;
         self.selected = (self.selected as isize + delta).clamp(0, last as isize) as usize;
-        self.sync_list_state();
+        self.follow_selection();
     }
 
     /// `a` is context-sensitive: on a waiting session (Blocked or AwaitingAck) it
@@ -260,7 +313,7 @@ impl App {
                 self.selected = self
                     .selected
                     .min(self.board.rows.len().saturating_sub(1));
-                self.sync_list_state();
+                self.follow_selection();
             }
             Dismissal::StillRunning => {
                 self.flash_spawn("still running — dismiss is for finished work".into(), false)
@@ -303,7 +356,7 @@ impl App {
         };
         if copy_to_clipboard(&row.continue_cmd) {
             self.selected = idx;
-            self.sync_list_state();
+            self.follow_selection();
             self.copied_until = Some(Instant::now() + Duration::from_millis(1600));
         }
     }
@@ -435,44 +488,54 @@ impl App {
     /// Map a terminal cell to the row rendered under it, using the geometry
     /// captured on the last frame.
     fn row_at(&self, click_y: u16) -> Option<usize> {
-        hit_test(
-            click_y,
-            self.list_top,
-            self.list_height,
-            self.list_state.offset(),
-            &self.frame_item_heights,
-            &self.frame_item_rows,
-        )
+        hit_test(click_y, &self.tables)
     }
 }
 
-/// Resolve a click's y-coordinate to a row index, walking the visible items from
-/// the scroll offset and summing their heights. Returns None for a click on a
-/// section header, the clear-collapse line, or empty space below the list.
-/// Pure arithmetic, split out from `App` so it can be tested without a terminal.
-fn hit_test(
-    click_y: u16,
-    list_top: u16,
-    list_height: u16,
-    offset: usize,
-    heights: &[u16],
-    rows: &[Option<usize>],
-) -> Option<usize> {
-    if click_y < list_top || click_y >= list_top + list_height {
+/// The table drawn under a y-coordinate, if the pointer is over one at all.
+///
+/// Body rows only: a header, the blank row between two tables and the collapsed
+/// clear count are all deliberately not part of any table, because a click there
+/// picked a row nobody pointed at.
+fn table_at(y: u16, tables: &[ui::TableGeometry]) -> Option<&ui::TableGeometry> {
+    tables
+        .iter()
+        .find(|t| y >= t.body_top && y < t.body_top + t.body_height)
+}
+
+/// Resolve a click's y-coordinate to a row index, using the geometry of the last
+/// frame. Each table scrolls separately, so the answer is "which table is under
+/// the pointer, plus that table's own offset" -- one list walked from one offset
+/// cannot answer it any more. Pure arithmetic, split out from `App` so it can be
+/// tested without a terminal.
+fn hit_test(click_y: u16, tables: &[ui::TableGeometry]) -> Option<usize> {
+    let t = table_at(click_y, tables)?;
+    t.rows.get(t.offset + (click_y - t.body_top) as usize).copied()
+}
+
+/// The row `Tab` lands on: the head of the next table round from the one holding
+/// the cursor. It wraps, so Tab on its own walks the whole board.
+///
+/// Takes the group of every row, in board order, because that is what the tables
+/// are: rows arrive ranked, and a table is a run of that ranking. Nothing here
+/// consults the screen, so a table the pane was too short to draw is still on
+/// the way round.
+fn next_table_row(groups: &[ui::Group], selected: usize, dir: isize) -> Option<usize> {
+    let mut order: Vec<ui::Group> = Vec::new();
+    for g in groups {
+        if !order.contains(g) {
+            order.push(*g);
+        }
+    }
+    if order.is_empty() {
         return None;
     }
-    let mut y = list_top;
-    for i in offset..heights.len() {
-        let h = heights[i];
-        if click_y >= y && click_y < y + h {
-            return rows.get(i).copied().flatten();
-        }
-        y += h;
-        if y >= list_top + list_height {
-            break;
-        }
-    }
-    None
+    let here = groups
+        .get(selected)
+        .and_then(|g| order.iter().position(|o| o == g))
+        .unwrap_or(0) as isize;
+    let to = order[(here + dir).rem_euclid(order.len() as isize) as usize];
+    groups.iter().position(|g| *g == to)
 }
 
 /// Put text on the system clipboard. Tries the platform's own mechanism first
@@ -715,7 +778,6 @@ fn main() -> std::io::Result<()> {
         let saved = app.saved_flash();
         let copied = app.copied_flash();
         let spawned = app.spawn_flash().map(|(m, ok)| (m.to_string(), ok));
-        let mut list_state = app.list_state.clone();
         let mut geo = ui::FrameGeometry::default();
         // Copied out of `app` rather than borrowed, for the same reason `rows`
         // is: the view outlives the draw call, and `app` is mutated right after
@@ -754,17 +816,18 @@ fn main() -> std::io::Result<()> {
                 hot,
                 dirty,
             }),
+            scroll: app.scroll,
+            follow: app.follow,
         };
-        if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut list_state, &mut geo)) {
+        if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut geo)) {
             break Err(e);
         }
-        app.list_state = list_state;
-        // Stash the frame's list geometry so a mouse click next iteration can be
-        // mapped to the row under the cursor.
-        app.frame_item_heights = geo.item_heights;
-        app.frame_item_rows = geo.item_rows;
-        app.list_top = geo.list_top;
-        app.list_height = geo.list_height;
+        // Take back the offsets the drawing settled on, and the table geometry a
+        // mouse event next iteration will be resolved against. The offsets are a
+        // round trip on purpose: the event loop owns them between frames, but
+        // only the drawing knows how many rows each table was given.
+        app.scroll = geo.scroll;
+        app.tables = std::mem::take(&mut geo.tables);
 
         // Poll rather than block so the Eye keeps animating on an idle keyboard.
         // Wake every FRAME to redraw; the once-per-TICK data refresh below is
@@ -790,6 +853,8 @@ fn main() -> std::io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('j') | KeyCode::Down => app.move_by(1),
                     KeyCode::Char('k') | KeyCode::Up => app.move_by(-1),
+                    KeyCode::Tab => app.jump_table(1),
+                    KeyCode::BackTab => app.jump_table(-1),
                     KeyCode::Char('a') => app.ack_selected(),
                     KeyCode::Char('u') => app.unack_selected(),
                     // Shift-only, unlike `a`/`u`. Dismissing is the one gesture
@@ -824,8 +889,10 @@ fn main() -> std::io::Result<()> {
                             app.copy_continue_for(idx);
                         }
                     }
-                    MouseEventKind::ScrollDown => app.move_by(1),
-                    MouseEventKind::ScrollUp => app.move_by(-1),
+                    // The wheel scrolls the table under the pointer; it does not
+                    // move the cursor. See `App::scroll_at`.
+                    MouseEventKind::ScrollDown => app.scroll_at(m.row, 1),
+                    MouseEventKind::ScrollUp => app.scroll_at(m.row, -1),
                     _ => {}
                 },
                 Ok(_) => {}
@@ -922,16 +989,10 @@ fn print_once(app: &App) {
     println!("{}\n", if banner.is_empty() { "all caught up".into() } else { banner.join("  ·  ") });
 
     for r in &app.board.rows {
-        let glyph = match r.status {
-            Status::Errored => "✖",
-            Status::Blocked => "▲",
-            Status::AwaitingAck => "❯",
-            Status::NeedsTest => "█",
-            Status::Working => "◐",
-            Status::Delegated => "◇",
-            Status::Stalled => "◔",
-            Status::Clear => "·",
-        };
+        // The board's own glyph table, not a copy of it: a snapshot that marked
+        // a state differently from the window would be two answers to the same
+        // question.
+        let glyph = ui::glyph_of(r.status);
         println!(
             "{} {:<52} {:>4}  {}",
             glyph,
@@ -1003,41 +1064,85 @@ fn reload() -> std::io::Error {
 mod tests {
     use super::*;
 
-    // Layout used by these tests: list starts at y=10, is 20 rows tall.
-    // Items (draw order): section header (h=2), card A (h=3), card B (h=3),
-    // section header (h=2), card C (h=3). Rows map: A->0, B->1, C->2.
-    fn fixture() -> (Vec<u16>, Vec<Option<usize>>) {
-        (
-            vec![2, 3, 3, 2, 3],
-            vec![None, Some(0), Some(1), None, Some(2)],
-        )
+    // Geometry used by these tests, as the board would have drawn it:
+    //
+    //   y=10  YOUR MOVE (5) ────   header, in no table
+    //   y=11..13                   three of the table's five rows
+    //   y=14                       the blank row between two tables
+    //   y=15  WORKING (3) ─────    header
+    //   y=16..17                   two of the table's three rows
+    fn fixture() -> Vec<ui::TableGeometry> {
+        vec![
+            ui::TableGeometry {
+                group: ui::Group::YourMove,
+                body_top: 11,
+                body_height: 3,
+                rows: vec![0, 1, 2, 3, 4],
+                offset: 0,
+            },
+            ui::TableGeometry {
+                group: ui::Group::Working,
+                body_top: 16,
+                body_height: 2,
+                rows: vec![5, 6, 7],
+                offset: 0,
+            },
+        ]
     }
 
     #[test]
-    fn click_lands_on_the_card_under_the_cursor() {
-        let (h, r) = fixture();
-        // y layout from top=10: header 10-11, A 12-14, B 15-17, header 18-19, C 20-22.
-        assert_eq!(hit_test(13, 10, 20, 0, &h, &r), Some(0)); // inside card A
-        assert_eq!(hit_test(16, 10, 20, 0, &h, &r), Some(1)); // inside card B
-        assert_eq!(hit_test(21, 10, 20, 0, &h, &r), Some(2)); // inside card C
+    fn click_lands_on_the_row_under_the_cursor() {
+        let g = fixture();
+        assert_eq!(hit_test(11, &g), Some(0));
+        assert_eq!(hit_test(13, &g), Some(2));
+        // The second table's rows are the same click arithmetic against its own
+        // top -- which is the whole reason this is per table now.
+        assert_eq!(hit_test(16, &g), Some(5));
+        assert_eq!(hit_test(17, &g), Some(6));
     }
 
     #[test]
-    fn clicks_on_headers_and_outside_resolve_to_nothing() {
-        let (h, r) = fixture();
-        assert_eq!(hit_test(10, 10, 20, 0, &h, &r), None); // section header
-        assert_eq!(hit_test(18, 10, 20, 0, &h, &r), None); // second header
-        assert_eq!(hit_test(5, 10, 20, 0, &h, &r), None); // above the list
-        assert_eq!(hit_test(40, 10, 20, 0, &h, &r), None); // below the list
+    fn clicks_off_the_rows_resolve_to_nothing() {
+        let g = fixture();
+        assert_eq!(hit_test(10, &g), None); // a table header
+        assert_eq!(hit_test(14, &g), None); // the gap between two tables
+        assert_eq!(hit_test(15, &g), None); // the second header
+        assert_eq!(hit_test(5, &g), None); // above the board
+        assert_eq!(hit_test(40, &g), None); // below it
     }
 
     #[test]
-    fn scroll_offset_shifts_the_hit_test() {
-        let (h, r) = fixture();
-        // With offset=1, the first drawn item is card A at the list top (y=10).
-        // header 10-11? no -- offset skips item 0, so A(h=3) is 10-12, B 13-15...
-        assert_eq!(hit_test(11, 10, 20, 1, &h, &r), Some(0));
-        assert_eq!(hit_test(14, 10, 20, 1, &h, &r), Some(1));
+    fn each_table_is_hit_tested_through_its_own_offset() {
+        let mut g = fixture();
+        // Scroll the first table two rows on: its top line is now row 2, and the
+        // second table -- which nobody scrolled -- must not move with it.
+        g[0].offset = 2;
+        assert_eq!(hit_test(11, &g), Some(2));
+        assert_eq!(hit_test(12, &g), Some(3));
+        assert_eq!(hit_test(16, &g), Some(5));
+
+        // Scrolled past its last row, a body line resolves to nothing rather
+        // than to whatever index the arithmetic ran off the end into.
+        g[1].offset = 2;
+        assert_eq!(hit_test(16, &g), Some(7));
+        assert_eq!(hit_test(17, &g), None);
+    }
+
+    #[test]
+    fn tab_walks_the_tables_and_wraps_round() {
+        use ui::Group::*;
+        // Three rows in YOUR MOVE, one awaiting testing, two working -- the
+        // grouping of a ranked row set, which is what the board draws.
+        let g = [YourMove, YourMove, YourMove, AwaitingTesting, Working, Working];
+        assert_eq!(next_table_row(&g, 1, 1), Some(3));
+        assert_eq!(next_table_row(&g, 3, 1), Some(4));
+        // Round from the last table to the first, so Tab alone reaches every
+        // table rather than dead-ending at the bottom one.
+        assert_eq!(next_table_row(&g, 5, 1), Some(0));
+        assert_eq!(next_table_row(&g, 0, -1), Some(4));
+        // A cursor pointing at no row at all still gets somewhere.
+        assert_eq!(next_table_row(&g, 99, 1), Some(3));
+        assert_eq!(next_table_row(&[], 0, 1), None);
     }
 
     #[test]
