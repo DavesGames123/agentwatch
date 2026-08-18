@@ -7,6 +7,7 @@
 //!   fn parse_rfc3339_ms     -- ISO8601 -> epoch millis, no chrono dependency
 //!   fn ago                  -- epoch millis -> "4m" / "2h" / "3d"
 //!   fn fmt_duration         -- a task's elapsed run -> "4m 12s" / "1h 03m"
+//!   fn fmt_count            -- a token total -> "934" / "12.4k" / "1.2M"
 //!   fn local_offset_secs    -- the machine's UTC offset, read once from `date`
 //!   fn local_time / fmt_clock -- epoch millis -> local "3:42 PM"
 
@@ -32,16 +33,35 @@ pub const DORMANT_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 pub const STALE_HORIZON_MS: i64 = 12 * 60 * 60 * 1000;
 
 /// A session with an unresolved tool call and no log activity for this long is
-/// treated as wanting a human.
+/// treated as possibly waiting on a human.
 ///
 /// Claude Code never logs a permission prompt -- "Do you want to proceed?" is
 /// live UI state that only reaches the log once answered -- so the sole
-/// observable is a `tool_use` with no `tool_result` and a silent log. A long
-/// `cargo build` produces the same shape, so this deliberately over-reports:
-/// a false "check this one" costs a glance, while a false "still working" hides
-/// an agent parked on an approval indefinitely, which is the failure that
-/// actually wastes the day.
-pub const STALL_AFTER_MS: i64 = 45_000;
+/// observable is a `tool_use` with no `tool_result` and a silent log. A slow
+/// command produces exactly the same shape, and no amount of tuning separates
+/// them; the two remain indistinguishable in the log.
+///
+/// What changed is the calibration, and the band. At 45s this fired on ordinary
+/// work: over 74,846 real tool calls in this machine's transcripts, 2,673 ran
+/// longer than 45s -- 2,120 of them `Bash`, which is one `cargo build` or one
+/// test run -- adding up to 109 hours falsely drawn as "WAITING ON YOU". A
+/// signal that wrong stops being read, and takes the true positives with it.
+///
+/// 300s is the floor because it is above a routine build/test and still well
+/// under a human's tolerance for an unanswered prompt. Crossing it now yields
+/// [`Status::Stalled`], not [`Status::Blocked`]: a "probably fine, glance if it
+/// persists" state that no longer shares the red band with a certain question.
+pub const STALL_AFTER_MS: i64 = 300_000;
+
+/// A demand for attention older than this is history, not a demand.
+///
+/// `Errored`, `Blocked` and `Stalled` are all derived from evidence with a
+/// timestamp on it, but nothing bounded how long that evidence stayed valid: one
+/// bad classification sat at the top of the board until a human dismissed it,
+/// which is the same permanent-backlog failure [`STALE_HORIZON_MS`] removes for
+/// untested writes. Same span, separate constant -- the two age out for
+/// different reasons and want tuning apart.
+pub const ATTENTION_HORIZON_MS: i64 = 12 * 60 * 60 * 1000;
 
 /// A turn that ended this recently is treated as "the agent just handed the
 /// conversation back and is idle at the prompt". Past this, a finished session
@@ -59,8 +79,9 @@ pub const ORC_MARKER: &str = "no other agent is touching it";
 pub enum BlockedReason {
     /// AskUserQuestion / ExitPlanMode with no result: certain.
     Question,
-    /// Unresolved tool call plus a silent log: probable permission prompt, but
-    /// indistinguishable from a genuinely slow command.
+    /// Unresolved tool call plus a silent log: possibly a permission prompt, and
+    /// indistinguishable in the log from a genuinely slow command. Maps to
+    /// [`Status::Stalled`], not [`Status::Blocked`] -- see `STALL_AFTER_MS`.
     MaybeApproval,
     /// Turn ended and the agent is idle at the prompt. The single most common
     /// "waiting on you": an agent that asked something in prose, or offered a
@@ -142,8 +163,7 @@ pub enum Status {
     /// and it was previously indistinguishable from a polite "waiting on you".
     Errored,
     /// Asked a question (AskUserQuestion / ExitPlanMode) that has no tool_result
-    /// yet, or an unresolved tool call gone quiet (a probable permission prompt).
-    /// The agent has stopped and *cannot proceed* until a human answers it.
+    /// yet. The agent has stopped and *cannot proceed* until a human answers it.
     /// Ranks above everything else: nothing else on screen is costing time right
     /// now the way this is.
     Blocked,
@@ -155,6 +175,14 @@ pub enum Status {
     /// reply -- so a supervisor triaging the board can tell "look at this" apart
     /// from "run and verify this".
     AwaitingAck,
+    /// A tool call has been open for [`STALL_AFTER_MS`] with a silent log: a
+    /// permission prompt nobody answered, or a command that is simply slow. The
+    /// log cannot tell the two apart, so this state does not claim to. It is
+    /// deliberately *not* `Blocked`: sharing that band is what made the red
+    /// "WAITING ON YOU" band mostly wrong, because a long build looks like this
+    /// and there are far more long builds than unanswered prompts. Read it as
+    /// "probably fine, glance if it persists".
+    Stalled,
     /// Mid-turn -- the agent is computing.
     Working,
     /// The turn ended, but the session spun up a background agent and is waiting
@@ -174,6 +202,7 @@ impl Status {
             Status::Errored => "ERRORED",
             Status::Blocked => "WAITING ON YOU",
             Status::AwaitingAck => "AWAITING ACK",
+            Status::Stalled => "STALLED",
             Status::Working => "working",
             Status::Delegated => "running a background agent",
             Status::NeedsTest => "AWAITING TEST",
@@ -191,6 +220,7 @@ impl Status {
             Status::Errored => "errored",
             Status::Blocked => "waiting",
             Status::AwaitingAck => "your move",
+            Status::Stalled => "stalled",
             Status::Working => "working",
             Status::Delegated => "delegated",
             Status::NeedsTest => "needs test",
@@ -204,15 +234,21 @@ impl Status {
     /// outranks untested work -- both are stalled on you, but a stopped agent is
     /// burning a slot while done-but-untested work simply sits. Delegated work
     /// wants nothing from you, so it sits below everything actionable.
+    ///
+    /// `Stalled` sits below all four and above `Working`, which is the whole
+    /// point of splitting it out of `Blocked`: most of what lands there is a slow
+    /// command, so it must not push a certain question down the list, and it must
+    /// still rank above a session nobody has any reason to look at.
     pub fn rank(self) -> u8 {
         match self {
             Status::Errored => 0,
             Status::Blocked => 1,
             Status::AwaitingAck => 2,
             Status::NeedsTest => 3,
-            Status::Working => 4,
-            Status::Delegated => 5,
-            Status::Clear => 6,
+            Status::Stalled => 4,
+            Status::Working => 5,
+            Status::Delegated => 6,
+            Status::Clear => 7,
         }
     }
 }
@@ -260,6 +296,35 @@ pub struct Session {
     /// sauron's own orcs (a single-shot maintenance agent), so the UI marks it
     /// distinct from the hobbits doing your directed work.
     pub is_orc: bool,
+    /// True once the log has proved it records an explicit turn-end marker.
+    ///
+    /// For the Codex reader only. Claude Code always says when a turn ended
+    /// (`stop_reason: end_turn`), so its fold never needs this. Codex's rollout
+    /// format is implemented best-effort from documentation, and its weak
+    /// fallback -- "an assistant message means the turn ended" -- fires on
+    /// mid-turn narration too. Once a rollout shows it emits the strong marker,
+    /// the fallback is switched off for that session; a build that never emits
+    /// one keeps the fallback rather than never finishing a turn at all.
+    pub saw_turn_end_marker: bool,
+    /// Tokens billed to this session, split by how the API charges them.
+    ///
+    /// Summed from `message.usage` on assistant records, once per distinct
+    /// `message.id`: a real transcript repeats the same assistant message 2-4
+    /// times as it streams, and adding every copy reads about 2.4x high. See
+    /// `counted_messages`.
+    ///
+    /// Kept as four components rather than one figure because they are not the
+    /// same money and a surface may want to say so. What sums them for display is
+    /// [`Session::total_tokens`], and what that total means is documented there.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// `message.id`s already added into the token counters. The fold is
+    /// incremental and stateless per line -- it sees one record at a time and
+    /// never looks back -- so the only way to not double-count a repeated
+    /// message is to carry the set of ids already counted on the session.
+    pub counted_messages: BTreeSet<String>,
     /// Repo-relative path -> epoch millis of its most recent write by this session.
     pub edits: BTreeMap<String, i64>,
     /// Repo-relative path -> `(timestamp, lines)` of the most recent text an
@@ -327,12 +392,30 @@ impl Session {
             .collect()
     }
 
+    /// Total billed context movement for this session: input + output + cache
+    /// writes + cache reads.
+    ///
+    /// This is deliberately *not* "context window used" and not "money". It is
+    /// every token the API moved on this session's behalf, which is the figure
+    /// that answers "how expensive has this thread got" without a price table
+    /// baked in. Cache reads dominate it on any long session -- they are the
+    /// cheapest tokens and the most numerous -- so a surface that wants to say
+    /// something finer reads the four components off the struct instead.
+    ///
+    /// Zero for a Codex session: that reader has no usage record to fold.
+    pub fn total_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_tokens
+            + self.cache_read_tokens
+    }
+
     /// Why this session is waiting on the user, if it is. Single source of truth
     /// for the whole "needs a human" question; `status` is derived from it.
     ///
     /// The ladder, most urgent first:
     ///   1. an open question tool  -> certain, waiting.
-    ///   2. an unresolved tool call gone quiet -> probable permission prompt.
+    ///   2. an unresolved tool call gone quiet -> maybe an approval (Stalled).
     ///   3. mid-turn -> not waiting (the agent is computing, come back later).
     ///   4. turn settled with untested edits -> that is NeedsTest, not "waiting".
     ///   5. turn settled, nothing to test, stopped recently -> idle at the prompt.
@@ -345,12 +428,18 @@ impl Session {
             return Some(BlockedReason::Question);
         }
         let quiet = now.saturating_sub(self.last_activity);
-        // Nothing logged for a while with a tool call still open. Most often a
-        // permission prompt sitting unanswered on some other terminal.
-        if !self.pending_tools.is_empty() && quiet > STALL_AFTER_MS {
+        let stuck = quiet > STUCK_AFTER_MS;
+        // Nothing logged for a while with a tool call still open: maybe a
+        // permission prompt on another terminal, maybe a slow command.
+        //
+        // Bounded above by the stuck horizon, and tested *after* it, which is the
+        // ordering bug this fixes: the guess used to be returned first, so
+        // STUCK_AFTER_MS never reached it and a session killed mid-tool sat in
+        // the attention band forever. Past the horizon it falls through to the
+        // ordinary stuck-turn path and ages out.
+        if !self.pending_tools.is_empty() && quiet > STALL_AFTER_MS && !stuck {
             return Some(BlockedReason::MaybeApproval);
         }
-        let stuck = quiet > STUCK_AFTER_MS;
         // Still mid-turn: computing, not waiting.
         if !self.turn_complete && !stuck {
             return None;
@@ -384,15 +473,16 @@ impl Session {
             //   * spun up a background agent -> waiting on *it*, not you (Delegated);
             //     it resumes itself when the agent reports back.
             //   * otherwise -> AwaitingAck: a supervisor need only glance and reply.
-            // A real Question or a probable approval is different in kind -- the
-            // agent cannot proceed until a human answers -- so it stays Blocked.
-            if reason == BlockedReason::AwaitingInput {
-                if self.agent_launched_ms > 0 {
-                    return Status::Delegated;
-                }
-                return Status::AwaitingAck;
-            }
-            return Status::Blocked;
+            // A real Question is different in kind -- the agent cannot proceed
+            // until a human answers -- so it stays Blocked. A guessed approval is
+            // different again: it is a guess, and usually a wrong one, so it gets
+            // its own quieter band rather than the red one.
+            return match reason {
+                BlockedReason::AwaitingInput if self.agent_launched_ms > 0 => Status::Delegated,
+                BlockedReason::AwaitingInput => Status::AwaitingAck,
+                BlockedReason::MaybeApproval => Status::Stalled,
+                BlockedReason::Question => Status::Blocked,
+            };
         }
         // Mid-turn means the write set is still moving. Reporting it as testable
         // is the dangerous direction to be wrong in -- you go exercise a file the
@@ -491,6 +581,41 @@ pub fn fmt_duration(ms: i64) -> String {
     } else {
         format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
     }
+}
+
+/// A large count in the width a card can spare: "934", "12.4k", "1.2M".
+///
+/// Token totals reach eight figures on a long session, and eight digits in a
+/// column is a number nobody reads -- the magnitude is the whole message, and the
+/// units place carries none of it. One decimal is kept only while it still
+/// separates two plausible values (1.2k against 1.9k); past 100 of a unit it is
+/// noise and is dropped.
+///
+/// Truncates rather than rounds, so the figure never overstates and never rolls
+/// a unit ("999k", never "1000k"). Formatted here rather than in any surface, so
+/// the TUI, the web board and the beacon cannot drift apart on it. Negatives are
+/// not a real count and render as "0".
+pub fn fmt_count(n: i64) -> String {
+    const K: i64 = 1_000;
+    const M: i64 = 1_000_000;
+    if n <= 0 {
+        return "0".to_string();
+    }
+    if n < K {
+        return n.to_string();
+    }
+    if n < M {
+        let whole = n / K;
+        if whole >= 100 {
+            return format!("{}k", whole);
+        }
+        return format!("{}.{}k", whole, (n % K) / 100);
+    }
+    let whole = n / M;
+    if whole >= 100 {
+        return format!("{}M", whole);
+    }
+    format!("{}.{}M", whole, (n % M) / 100_000)
 }
 
 /// The machine's UTC offset in seconds, read once from `date +%z` ("-0700").
@@ -748,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_tool_plus_silence_reads_as_waiting_on_you() {
+    fn unresolved_tool_plus_silence_reads_as_stalled_not_waiting_on_you() {
         let now = 1_000_000_000i64;
         let mut s = Session::default();
         s.last_activity = now;
@@ -758,14 +883,130 @@ mod tests {
         assert_eq!(s.blocked_reason(now, None), None);
         assert_eq!(s.status(now, None), Status::Working);
 
-        // Still unresolved and nothing logged since: almost always a permission
-        // prompt sitting on another terminal.
+        // Still unresolved and nothing logged since: maybe a permission prompt,
+        // maybe a slow command. The log cannot say which, so this is its own
+        // quiet band -- never the red one a certain question owns.
         let later = now + STALL_AFTER_MS + 1;
         assert_eq!(
             s.blocked_reason(later, None),
             Some(BlockedReason::MaybeApproval)
         );
-        assert_eq!(s.status(later, None), Status::Blocked);
+        assert_eq!(s.status(later, None), Status::Stalled);
+        assert_ne!(s.status(later, None), Status::Blocked);
+    }
+
+    #[test]
+    fn a_routine_build_no_longer_reads_as_a_stalled_session() {
+        // The measured failure: over 74,846 real tool calls, 2,673 ran longer
+        // than the old 45s threshold -- 2,120 of them Bash. Every one of those
+        // was drawn as "WAITING ON YOU". A four-minute test run is ordinary work
+        // and must classify as ordinary work.
+        let now = 1_000_000_000i64;
+        let mut s = Session::default();
+        s.last_activity = now;
+        s.pending_tools.insert("toolu_bash".into());
+
+        for quiet in [45_001i64, 60_000, 4 * 60_000] {
+            assert_eq!(
+                s.status(now + quiet, None),
+                Status::Working,
+                "a tool open for {quiet}ms is a slow command, not a prompt"
+            );
+        }
+        // Past the new floor it is worth a glance, and no more than a glance.
+        assert_eq!(s.status(now + STALL_AFTER_MS + 1, None), Status::Stalled);
+    }
+
+    #[test]
+    fn a_stalled_session_ages_out_instead_of_sitting_there_forever() {
+        // The ordering bug: the approval guess used to be returned before the
+        // stuck test, so STUCK_AFTER_MS never reached it and a session killed
+        // mid-tool held a slot in the attention band until a human dismissed it.
+        let now = 1_000_000_000i64;
+        let mut s = Session::default();
+        s.last_activity = now;
+        s.pending_tools.insert("toolu_1".into());
+
+        assert_eq!(s.status(now + STALL_AFTER_MS + 1, None), Status::Stalled);
+        assert_eq!(s.status(now + STUCK_AFTER_MS - 1, None), Status::Stalled);
+
+        // Past the stuck horizon the turn is written off. Nothing to test here,
+        // so it lands on Clear rather than claiming a human is still needed.
+        let dead = now + STUCK_AFTER_MS + 1;
+        assert_eq!(s.blocked_reason(dead, None), None);
+        assert_eq!(s.status(dead, None), Status::Clear);
+
+        // And the writes of such a session still surface, exactly as a stuck
+        // turn's always did.
+        s.edits.insert("src/a.rs".into(), now);
+        assert_eq!(s.status(dead, None), Status::NeedsTest);
+    }
+
+    #[test]
+    fn stalled_ranks_under_every_state_that_actually_wants_a_human() {
+        // The re-band is a ranking claim as much as a colour one: a guess that is
+        // usually a slow build must never push a certain question down the list.
+        for above in [
+            Status::Errored,
+            Status::Blocked,
+            Status::AwaitingAck,
+            Status::NeedsTest,
+        ] {
+            assert!(
+                above.rank() < Status::Stalled.rank(),
+                "{above:?} must outrank a guess"
+            );
+        }
+        // But it still outranks a session nobody has a reason to look at.
+        assert!(Status::Stalled.rank() < Status::Working.rank());
+        assert!(Status::Stalled.rank() < Status::Clear.rank());
+    }
+
+    #[test]
+    fn a_certain_question_keeps_the_red_band_a_guess_lost() {
+        let now = 1_000_000_000i64;
+        let mut s = Session::default();
+        s.last_activity = now - STALL_AFTER_MS - 1;
+        s.pending_tools.insert("toolu_1".into());
+        assert_eq!(s.status(now, None), Status::Stalled);
+
+        // An AskUserQuestion/ExitPlanMode call is not a guess, and nothing about
+        // the recalibration may soften it.
+        s.open_questions.insert("toolu_1".into());
+        assert_eq!(s.blocked_reason(now, None), Some(BlockedReason::Question));
+        assert_eq!(s.status(now, None), Status::Blocked);
+    }
+
+    #[test]
+    fn total_tokens_sums_every_billed_component() {
+        let mut s = Session::default();
+        assert_eq!(s.total_tokens(), 0, "a session with no usage costs nothing");
+        s.input_tokens = 12;
+        s.output_tokens = 300;
+        s.cache_creation_tokens = 4_000;
+        s.cache_read_tokens = 50_000;
+        // Every token the API moved, cache included -- see the doc comment for
+        // why this is not "context used" and not money.
+        assert_eq!(s.total_tokens(), 54_312);
+    }
+
+    #[test]
+    fn a_count_keeps_its_magnitude_and_drops_the_digits_that_carry_none() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(934), "934");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1.0k");
+        assert_eq!(fmt_count(12_400), "12.4k");
+        // One decimal stops separating anything past 100 of a unit.
+        assert_eq!(fmt_count(934_000), "934k");
+        // Truncation, so the figure never overstates and never rolls a unit.
+        assert_eq!(fmt_count(12_499), "12.4k");
+        assert_eq!(fmt_count(999_999), "999k");
+        assert_eq!(fmt_count(1_200_000), "1.2M");
+        assert_eq!(fmt_count(1_234_567), "1.2M");
+        assert_eq!(fmt_count(250_000_000), "250M");
+        // Not a real count; must not render a minus sign into a column.
+        assert_eq!(fmt_count(-5), "0");
     }
 
     #[test]

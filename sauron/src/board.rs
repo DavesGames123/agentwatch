@@ -21,6 +21,7 @@
 //!   fn Board::ack       -- context-sensitive ack/defer by session id
 //!   fn Board::dismiss   -- drop a finished session from the board for good
 //!   fn dismissable      -- which statuses may be dismissed, and why not the rest
+//!   fn within_horizon   -- how long a row of each status stays on the board
 //!   fn Board::hot_paths -- paths a live session is touching, for orc safety
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +29,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::Agent;
 use crate::model::{
-    now_ms, BlockedReason, ErrorKind, Session, Status, DORMANT_AFTER_MS, STALE_HORIZON_MS,
+    now_ms, BlockedReason, ErrorKind, Session, Status, ATTENTION_HORIZON_MS, DORMANT_AFTER_MS,
+    STALE_HORIZON_MS,
 };
 use crate::scan::Scanner;
 use crate::store::AckStore;
@@ -50,6 +52,15 @@ pub struct Row {
     /// Repo paths written but not acked at their current timestamp.
     pub pending: Vec<String>,
     pub total_edits: usize,
+    /// Total billed context movement for the session -- input, output and both
+    /// cache figures added together. See `Session::total_tokens` for what the
+    /// number is and is not. Zero on a Codex session and on any Claude session
+    /// whose log carries no `usage`.
+    ///
+    /// Numeric, not a string: every surface formats it itself, through
+    /// `model::fmt_count`, so a board that has room for the full figure can print
+    /// it and a card that has not can compact it.
+    pub tokens: i64,
     pub last_prompt: Option<String>,
     /// One of sauron's own orcs (a single-shot maintenance agent), not a hobbit.
     pub is_orc: bool,
@@ -76,8 +87,8 @@ pub enum Dismissal {
 
 /// Whether a session in this state may be dismissed.
 ///
-/// Everything except `Working` and `Delegated`, and the exclusion is a safety
-/// property rather than a manners one. `hot_paths` -- which is what an orc
+/// Everything except `Working`, `Delegated` and `Stalled`, and the exclusion is
+/// a safety property rather than a manners one. `hot_paths` -- which is what an orc
 /// consults before it is loosed on a file -- is derived from `rows`, so a
 /// dismissed session contributes no hot files. Dismissing a session that is
 /// still writing would therefore not merely hide a row: it would tell the next
@@ -87,8 +98,39 @@ pub enum Dismissal {
 /// `Delegated` is included in the refusal for the same reason. The session
 /// itself is sitting still, but it is waiting on a sub-agent that is not, and
 /// the write-set it is holding is just as hot.
+///
+/// `Stalled` is included on the same argument, and it is the one that has to be
+/// argued rather than seen: the session looks parked, but what defines the state
+/// is an *open tool call*, and the likeliest thing that call is doing is writing
+/// files. It used to reach here as `Blocked` and was dismissable, which was
+/// already wrong; splitting the state out is what made the mistake visible.
 pub fn dismissable(status: Status) -> bool {
-    !matches!(status, Status::Working | Status::Delegated)
+    !matches!(status, Status::Working | Status::Delegated | Status::Stalled)
+}
+
+/// Whether a row of this status, this old, still belongs on the board.
+///
+/// Two horizons, one rule. Untested writes age out because whatever process
+/// preceded this tool already tested or abandoned them, and listing yesterday's
+/// buries today's. The attention states -- `Errored`, `Blocked`, `Stalled` --
+/// age out because each is read off a timestamped observation and nothing else
+/// bounded how long that observation stayed true: one misclassification sat
+/// first on the board until a human dismissed it by hand.
+///
+/// Everything else is unbounded on purpose. `Working` and `Delegated` are claims
+/// about right now and are re-derived every tick; `AwaitingAck` and `Clear` have
+/// their own exits (`RECENT_STOP_MS`, `DORMANT_AFTER_MS`) inside the classifier.
+///
+/// A free function, and the reason is that it is the rule this file exists to
+/// get right: `Board::refresh` needs a whole scanner and a `~/.claude` full of
+/// real logs, so a horizon tested only through it is a horizon tested by running
+/// the program and squinting.
+pub fn within_horizon(status: Status, age_ms: i64) -> bool {
+    match status {
+        Status::NeedsTest => age_ms <= STALE_HORIZON_MS,
+        Status::Errored | Status::Blocked | Status::Stalled => age_ms <= ATTENTION_HORIZON_MS,
+        _ => true,
+    }
 }
 
 pub struct Board {
@@ -98,7 +140,9 @@ pub struct Board {
     /// The rows to show, ranked. Rows filtered out by the horizon or the clear
     /// collapse are counted below rather than kept here.
     pub rows: Vec<Row>,
-    /// Rows past the staleness horizon, kept out of `rows` but counted.
+    /// Rows past a horizon -- untested work past `STALE_HORIZON_MS`, or an
+    /// attention state past `ATTENTION_HORIZON_MS` -- kept out of `rows` but
+    /// counted. See `within_horizon`.
     pub hidden_stale: usize,
     /// Clear sessions are counted but kept out of `rows` unless `show_clear`.
     pub clear_count: usize,
@@ -186,12 +230,16 @@ impl Board {
         // Collapse the historical backlog. Sessions from days ago were tested
         // (or abandoned) by whatever process preceded this tool; listing them as
         // outstanding buries today's actual work.
+        //
+        // The attention states age out the same way, and for a sharper reason:
+        // `Errored`, `Blocked` and `Stalled` are read off evidence with a
+        // timestamp on it, but nothing bounded how long that evidence stayed
+        // good. One misclassification held the top of the board until a human
+        // dismissed it by hand -- permanent, and permanently first. Both horizons
+        // are lifted by `show_all`, so nothing is destroyed, only put away.
         let before = rows.len();
         if !self.show_all {
-            rows.retain(|r| {
-                r.status != Status::NeedsTest
-                    || now.saturating_sub(r.last_activity) <= STALE_HORIZON_MS
-            });
+            rows.retain(|r| within_horizon(r.status, now.saturating_sub(r.last_activity)));
         }
         self.hidden_stale = before - rows.len();
 
@@ -268,6 +316,7 @@ impl Board {
             error: s.error,
             pending,
             total_edits: s.edits.len(),
+            tokens: s.total_tokens(),
             last_prompt: s.last_prompt.clone(),
             is_orc: s.is_orc,
             continue_cmd: s.continue_command(),
@@ -411,9 +460,18 @@ impl Board {
     pub fn hot_paths(&self) -> BTreeSet<String> {
         let mut hot = BTreeSet::new();
         for r in &self.rows {
+            // `Stalled` is in this set because it was in it before the split --
+            // those sessions arrived here as `Blocked` -- and because an open
+            // tool call is the definition of the state. Dropping it would tell
+            // the next orc that a file some Bash call is halfway through writing
+            // is cold.
             if matches!(
                 r.status,
-                Status::Working | Status::Delegated | Status::Blocked | Status::NeedsTest
+                Status::Working
+                    | Status::Delegated
+                    | Status::Blocked
+                    | Status::Stalled
+                    | Status::NeedsTest
             ) {
                 hot.extend(r.edits.keys().cloned());
             }
@@ -430,11 +488,19 @@ impl Board {
             .count()
     }
 
-    /// Sessions mid-turn right now, including ones waiting on a sub-agent.
+    /// Sessions mid-turn right now: computing, waiting on a sub-agent, or quiet
+    /// with a tool call still open. `Stalled` belongs here rather than in
+    /// `waiting_count` -- it is a guess about a slow command, and counting it as
+    /// a demand on the human is exactly the over-reporting the split removed.
     pub fn working_count(&self) -> usize {
         self.rows
             .iter()
-            .filter(|r| matches!(r.status, Status::Working | Status::Delegated))
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    Status::Working | Status::Delegated | Status::Stalled
+                )
+            })
             .count()
     }
 
@@ -460,16 +526,22 @@ pub fn git_root() -> Option<PathBuf> {
     }
 }
 
-/// The in-flight sessions for a repo -- mid-turn (`Working`) or waiting on a
-/// background agent it spawned (`Delegated`) -- as `(session_id, display_name)`.
-/// The same set `--list-working` prints and the TUI shows, so `sauron workspace`
-/// reopens exactly the sessions the tool counts as live.
+/// The in-flight sessions for a repo -- mid-turn (`Working`), waiting on a
+/// background agent it spawned (`Delegated`), or quiet with a tool call still
+/// open (`Stalled`) -- as `(session_id, display_name)`. The same set
+/// `--list-working` prints and the TUI shows, so `sauron workspace` reopens
+/// exactly the sessions the tool counts as live.
 pub fn in_flight_tasks(repo_root: PathBuf, agent: Agent) -> Vec<(String, String)> {
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     Board::new(repo_root, agent)
         .rows
         .iter()
-        .filter(|r| matches!(r.status, Status::Working | Status::Delegated))
+        .filter(|r| {
+            matches!(
+                r.status,
+                Status::Working | Status::Delegated | Status::Stalled
+            )
+        })
         .map(|r| (r.id.clone(), crate::model::collapse_ws(&r.name)))
         .collect()
 }
@@ -493,7 +565,7 @@ mod tests {
     /// cannot clear of dead rows is the failure this key exists to fix.
     #[test]
     fn only_a_session_nobody_is_writing_through_can_be_dismissed() {
-        for s in [Status::Working, Status::Delegated] {
+        for s in [Status::Working, Status::Delegated, Status::Stalled] {
             assert!(!dismissable(s), "{s:?} is mid-turn; its files are still hot");
         }
         for s in [
@@ -561,6 +633,80 @@ mod tests {
         kept.edits.insert("src/a.rs".into(), now);
         assert!(board.to_row(kept, now).is_some(), "the filter caught a bystander");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug: nothing bounded how long a classification stayed on the board.
+    /// A session misread as blocked at 9am was still first on the list at
+    /// midnight, and only a keypress could remove it.
+    #[test]
+    fn an_attention_state_stops_demanding_attention_once_its_evidence_is_old() {
+        for s in [Status::Errored, Status::Blocked, Status::Stalled] {
+            assert!(within_horizon(s, ATTENTION_HORIZON_MS - 1), "{s:?} is fresh");
+            assert!(
+                !within_horizon(s, ATTENTION_HORIZON_MS + 1),
+                "{s:?} outlived its evidence"
+            );
+        }
+        // Untested writes keep their own, older horizon.
+        assert!(within_horizon(Status::NeedsTest, STALE_HORIZON_MS - 1));
+        assert!(!within_horizon(Status::NeedsTest, STALE_HORIZON_MS + 1));
+
+        // The rest are unbounded on purpose: two are claims about right now and
+        // are re-derived every tick, and two have their own exits inside the
+        // classifier (RECENT_STOP_MS, DORMANT_AFTER_MS).
+        for s in [
+            Status::Working,
+            Status::Delegated,
+            Status::AwaitingAck,
+            Status::Clear,
+        ] {
+            assert!(
+                within_horizon(s, 30 * DORMANT_AFTER_MS),
+                "{s:?} must not be aged out here"
+            );
+        }
+    }
+
+    /// A stalled session looks parked and is not: what defines the state is an
+    /// open tool call, and the likeliest thing that call is doing is writing.
+    /// `hot_paths` is what an orc consults before it is loosed on a file, so a
+    /// gap here is a refactor landing on a file mid-edit.
+    #[test]
+    fn a_stalled_session_still_reports_its_files_as_hot() {
+        let dir = scratch("hot");
+        let store = AckStore::load_at(dir.clone());
+        let mut board = Board::with_store(dir.join("repo"), Agent::Claude, store);
+        let now = now_ms();
+        let row = |id: &str, status: Status| Row {
+            id: id.into(),
+            id_short: id.into(),
+            name: id.into(),
+            branch: None,
+            last_activity: now,
+            turn_started: 0,
+            status,
+            blocked_reason: None,
+            error: None,
+            pending: Vec::new(),
+            total_edits: 1,
+            tokens: 0,
+            last_prompt: None,
+            is_orc: false,
+            continue_cmd: String::new(),
+            edits: [(format!("src/{id}.rs"), now)].into_iter().collect(),
+            previews: BTreeMap::new(),
+        };
+        board.rows = vec![row("stalled", Status::Stalled), row("done", Status::Clear)];
+
+        let hot = board.hot_paths();
+        assert!(hot.contains("src/stalled.rs"), "a stalled session's files are hot");
+        assert!(!hot.contains("src/done.rs"));
+
+        // And it counts as live work, not as a demand on the human -- which is
+        // the whole reason it was split out of the red band.
+        assert_eq!(board.working_count(), 1);
+        assert_eq!(board.waiting_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

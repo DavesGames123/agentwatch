@@ -26,11 +26,26 @@
 //! rollout never changes once written, so the verdict is remembered per file and
 //! the probe runs once per rollout instead of once per tick.
 //!
+//! TOKENS ARE NOT AVAILABLE HERE
+//! -----------------------------
+//! A Codex session's token total stays zero, and that is a finding rather than
+//! an omission. The rollout store this reader is written against does not exist
+//! on this machine at all: that install keeps its state in
+//! `~/.codex/state_5.sqlite`, whose `threads` table carries a `tokens_used`
+//! column. The crate already links rusqlite (see `clip::store`), so the missing
+//! parts are not the dependency -- they are a second discovery path over thread
+//! rows rather than rollout files, and a way to marry a thread id to the session
+//! ids this module hands out. Both are guesswork until one machine has the
+//! rollout files and the database together to check an id against. Recorded here
+//! so the next person does not go looking for the sessions directory and
+//! conclude the feature is simply missing.
+//!
 //! grep targets:
 //!   fn session_files   -- rollouts whose cwd is this repo
 //!   fn has_session_for -- the same question, answered on the first hit
 //!   fn rollout_cwd     -- the cached header probe
 //!   fn fold            -- one rollout record -> Session mutation
+//!   TURN_END_TYPES     -- the strong turn-end markers, and their weak fallback
 //!   fn patch_paths     -- files out of an apply_patch envelope
 
 use std::collections::HashMap;
@@ -152,6 +167,20 @@ fn read_rollout_cwd(path: &Path) -> Option<String> {
     None
 }
 
+/// Record types that mean "the turn is over", at either level of the envelope.
+///
+/// Codex emits one of these when a task finishes, aborts, or is interrupted --
+/// the counterpart of Claude Code's `stop_reason: end_turn`. Several spellings
+/// are matched because the reader is written from documentation rather than from
+/// a certified rollout; an extra name costs nothing, and a missing one costs a
+/// session that never reads as finished.
+const TURN_END_TYPES: [&str; 4] = [
+    "task_complete",
+    "task_finished",
+    "turn_complete",
+    "turn_aborted",
+];
+
 /// Fold one Codex rollout record into the session.
 pub fn fold(session: &mut Session, v: &Value, repo: &Path) {
     if let Some(ms) = field(v, "timestamp").and_then(parse_rfc3339_ms) {
@@ -162,7 +191,17 @@ pub fn fold(session: &mut Session, v: &Value, repo: &Path) {
 
     // A record may be a raw item or wrapped as {type, payload}; fold the item.
     let item = v.get("payload").unwrap_or(v);
-    match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    // The strong turn-end marker, wherever it appears. Once a rollout has shown
+    // it emits one, it is the only thing that ends a turn in this session.
+    if TURN_END_TYPES.contains(&item_type) {
+        session.saw_turn_end_marker = true;
+        session.turn_complete = true;
+        return;
+    }
+
+    match item_type {
         "message" => match item.get("role").and_then(|r| r.as_str()).unwrap_or("") {
             "user" => {
                 session.turn_complete = false;
@@ -175,7 +214,20 @@ pub fn fold(session: &mut Session, v: &Value, repo: &Path) {
                     session.last_prompt = Some(t.to_string());
                 }
             }
-            "assistant" => session.turn_complete = true,
+            // An assistant message is the *weak* marker, and on its own it is
+            // wrong: Codex narrates between tool calls, so every "now I'll check
+            // the tests" ended the turn and parked the session at "your move"
+            // until the next tool call arrived. The Claude reader has never had
+            // this problem because it waits for an explicit `end_turn`; this is
+            // the same gate, with a fallback for a build that logs no marker at
+            // all. Dropping the fallback outright would leave such a session
+            // reading Working until STUCK_AFTER_MS -- half an hour -- and the
+            // format here is documented, not certified.
+            "assistant" => {
+                if !session.saw_turn_end_marker {
+                    session.turn_complete = true;
+                }
+            }
             _ => {}
         },
         // Any tool call means the turn is still in flight; an apply_patch also
@@ -233,7 +285,7 @@ fn patch_paths(item: &Value) -> Vec<String> {
         .lines()
         .filter_map(|l| {
             let l = l.trim_start();
-            ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+            PATCH_TAGS
                 .iter()
                 .find_map(|tag| l.strip_prefix(tag))
                 .map(|rest| rest.trim().to_string())
@@ -258,8 +310,26 @@ fn find_patch_text(item: &Value) -> Option<String> {
     None
 }
 
+/// The tags `patch_paths` reads. Kept next to it so the recogniser and the
+/// parser cannot drift: a string that passes `is_patch` and yields no paths is
+/// how a false write-set gets built.
+const PATCH_TAGS: [&str; 3] = ["*** Update File: ", "*** Add File: ", "*** Delete File: "];
+
+/// Whether a string is an apply_patch envelope, judged line by line.
+///
+/// It used to be `s.contains("*** ") && s.contains(" File: ")` -- two substrings
+/// anywhere in the same string, in any order, on any lines. Ordinary command
+/// output satisfies that: a `grep` hit and the word "File:" a hundred lines
+/// apart were enough. Every such string was then handed to `patch_paths`, and
+/// what it found there inflated the write-set into a session that appeared to
+/// have edited files it never touched -- a false AWAITING TEST.
+///
+/// A real envelope puts its tag at the start of a line, so that is what is
+/// matched. Leading whitespace is tolerated because the patch commonly arrives
+/// as a JSON string that some layer has indented.
 fn is_patch(s: &str) -> bool {
-    s.contains("*** ") && s.contains(" File: ")
+    s.lines()
+        .any(|l| PATCH_TAGS.iter().any(|tag| l.trim_start().starts_with(tag)))
 }
 
 fn collect_strings(v: &Value) -> Vec<String> {
@@ -378,5 +448,86 @@ mod tests {
             repo,
         );
         assert!(s.turn_complete);
+    }
+
+    #[test]
+    fn narration_between_tool_calls_does_not_end_the_turn() {
+        // The bug: any assistant message ended the turn, so "now I'll check the
+        // tests" parked the session at "your move" while it was mid-task.
+        let repo = Path::new("/repo");
+        let mut s = Session::default();
+
+        // Once the rollout proves it logs the strong marker, the weak one is off.
+        fold(
+            &mut s,
+            &json!({"type":"event_msg","timestamp":"2026-07-22T10:00:00.000Z",
+                    "payload":{"type":"task_complete"}}),
+            repo,
+        );
+        assert!(s.turn_complete && s.saw_turn_end_marker);
+
+        fold(
+            &mut s,
+            &json!({"type":"response_item","timestamp":"2026-07-22T10:01:00.000Z",
+                    "payload":{"type":"message","role":"user",
+                               "content":[{"type":"input_text","text":"do it again"}]}}),
+            repo,
+        );
+        assert!(!s.turn_complete);
+
+        fold(
+            &mut s,
+            &json!({"type":"response_item","timestamp":"2026-07-22T10:01:05.000Z",
+                    "payload":{"type":"message","role":"assistant",
+                               "content":[{"type":"output_text","text":"Now I'll run the tests."}]}}),
+            repo,
+        );
+        assert!(!s.turn_complete, "mid-turn narration is not a handback");
+
+        // The marker, and only the marker, settles it.
+        fold(
+            &mut s,
+            &json!({"type":"event_msg","timestamp":"2026-07-22T10:02:00.000Z",
+                    "payload":{"type":"task_complete"}}),
+            repo,
+        );
+        assert!(s.turn_complete);
+    }
+
+    #[test]
+    fn a_rollout_with_no_marker_keeps_the_weak_fallback() {
+        // The format here is documented, not certified. A build that logs no
+        // turn-end record must not leave every session reading Working until the
+        // half-hour stuck horizon releases it.
+        let repo = Path::new("/repo");
+        let mut s = Session::default();
+        fold(
+            &mut s,
+            &json!({"type":"response_item","timestamp":"2026-07-22T10:00:00.000Z",
+                    "payload":{"type":"message","role":"assistant",
+                               "content":[{"type":"output_text","text":"done"}]}}),
+            repo,
+        );
+        assert!(s.turn_complete, "no marker seen -- the fallback still applies");
+        assert!(!s.saw_turn_end_marker);
+    }
+
+    #[test]
+    fn command_output_mentioning_a_file_is_not_a_patch() {
+        // `contains("*** ") && contains(" File: ")` matched two substrings
+        // anywhere in one string, in any order, lines apart. Ordinary output
+        // satisfied it, and whatever `patch_paths` then scraped out inflated the
+        // write-set into a session that appeared to have edited files it never
+        // touched -- a false AWAITING TEST.
+        let noise = "*** banner ***\nchecked 400 lines\nSee File: docs/readme.md for details";
+        assert!(!is_patch(noise));
+        assert!(patch_paths(&json!({"type":"local_shell_call","output":noise})).is_empty());
+
+        // A tag that is real but not at the start of a line is still not one.
+        assert!(!is_patch("grep found: *** Update File: src/a.rs"));
+
+        // The genuine envelope still parses, indented or not.
+        assert!(is_patch("*** Begin Patch\n*** Update File: src/a.rs\n+x\n*** End Patch"));
+        assert!(is_patch("  *** Add File: src/b.rs\n+y"));
     }
 }

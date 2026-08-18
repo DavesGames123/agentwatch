@@ -35,6 +35,7 @@ pub fn status_key(s: Status) -> &'static str {
         Status::Working => "working",
         Status::Delegated => "delegated",
         Status::NeedsTest => "needs-test",
+        Status::Stalled => "stalled",
         Status::Clear => "clear",
     }
 }
@@ -181,6 +182,7 @@ mod tests {
             error: None,
             pending: vec!["src/ui.rs".into()],
             total_edits: 3,
+            tokens: 0,
             last_prompt: None,
             is_orc: false,
             continue_cmd: "claude --resume abc".into(),

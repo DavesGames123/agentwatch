@@ -929,6 +929,7 @@ fn print_once(app: &App) {
             Status::NeedsTest => "█",
             Status::Working => "◐",
             Status::Delegated => "◇",
+            Status::Stalled => "◔",
             Status::Clear => "·",
         };
         println!(

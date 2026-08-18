@@ -244,6 +244,7 @@ pub fn status_token(s: Status) -> &'static str {
         Status::Working => "working",
         Status::Delegated => "delegated",
         Status::NeedsTest => "needs_test",
+        Status::Stalled => "stalled",
         Status::Clear => "clear",
     }
 }

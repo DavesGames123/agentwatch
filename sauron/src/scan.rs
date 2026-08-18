@@ -11,6 +11,9 @@
 //!   struct Scanner          -- owns per-file offsets and folded sessions
 //!   fn Scanner::refresh     -- tail each session file, fold new records
 //!   fn fold_record          -- one Claude Code record -> mutation on a Session
+//!   fn is_human_prompt      -- a user record a person typed, vs a tool result
+//!   fn advances_activity    -- which records are evidence a session is alive
+//!   fn fold_usage           -- message.usage -> the session's token counters
 //!   fn claude_session_files -- the jsonl for a repo under ~/.claude/projects
 //!   fn project_dir_for      -- /a/b/c -> ~/.claude/projects/-a-b-c
 
@@ -151,9 +154,11 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
         .get("timestamp")
         .and_then(|t| t.as_str())
         .and_then(parse_rfc3339_ms);
-    if let Some(ms) = record_ms {
-        if ms > session.last_activity {
-            session.last_activity = ms;
+    if advances_activity(kind, v) {
+        if let Some(ms) = record_ms {
+            if ms > session.last_activity {
+                session.last_activity = ms;
+            }
         }
     }
 
@@ -200,35 +205,57 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
                     _ => {}
                 }
             }
+
+            fold_usage(session, v);
         }
         "user" => {
             // isMeta records are harness bookkeeping (command caveats, hook
             // output), not the user or a tool actually driving the turn.
             if v.get("isMeta").and_then(|m| m.as_bool()) != Some(true) {
-                // A user record that arrives while the previous turn was complete
-                // (or before any turn has started) opens a new task -- stamp its
-                // start. Tool-result user records mid-turn leave turn_complete
-                // already false, so they do not reset the clock, which is what
-                // makes `now - turn_started_ms` the running task's real age rather
-                // than the time since its last tool call.
-                if session.turn_complete || session.turn_started_ms == 0 {
+                let human = is_human_prompt(v);
+                // A *human* prompt that arrives while the previous turn was
+                // complete (or before any turn has started) opens a new task --
+                // stamp its start. A tool result must never stamp it: it is the
+                // agent's own work coming back, and re-stamping restarts the
+                // elapsed timer on every tool call, so a task that has run an
+                // hour reads as seconds old.
+                //
+                // `turn_complete` alone used to carry this, on the assumption
+                // that a mid-turn tool result always finds it false. It does not:
+                // the stop hook sets it true, and the tool result that follows an
+                // aborted-looking turn then re-opened the clock.
+                if human && (session.turn_complete || session.turn_started_ms == 0) {
                     session.turn_started_ms = record_ms.unwrap_or(session.last_activity);
                 }
+                // Both kinds put the session back in flight: a tool result means
+                // the agent has more to do, a prompt means the human asked for
+                // more. This one is right as it stands.
                 session.turn_complete = false;
-                // A real user turn after a failure means the human already
-                // engaged it (a retry, a new prompt) -- the error is stale.
-                session.error = None;
+                // Deliberate: only a human prompt clears a recorded failure. The
+                // rule was "the human already engaged it (a retry, a new
+                // prompt)", and a tool result is neither -- it is the agent's own
+                // machinery, and letting it clear the flag would hide an API
+                // error behind the next tool call. A session that genuinely
+                // recovered still clears it, on the next healthy assistant stop.
+                if human {
+                    session.error = None;
+                }
                 // The tool result for a spawned background agent is a user
-                // record too: it starts the "waiting on the agent" clock. Any
-                // other real user turn -- a human prompt, or the agent reporting
-                // its result back -- supersedes that wait and clears it.
+                // record too: it starts the "waiting on the agent" clock. Only a
+                // human prompt supersedes that wait.
+                //
+                // Clearing it on *any* user record is what lost the flag on 241
+                // of 617 measured launches -- 39% -- because every tool result
+                // the session logged afterwards counted as one, and the session
+                // then reported "stopped -- your move" while its subagent was
+                // still running.
                 if mentions_async_launch(v) {
                     session.agent_launched_ms = v
                         .get("timestamp")
                         .and_then(|t| t.as_str())
                         .and_then(parse_rfc3339_ms)
                         .unwrap_or(session.last_activity);
-                } else {
+                } else if human {
                     session.agent_launched_ms = 0;
                 }
             }
@@ -237,7 +264,9 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
         // robust turn-end marker than end_turn alone: an agent that stopped to
         // ask a question in prose still triggers them, and they arrive after any
         // trailing assistant record. This is what catches the idle-at-prompt
-        // case that end_turn tracking alone missed.
+        // case that end_turn tracking alone missed. Every one sampled follows an
+        // end_turn within 60ms, so letting them carry the session's clock is
+        // safe -- see `advances_activity` for the subtypes that do not.
         "system" => {
             let sub = v.get("subtype").and_then(|s| s.as_str());
             if matches!(sub, Some("stop_hook_summary") | Some("turn_duration")) {
@@ -287,6 +316,84 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
     // Tool results ride on `user` records regardless of the write-set deltas, so
     // harvest the edited text here, outside the `kind` match.
     fold_edit_preview(session, v, repo_root);
+}
+
+/// True when a `user` record is something a person typed, rather than a tool
+/// result the agent's own machinery posted back.
+///
+/// The single distinction three separate misreads rested on. `isMeta` was doing
+/// this job, and `isMeta` is absent from every real record on disk -- so every
+/// tool result counted as a human turn: it cleared the background-agent flag
+/// (39% of measured launches lost it and reported "your move" while the subagent
+/// ran), it re-stamped the task clock, and it cleared recorded errors.
+///
+/// The observable that does hold: Claude Code posts a tool result as a user
+/// record whose `message.content` is an *array* carrying `tool_result` blocks. A
+/// typed prompt is a plain string, or an array of `text` blocks. Anything
+/// unrecognised counts as human, which is the safe direction -- treating a
+/// prompt as a tool result would freeze the task clock for the whole session.
+fn is_human_prompt(v: &Value) -> bool {
+    let Some(blocks) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return true;
+    };
+    !blocks
+        .iter()
+        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+}
+
+/// Whether a record is evidence the session was alive at its timestamp.
+///
+/// Everything is, except a `system` record of an unrecognised subtype. Those are
+/// harness events with no agent behind them: a `local_command` was observed at
+/// 23:15:46 on a session whose last real activity was 21:15:05, two hours dead,
+/// and advancing the clock from it pulled the session back inside RECENT_STOP_MS
+/// and relit it as "AWAITING ACK -- your move". `away_summary` does the same.
+///
+/// The two turn-end subtypes are exempt because they are not independent events:
+/// every one sampled follows an `end_turn` within 60ms, so the clock they set is
+/// the clock the turn already had.
+fn advances_activity(kind: &str, v: &Value) -> bool {
+    if kind != "system" {
+        return true;
+    }
+    matches!(
+        v.get("subtype").and_then(|s| s.as_str()),
+        Some("stop_hook_summary") | Some("turn_duration")
+    )
+}
+
+/// Add one assistant record's `message.usage` into the session's token counters.
+///
+/// Deduplicated on `message.id`, which is the whole difficulty. Claude Code
+/// writes the same assistant message to the log 2-4 times as it streams -- one
+/// sampled transcript held 24 assistant records over 10 distinct ids -- and each
+/// copy carries a `usage` block. Summing them reads roughly 2.4x high, and reads
+/// *plausibly* high, which is worse: nothing on screen would look wrong.
+///
+/// A record with usage but no `message.id` is counted rather than dropped. That
+/// direction can only over-count a record the log gave us no way to recognise
+/// again; the other direction silently loses real tokens.
+fn fold_usage(session: &mut Session, v: &Value) {
+    let Some(msg) = v.get("message") else {
+        return;
+    };
+    let Some(usage) = msg.get("usage") else {
+        return;
+    };
+    if let Some(id) = msg.get("id").and_then(|i| i.as_str()) {
+        if !session.counted_messages.insert(id.to_string()) {
+            return;
+        }
+    }
+    let n = |key: &str| usage.get(key).and_then(|x| x.as_i64()).unwrap_or(0);
+    session.input_tokens += n("input_tokens");
+    session.output_tokens += n("output_tokens");
+    session.cache_creation_tokens += n("cache_creation_input_tokens");
+    session.cache_read_tokens += n("cache_read_input_tokens");
 }
 
 /// True when this user record carries the "Async agent launched successfully"
@@ -1043,6 +1150,269 @@ mod tests {
             root,
         );
         assert_eq!(s.error, None, "stop_sequence must not read as an error");
+        let now = parse_rfc3339_ms("2026-07-21T18:00:05.000Z").unwrap();
+        assert_ne!(s.status(now, None), Status::Errored);
+    }
+
+    #[test]
+    fn a_tool_result_is_not_a_human_prompt() {
+        // The one distinction three misreads rested on. `isMeta` was doing this
+        // job and is absent from every real record, so every tool result counted
+        // as a person typing.
+        assert!(!is_human_prompt(&json!({"message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"}]}})));
+        // A typed prompt arrives as a bare string ...
+        assert!(is_human_prompt(&json!({"message":{"role":"user","content":"do the thing"}})));
+        // ... or as text blocks, which a tool result never is.
+        assert!(is_human_prompt(&json!({"message":{"role":"user","content":[
+            {"type":"text","text":"do the thing"}]}})));
+        // Anything unrecognised counts as human: treating a prompt as a tool
+        // result would freeze the task clock for the session's whole life.
+        assert!(is_human_prompt(&json!({"message":{"role":"user"}})));
+        assert!(is_human_prompt(&json!({})));
+    }
+
+    #[test]
+    fn a_tool_result_does_not_clear_the_background_agent_flag() {
+        // 241 of 617 measured launches lost the flag this way and reported
+        // "stopped -- your move" while the subagent was still running: the
+        // launch's own tool result set it, and the very next tool result of any
+        // kind cleared it again.
+        use crate::model::Status;
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+
+        fold_record(
+            &mut s,
+            &json!({
+                "type":"user","timestamp":"2026-07-22T05:00:00.000Z",
+                "message":{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":[
+                        {"type":"text","text":"Async agent launched successfully. agentId: abc"}
+                    ]}
+                ]}
+            }),
+            root,
+        );
+        assert!(s.agent_launched_ms > 0);
+
+        // The session keeps working while the agent runs, and every tool result
+        // it logs used to wipe the flag.
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-22T05:00:30.000Z",
+                    "message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}),
+            root,
+        );
+        assert!(s.agent_launched_ms > 0, "a tool result is not a human turn");
+
+        // With the turn settled it must read as Delegated, never AwaitingAck.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-22T05:01:00.000Z",
+                    "message":{"stop_reason":"end_turn"}}),
+            root,
+        );
+        let now = parse_rfc3339_ms("2026-07-22T05:01:10.000Z").unwrap();
+        assert_eq!(s.status(now, None), Status::Delegated);
+
+        // A person typing still supersedes the wait, which is the whole point of
+        // keeping the clear at all.
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-22T05:02:00.000Z",
+                    "message":{"role":"user","content":"never mind, do this instead"}}),
+            root,
+        );
+        assert_eq!(s.agent_launched_ms, 0);
+    }
+
+    #[test]
+    fn a_tool_result_after_a_stop_hook_does_not_restart_the_task_clock() {
+        // `turn_complete` alone used to guard the stamp, on the assumption that a
+        // mid-turn tool result always finds it false. The stop hook sets it true,
+        // and the next tool result then re-stamped the start -- an hour-old task
+        // reading as seconds old.
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T22:00:00.000Z",
+                    "message":{"role":"user","content":"do the thing"}}),
+            root,
+        );
+        let start = parse_rfc3339_ms("2026-07-24T22:00:00.000Z").unwrap();
+
+        fold_record(
+            &mut s,
+            &json!({"type":"system","subtype":"stop_hook_summary",
+                    "timestamp":"2026-07-24T22:00:01.000Z"}),
+            root,
+        );
+        assert!(s.turn_complete);
+
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T23:00:00.000Z",
+                    "message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t9"}]}}),
+            root,
+        );
+        assert_eq!(s.turn_started_ms, start, "a tool result must never open a task");
+
+        // A person typing after the turn has settled does open one -- which is
+        // what the stamp is for, and what must survive the tighter guard.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-24T23:29:00.000Z",
+                    "message":{"stop_reason":"end_turn"}}),
+            root,
+        );
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-24T23:30:00.000Z",
+                    "message":{"role":"user","content":"next thing"}}),
+            root,
+        );
+        assert_eq!(
+            s.turn_started_ms,
+            parse_rfc3339_ms("2026-07-24T23:30:00.000Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_system_subtype_does_not_resurrect_a_dead_session() {
+        // Observed: a `local_command` at 23:15:46 on a session whose last real
+        // activity was 21:15:05. Two hours dead, and the record pulled it back
+        // inside RECENT_STOP_MS and relit it as "AWAITING ACK -- your move".
+        use crate::model::Status;
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-21T21:15:05.000Z",
+                    "message":{"stop_reason":"end_turn"}}),
+            root,
+        );
+        let last_real = parse_rfc3339_ms("2026-07-21T21:15:05.000Z").unwrap();
+        assert_eq!(s.last_activity, last_real);
+
+        for sub in ["local_command", "away_summary"] {
+            fold_record(
+                &mut s,
+                &json!({"type":"system","subtype":sub,
+                        "timestamp":"2026-07-21T23:15:46.000Z"}),
+                root,
+            );
+            assert_eq!(s.last_activity, last_real, "{sub} moved the session's clock");
+        }
+
+        // Two hours after the real end, it is history -- not something waiting.
+        let now = parse_rfc3339_ms("2026-07-21T23:15:50.000Z").unwrap();
+        assert_eq!(s.status(now, None), Status::Clear);
+
+        // The two turn-end subtypes still carry the clock: each follows an
+        // end_turn within 60ms, so the time they set is the turn's own.
+        fold_record(
+            &mut s,
+            &json!({"type":"system","subtype":"stop_hook_summary",
+                    "timestamp":"2026-07-21T23:16:00.000Z"}),
+            root,
+        );
+        assert_eq!(
+            s.last_activity,
+            parse_rfc3339_ms("2026-07-21T23:16:00.000Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn assistant_usage_is_counted_once_per_message_id() {
+        // The transcript on disk repeats one assistant message 2-4 times as it
+        // streams, each copy carrying the same usage block. One sampled file held
+        // 24 assistant records over 10 distinct ids; summing every copy reads
+        // about 2.4x high, and reads plausibly high, which is worse.
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+        let rec = |id: &str, out: i64| {
+            json!({"type":"assistant","timestamp":"2026-07-21T18:00:00.000Z",
+                   "message":{"id":id,"stop_reason":"tool_use","usage":{
+                       "input_tokens":10,
+                       "output_tokens":out,
+                       "cache_creation_input_tokens":100,
+                       "cache_read_input_tokens":1_000}}})
+        };
+
+        fold_record(&mut s, &rec("msg_a", 5), root);
+        fold_record(&mut s, &rec("msg_a", 5), root);
+        fold_record(&mut s, &rec("msg_a", 5), root);
+        assert_eq!(s.output_tokens, 5, "a repeated id must be counted once");
+        assert_eq!(s.total_tokens(), 1_115);
+
+        // A genuinely new message adds.
+        fold_record(&mut s, &rec("msg_b", 7), root);
+        assert_eq!(s.input_tokens, 20);
+        assert_eq!(s.output_tokens, 12);
+        assert_eq!(s.cache_creation_tokens, 200);
+        assert_eq!(s.cache_read_tokens, 2_000);
+        assert_eq!(s.total_tokens(), 2_232);
+
+        // Usage with no id cannot be recognised again, so it is counted rather
+        // than dropped -- over-counting an unidentifiable record beats silently
+        // losing real tokens.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","message":{"usage":{"output_tokens":3}}}),
+            root,
+        );
+        assert_eq!(s.output_tokens, 15);
+
+        // A record with no usage at all leaves the counters alone.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","message":{"id":"msg_c","stop_reason":"end_turn"}}),
+            root,
+        );
+        assert_eq!(s.total_tokens(), 2_235);
+    }
+
+    #[test]
+    fn a_tool_result_does_not_clear_a_recorded_error() {
+        // Deliberate, and the counterpart to `api_error_outranks_the_stop_hook`:
+        // the rule was "the human already engaged it", and the agent's own
+        // machinery posting a result back is not a human engaging anything.
+        use crate::model::Status;
+        let root = Path::new("/repo");
+        let mut s = Session::default();
+
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","isApiErrorMessage":true,
+                    "timestamp":"2026-07-21T18:00:00.000Z",
+                    "message":{"role":"assistant","stop_reason":null}}),
+            root,
+        );
+        assert_eq!(s.error, Some(ErrorKind::ApiError));
+
+        fold_record(
+            &mut s,
+            &json!({"type":"user","timestamp":"2026-07-21T18:00:02.000Z",
+                    "message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t1"}]}}),
+            root,
+        );
+        assert_eq!(s.error, Some(ErrorKind::ApiError), "a tool result is not a retry");
+
+        // A session that genuinely recovered clears it on the next healthy stop.
+        fold_record(
+            &mut s,
+            &json!({"type":"assistant","timestamp":"2026-07-21T18:00:03.000Z",
+                    "message":{"stop_reason":"end_turn"}}),
+            root,
+        );
+        assert_eq!(s.error, None);
         let now = parse_rfc3339_ms("2026-07-21T18:00:05.000Z").unwrap();
         assert_ne!(s.status(now, None), Status::Errored);
     }

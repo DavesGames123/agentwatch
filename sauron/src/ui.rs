@@ -66,6 +66,7 @@ pub fn color_of(status: Status) -> Color {
         Status::NeedsTest => GOLD,
         Status::Working => CYAN,
         Status::Delegated => INDIGO,
+        Status::Stalled => AMBER,
         Status::Clear => DIM,
     }
 }
@@ -79,6 +80,7 @@ fn glyph_of(status: Status) -> &'static str {
         Status::NeedsTest => "█",
         Status::Working => "◐",
         Status::Delegated => "◇",
+        Status::Stalled => "◔",
         Status::Clear => "·",
     }
 }
@@ -664,6 +666,7 @@ fn section_header(status: Status, count: usize, width: usize) -> ListItem<'stati
         Status::NeedsTest => ("AWAITING TESTING", GOLD),
         Status::Working => ("WORKING", CYAN),
         Status::Delegated => ("RUNNING A BACKGROUND AGENT", INDIGO),
+        Status::Stalled => ("STALLED", AMBER),
         Status::Clear => ("CLEAR", DIM),
     };
     let text = format!(" {} ({}) ", label, count);
@@ -736,6 +739,7 @@ fn card(row: &Row, selected: bool, now: i64, offset: i64, width: usize) -> ListI
             .add_modifier(Modifier::BOLD),
         Status::Working => Style::default().fg(Color::Rgb(200, 210, 220)),
         Status::Delegated => Style::default().fg(Color::Rgb(200, 210, 220)),
+        Status::Stalled => Style::default().fg(Color::Rgb(200, 210, 220)),
         Status::Clear => Style::default().fg(DIM),
     };
 
@@ -1066,6 +1070,10 @@ fn detail(f: &mut Frame, area: Rect, row: Option<&Row>, now: i64, offset: i64) {
         Status::Delegated => lines.push(Line::styled(
             "spun up a background agent — waiting on it, not on you; resumes on its own",
             Style::default().fg(INDIGO),
+        )),
+        Status::Stalled => lines.push(Line::styled(
+            "tool call open and the log quiet — probably a slow command",
+            Style::default().fg(AMBER),
         )),
         Status::Clear => lines.push(Line::styled(
             "nothing outstanding",
@@ -1607,6 +1615,7 @@ mod tests {
             error: None,
             pending: vec!["src/a.rs".into()],
             total_edits: 1,
+            tokens: 0,
             last_prompt: None,
             is_orc: false,
             continue_cmd: "claude --resume abcd1234".into(),
