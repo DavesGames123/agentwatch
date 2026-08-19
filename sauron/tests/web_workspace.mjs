@@ -75,6 +75,21 @@ check("rows carry a servant name and colour, so tabs and cards can agree",
   !seen.board.rows.length || (seen.board.rows[0].servant && Array.isArray(seen.board.rows[0].color)));
 check("rows carry sauron's own formatting, not raw epochs to re-derive",
   !seen.board.rows.length || typeof seen.board.rows[0].ago === "string");
+// The token total travels as both, for the reason `lastActivity` travels with
+// `ago`: the page prints the string sauron would have drawn, and anything that
+// sorts or compares has the figure. Zero means "never measured", so its text is
+// empty and the column renders blank rather than "0".
+check("rows carry a token total as a number and as sauron's compact form",
+  !seen.board.rows.length || seen.board.rows.every((r) =>
+    typeof r.tokens === "number" && typeof r.tokensText === "string"
+    && (r.tokens > 0 ? r.tokensText.length > 0 : r.tokensText === "")),
+  JSON.stringify(seen.board.rows.map((r) => [r.tokens, r.tokensText]).slice(0, 4)));
+// The grouping is decided once, in Rust. A page that had to derive it from the
+// status would be the fourth copy of a table that has already drifted apart.
+check("rows name the table they are listed under",
+  !seen.board.rows.length || seen.board.rows.every((r) =>
+    ["your-move", "awaiting-testing", "working", "clear"].includes(r.group)),
+  JSON.stringify(seen.board.rows.map((r) => [r.status, r.group]).slice(0, 4)));
 check("the tab strip starts empty (--agents 0)", seen.tabs.length === 0);
 
 // --- open a real pty ------------------------------------------------------

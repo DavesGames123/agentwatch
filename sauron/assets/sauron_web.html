@@ -27,6 +27,7 @@
     --blocked:   #ff5c6e;
     --ack:       #ffb042;
     --needs-test:#e2ca60;
+    --stalled:   #ffb042;
     --working:   #56cde2;
     --delegated: #968ceb;
     --clear:     #7ec878;
@@ -124,54 +125,127 @@
   .view[hidden] { display: none; }
 
   /* ---------- the board ---------- */
-  #board { overflow-y: auto; padding: 20px 18px 40px; }
-  .band { margin-bottom: 26px; }
-  .band > h2 {
+  /* Two panes: the tables on the left, and the detail of whichever row is
+     selected on the right. One line per agent is the whole point of the layout
+     -- the columns only line up if nothing can make a row taller -- so
+     everything that used to swell a card (the prompt, the files, the previews,
+     the buttons) now lives in the detail pane and follows the selection. */
+  #board {
+    display: grid; gap: 0 18px;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-rows: minmax(0, 1fr);
+    padding: 16px 18px 14px;
+  }
+  /* The tables scroll on both axes inside this pane and nowhere else: `body` is
+     `overflow: hidden`, so a wide table must never reach it. `container-type`
+     makes the columns degrade off this pane's width rather than the window's,
+     which is what the terminal board does with its own pane width. */
+  .tables { overflow: auto; min-width: 0; min-height: 0; container-type: inline-size; }
+  .detail {
+    overflow-y: auto; min-width: 0; min-height: 0;
+    border-left: 1px solid var(--line); padding: 2px 2px 20px 16px;
+  }
+  @media (max-width: 1000px) {
+    #board { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+    .detail { border-left: none; border-top: 1px solid var(--line); padding: 12px 0 12px; max-height: 42%; }
+  }
+
+  /* ---------- one table ---------- */
+  .tbl { margin-bottom: 22px; min-width: 520px; }
+  .tbl > h2 {
     display: flex; align-items: center; gap: 10px;
-    margin: 0 0 12px; font: 600 11px/1 var(--ui);
+    margin: 0 0 6px; font: 600 11px/1 var(--ui);
     letter-spacing: .1em; text-transform: uppercase; color: var(--c);
   }
-  .band > h2::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--c), transparent); opacity: .35; }
-  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); }
+  .tbl > h2::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--c), transparent); opacity: .35; }
 
-  .card {
-    position: relative; overflow: hidden;
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: var(--radius); padding: 14px 16px 14px 18px;
-    transition: border-color .15s, transform .15s;
+  /* The header and the rows share one template, or the labels name the wrong
+     columns. Right-hand columns are fixed; the name absorbs the slack. */
+  .row, .hd { display: grid; align-items: center; gap: 10px; padding-left: 12px; }
+  .hd {
+    height: 20px; font: 500 10px var(--ui); letter-spacing: .08em;
+    text-transform: uppercase; color: var(--faint);
   }
-  .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--servant, var(--faint)); }
-  .card:hover { border-color: #313a4a; }
-  .card.attention { border-color: color-mix(in srgb, var(--c) 45%, var(--line)); }
-  .card .top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
-  .card .who { font: 600 12px var(--mono); color: var(--servant, var(--muted)); letter-spacing: .04em; }
-  .card .tag {
-    font: 600 10px var(--ui); letter-spacing: .08em; text-transform: uppercase;
-    color: var(--c); padding: 2px 7px; border-radius: 5px;
-    background: color-mix(in srgb, var(--c) 14%, transparent);
+  .row { height: 30px; position: relative; border-radius: 7px; cursor: pointer; }
+  .row::before {
+    content: ""; position: absolute; left: 0; top: 5px; bottom: 5px; width: 3px;
+    border-radius: 2px; background: var(--servant, var(--faint));
   }
-  .card .when { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+  .row:hover { background: var(--panel); }
+  .row.on { background: var(--panel-2); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 40%, var(--line)); }
+  .row > *, .hd > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) minmax(0, 22ch) 6ch 6ch; }
+  .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 2fr) 4ch minmax(8ch, 1fr) 6ch 6ch; }
+  .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch 6ch minmax(10ch, 1fr); }
+  .tbl.clear            .row, .tbl.clear            .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch 6ch; }
+
+  /* Columns drop from the right as the pane narrows -- tokens first, then the
+     wide reason column -- exactly as the contract orders it. The name and the
+     state mark never drop. */
+  @container (max-width: 620px) {
+    .tokens { display: none; }
+    .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) minmax(0, 22ch) 6ch; }
+    .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 2fr) 4ch minmax(8ch, 1fr) 6ch; }
+    .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch minmax(10ch, 1fr); }
+    .tbl.clear            .row, .tbl.clear            .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch; }
+  }
+  @container (max-width: 460px) {
+    .sec { display: none; }
+    .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch; }
+    .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 1fr) 4ch 6ch; }
+    .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch; }
+  }
+
+  /* The state mark. The terminal board draws a glyph here; the page draws its
+     own mark in the same hue, because a second copy of the glyph table is how
+     the surfaces drifted apart in the first place. */
+  .row .g { justify-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
   /* The name is underlined in the servant's colour, exactly as the terminal
-     board draws it (`ui.rs`, `fn card`). It is an underline and not the text
-     colour because the text colour is spoken for: the card says whether this
-     needs you, and the line under the name says which servant it is. That line
-     is the join between a row here and the panel running it. */
-  .card h3 {
-    margin: 0 0 8px; font: 600 14px/1.35 var(--ui);
+     board draws it. It is an underline and not the text colour because the text
+     colour is spoken for: the row says whether this needs you, and the line
+     under the name says which servant it is. That line is the join between a
+     row here and the panel running it. */
+  .row .nm {
+    font: 600 13px var(--ui);
     text-decoration: underline;
     text-decoration-color: var(--servant, transparent);
     text-decoration-thickness: 2px;
     text-underline-offset: 4px;
   }
-  .card .why { margin: 0 0 10px; font: 12.5px/1.5 var(--ui); color: var(--c); }
-  .card .said {
+  .row .sec { font: 12.5px var(--ui); color: var(--c); }
+  .row .file { font: 11.5px var(--mono); color: #cfd6e2; }
+  .row .num, .row .t { font: 11.5px var(--mono); color: var(--faint); text-align: right; }
+  .hd .num, .hd .t { text-align: right; }
+  .row .t.live { color: var(--working); }
+  .row .quiet { color: var(--faint); }
+
+  /* ---------- the detail of the selected row ---------- */
+  .detail .top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+  .detail .who { font: 600 12px var(--mono); color: var(--servant, var(--muted)); letter-spacing: .04em; }
+  .detail .tag {
+    font: 600 10px var(--ui); letter-spacing: .08em; text-transform: uppercase;
+    color: var(--c); padding: 2px 7px; border-radius: 5px;
+    background: color-mix(in srgb, var(--c) 14%, transparent);
+  }
+  .detail .when { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+  .detail h3 {
+    margin: 0 0 8px; font: 600 15px/1.35 var(--ui);
+    text-decoration: underline;
+    text-decoration-color: var(--servant, transparent);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 4px;
+  }
+  .detail .why { margin: 0 0 10px; font: 12.5px/1.5 var(--ui); color: var(--c); }
+  .detail .meta { margin: 0 0 10px; font: 11.5px/1.6 var(--mono); color: var(--faint); }
+  .detail .said {
     margin: 0 0 10px; padding-left: 10px; border-left: 2px solid var(--line);
     font: 12.5px/1.5 var(--ui); color: var(--muted);
-    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden;
   }
   .files { margin: 0 0 12px; padding: 0; list-style: none; font: 11.5px/1.7 var(--mono); }
-  .files li { display: flex; gap: 8px; color: #cfd6e2; }
-  .files li span { color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .files li { color: #cfd6e2; overflow: hidden; }
+  .files li span { display: block; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .files .more { color: var(--faint); }
   .acts { display: flex; gap: 7px; flex-wrap: wrap; }
   button.act {
@@ -187,7 +261,7 @@
 
   .empty { color: var(--faint); text-align: center; padding: 60px 20px; font-size: 13px; }
   .empty b { display: block; color: var(--muted); font-size: 15px; margin-bottom: 6px; }
-  #boardfoot { display: flex; gap: 8px; justify-content: center; padding-top: 4px; }
+  #boardfoot { display: flex; gap: 8px; justify-content: center; padding: 4px 0 8px; flex-wrap: wrap; }
 
   /* ---------- terminals ---------- */
   /* A panel wears its servant's colour, because the panel is the one surface
@@ -304,18 +378,34 @@
   let ws = null, board = null, tabs = [], active = "board", stopped = false;
   const terms = new Map();   // pane id -> { term, fit, wrap, attached }
 
-  // Status order and prose. The order is attention order, the same one the
-  // terminal board groups by -- it is a product decision, not a style, so the
-  // two front ends must not disagree about it.
-  const BANDS = [
-    ["errored",    "errored"],
-    ["blocked",    "waiting on you"],
-    ["ack",        "to acknowledge"],
-    ["needs-test", "to test"],
-    ["working",    "working"],
-    ["delegated",  "delegated"],
-    ["clear",      "clear"],
+  // The board's tables, top to bottom, with the columns each one carries.
+  //
+  // Which table a row belongs to is decided in Rust and arrives on the row as
+  // `group`; the header words are the contract's words. The page used to hold
+  // its own status-to-band table and its own wording ("to acknowledge", "to
+  // test"), which is how three surfaces ended up calling the same group three
+  // different things. It now decides only where a table is drawn.
+  //
+  // Each entry is [group, header word, header hue, columns]. A column is
+  // [class, label]: the same classes go on the row cells, so the header and the
+  // rows share one grid template and drop the same columns together.
+  const TABLES = [
+    ["your-move", "YOUR MOVE", "blocked",
+      [["g", ""], ["nm", "agent"], ["sec", "why"], ["t", "waited"], ["num tokens", "tokens"]]],
+    ["awaiting-testing", "AWAITING TESTING", "needs-test",
+      [["g", ""], ["nm", "agent"], ["num", "files"], ["file sec", "top file"], ["t", "since"], ["num tokens", "tokens"]]],
+    ["working", "WORKING", "working",
+      [["g", ""], ["nm", "agent"], ["t", "elapsed"], ["num tokens", "tokens"], ["sec", "now doing"]]],
+    // Not one of the three: `clear` is collapsed to the count in the footer and
+    // only ever drawn when the toggle asks sauron to send those rows.
+    ["clear", "CLEAR", "clear",
+      [["g", ""], ["nm", "agent"], ["t", "since"], ["num tokens", "tokens"]]],
   ];
+
+  // The id of the row the detail pane is showing. Kept as a session id and not
+  // an index: a board arrives every tick, and an index would follow whatever
+  // row churn moved into that slot.
+  let selected = null;
 
   // ---- talking to sauron ---------------------------------------------------
   function send(obj) {
@@ -346,7 +436,7 @@
     document.title = `${board.repo} · sauron`;
 
     const c = board.counts;
-    const busy = c.working + c.delegated;
+    const busy = c.working + c.delegated + c.stalled;
     // The Eye lids when nothing is running and nothing wants a human -- the
     // same `World::repose` signal the terminal scene uses to change state.
     const wants = c.errored + c.blocked + c.ack + c.needsTest;
@@ -366,45 +456,91 @@
     add("blocked", c.blocked, "waiting on you", true);
     add("ack", c.ack, "to acknowledge", true);
     add("needs-test", c.needsTest, "to test", true);
+    add("stalled", c.stalled, "stalled");
     add("working", c.working, "working");
     add("delegated", c.delegated, "delegated");
     add("clear", c.clear, "clear");
     if (!bar.children.length) add("clear", 1, "all caught up");
   }
 
-  function card(r) {
-    const open = tabs.some((t) => t.session === r.id);
-    const n = el("div", "card" + (["errored", "blocked", "ack", "needs-test"].includes(r.status) ? " attention" : ""));
+  // The cells of one row, in its table's column order, after the state mark and
+  // the name. Every string here was formatted by sauron; the page prints them.
+  function cells(r) {
+    const files = r.pending || [];
+    switch (r.group) {
+      case "your-move":
+        return [["sec", r.why], ["t", r.ago], ["num tokens", r.tokensText]];
+      case "awaiting-testing":
+        return [["num", files.length ? String(files.length) : ""],
+                ["file sec", files[0] || ""], ["t", r.ago], ["num tokens", r.tokensText]];
+      case "working":
+        return [["t" + (r.status === "working" ? " live" : ""), r.elapsed || ""],
+                ["num tokens", r.tokensText], ["sec", r.doing]];
+      default:
+        return [["t", r.ago], ["num tokens", r.tokensText]];
+    }
+  }
+
+  // One agent, one line. Nothing in here may wrap or grow: the columns line up
+  // down the table only because every row is the same height, and the detail
+  // that used to swell a card is in the detail pane now.
+  function row(r) {
+    const n = el("div", "row" + (r.id === selected ? " on" : ""));
+    n.dataset.id = r.id;
     n.style.setProperty("--c", `var(--${r.status})`);
     n.style.setProperty("--servant", rgb(r.color));
+    const mark = el("span", "g");
+    mark.title = r.statusLabel;
+    n.append(mark);
+    n.append(el("span", "nm", r.orc ? `orc · ${r.name}` : r.name));
+    for (const [cls, text] of cells(r)) n.append(el("span", cls, text));
+    n.onclick = () => select(r.id);
+    return n;
+  }
+
+  // Everything a row cannot say in one line, for the row that is selected: what
+  // it was asked, what it has written, and every action it offers. It redraws
+  // with the selection, so arrowing down the tables reads the board.
+  function detail(r) {
+    const d = el("aside", "detail");
+    if (!r) return d;
+    d.style.setProperty("--c", `var(--${r.status})`);
+    d.style.setProperty("--servant", rgb(r.color));
 
     const top = el("div", "top");
     top.append(el("span", "who", r.orc ? `orc · ${r.servant}` : r.servant));
     top.append(el("span", "tag", r.tag));
-    const when = el("span", "when", r.elapsed ? `${r.elapsed} · started ${r.startedAt}` : r.ago);
-    top.append(when);
-    n.append(top);
+    top.append(el("span", "when", r.elapsed ? `${r.elapsed} · started ${r.startedAt}` : r.ago));
+    d.append(top);
+    d.append(el("h3", null, r.name));
 
-    n.append(el("h3", null, r.name));
-    if (r.error) n.append(el("p", "why", r.error));
-    else if (r.blocked) n.append(el("p", "why", r.blocked));
-    if (r.prompt) n.append(el("p", "said", `“${r.prompt}”`));
+    if (r.error) d.append(el("p", "why", r.error));
+    else if (r.blocked) d.append(el("p", "why", r.blocked));
+
+    const meta = [];
+    if (r.branch) meta.push(r.branch);
+    if (r.tokensText) meta.push(`${r.tokensText} tokens`);
+    meta.push(r.short);
+    d.append(el("p", "meta", meta.join(" · ")));
+
+    if (r.prompt) d.append(el("p", "said", `“${r.prompt}”`));
 
     if (r.pending && r.pending.length) {
       const ul = el("ul", "files");
-      for (const f of r.pending.slice(0, 5)) {
+      for (const f of r.pending.slice(0, 8)) {
         const li = el("li");
         li.append(el("code", null, f));
         const prev = r.previews && r.previews[f];
         if (prev && prev.length) li.append(el("span", null, prev[prev.length - 1]));
         ul.append(li);
       }
-      if (r.pending.length > 5) ul.append(el("li", "more", `… and ${r.pending.length - 5} more`));
-      n.append(ul);
+      if (r.pending.length > 8) ul.append(el("li", "more", `… and ${r.pending.length - 8} more`));
+      d.append(ul);
     } else if (r.edits) {
-      n.append(el("p", "said", `${r.edits} file${r.edits === 1 ? "" : "s"}, all acknowledged`));
+      d.append(el("p", "said", `${r.edits} file${r.edits === 1 ? "" : "s"}, all acknowledged`));
     }
 
+    const open = tabs.some((t) => t.session === r.id);
     const acts = el("div", "acts");
     const act = (label, cls, fn) => {
       const b = el("button", "act " + cls, label);
@@ -424,8 +560,27 @@
       act("dismiss", "quiet", () => send({ t: "dismiss", id: r.id }));
     }
     act("copy resume", "quiet", () => copy(r.continueCmd));
-    n.append(acts);
-    return n;
+    d.append(acts);
+    return d;
+  }
+
+  // The rows in the order they are drawn: table by table, and within a table in
+  // the order sauron sorted them. This is the order the arrow keys walk, so it
+  // has to be the order on the screen and not the order of the message.
+  const drawn = () => (board ? TABLES.flatMap(([key]) => board.rows.filter((r) => r.group === key)) : []);
+
+  function select(id) {
+    selected = id;
+    drawBoard();
+  }
+
+  // Move the selection by `step` rows through the drawn order.
+  function step(n) {
+    const all = drawn();
+    if (!all.length) return;
+    const at = all.findIndex((r) => r.id === selected);
+    const next = Math.max(0, Math.min(all.length - 1, (at < 0 ? 0 : at + n)));
+    select(all[next].id);
   }
 
   function drawBoard() {
@@ -433,23 +588,34 @@
     host.replaceChildren();
     if (!board) return;
 
+    // Hold the selection on the row it was on. A board arrives every tick, and
+    // a detail pane that jumped back to the top on each one would be unreadable
+    // -- which is the point of selecting a row and scrolling the list.
+    if (!board.rows.some((r) => r.id === selected)) {
+      selected = board.rows.length ? board.rows[0].id : null;
+    }
+
+    const tables = el("div", "tables");
     if (!board.rows.length) {
       const e = el("div", "empty");
       e.append(el("b", null, "nothing to attend to"));
       e.append(el("div", null, "No agent sessions with repo edits yet. Open one with the + above."));
-      host.append(e);
+      tables.append(e);
     }
 
-    for (const [key, word] of BANDS) {
-      const rows = board.rows.filter((r) => r.status === key);
-      if (!rows.length) continue;
-      const band = el("section", "band");
-      band.style.setProperty("--c", `var(--${key})`);
-      band.append(el("h2", null, `${rows.length} ${word}`));
-      const grid = el("div", "cards");
-      rows.forEach((r) => grid.append(card(r)));
-      band.append(grid);
-      host.append(band);
+    for (const [key, word, hue, cols] of TABLES) {
+      const mine = board.rows.filter((r) => r.group === key);
+      if (!mine.length) continue;
+      const tbl = el("section", "tbl " + key);
+      tbl.style.setProperty("--c", `var(--${hue})`);
+      tbl.append(el("h2", null, `${word} (${mine.length})`));
+      const hd = el("div", "hd");
+      for (const [cls, label] of cols) hd.append(el("span", cls, label));
+      tbl.append(hd);
+      const body = el("div", "rows");
+      mine.forEach((r) => body.append(row(r)));
+      tbl.append(body);
+      tables.append(tbl);
     }
 
     const foot = el("div", "", "");
@@ -466,7 +632,10 @@
       b.onclick = () => send({ t: "ackAll" });
       foot.append(b);
     }
-    host.append(foot);
+    tables.append(foot);
+
+    host.append(tables);
+    host.append(detail(board.rows.find((r) => r.id === selected)));
   }
 
   // ---- tabs ----------------------------------------------------------------
@@ -763,6 +932,12 @@
       const i = Number(e.key) - 1;
       const target = i === 0 ? "board" : tabs[i - 1] && tabs[i - 1].id;
       if (target !== undefined) { e.preventDefault(); show(target); }
+    }
+    // The board is a list you read by moving down it, so the arrows (and j/k,
+    // as in the terminal board) move the selection and the detail pane follows.
+    if (active === "board" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const n = { ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 }[e.key];
+      if (n) { e.preventDefault(); step(n); }
     }
     if (e.key === "Escape") closeMenu();
   });
