@@ -29,16 +29,18 @@
 //!   third-party tool gets free parsing; a `--json` emitter over these same
 //!   structs is the escape hatch if that ever matters.
 //!
-//! Format v1. Tabs separate fields, `\` `\t` `\n` are escaped in free text:
+//! The format as it now stands. Tabs separate fields, `\` `\t` `\n` are
+//! escaped in free text, and the version on the first line is what every reader
+//! checks before it reads anything else:
 //!
 //! ```text
-//! sauron-beacon 1
+//! sauron-beacon 4
 //! repo    /Users/d/Downloads/barnes-hut
 //! label   barnes-hut
 //! pid     2418
 //! written 1753567890123
 //! counts  3       1       12      2         (attention working clear stale)
-//! row     needs_test      a1b2c3d4  <full-id> <turn_started> <last_activity> <orc> <edits> <name>
+//! row     needs_test      a1b2c3d4  <full-id> <turn_started> <last_activity> <orc> <edits> <tokens> <name>
 //! detail  station hull plates render at the wrong scale
 //! file    src/gui/overlays/station_damage.rs
 //! file    src/combat/hull.rs
@@ -53,6 +55,13 @@
 //! a row is asking about, resolved from the watched repo's own
 //! `.sauron/panels.toml` (see `route.rs`). Each attaches to the row above it,
 //! and `need` to the `step` above it, the same way `file` already did.
+//!
+//! v4 added the row's token total, and the `stalled` status word. The token
+//! figure is the raw number, not a formatted one: a reader with a wide column
+//! prints the whole figure and a reader with a narrow one compacts it, and a
+//! wire that had already chosen "12.4k" takes that choice away from both. It is
+//! the second-to-last field rather than an appended one, because the name is
+//! free text and keeping it last is what lets a person read a row by eye.
 //!
 //! A repo with no map emits none of the three, which is not the same as a repo
 //! whose map covered everything -- the `route` line is written whenever a map
@@ -69,7 +78,8 @@
 //!   fn path_for      -- repo root -> beacon path, the encoding both ends share
 //!   fn publish       -- Board -> file, atomically
 //!   fn retire        -- unlink on clean exit
-//!   fn render        -- Board -> the v1 wire text
+//!   fn render        -- Board -> the wire text
+//!   fn status_token  -- Status -> the word on the wire
 //!   fn parse         -- wire text -> Beacon, the reader half
 //!   const STALE_MS   -- how old a beacon may be and still count as live
 
@@ -82,7 +92,7 @@ use crate::scan::home;
 
 /// Wire format version. Bump on any field change; readers refuse a version they
 /// were not built for rather than guessing at a shifted column.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// How stale a beacon may be before a reader must treat sauron as gone.
 ///
@@ -112,6 +122,12 @@ pub struct BeaconRow {
     pub last_activity: i64,
     pub is_orc: bool,
     pub total_edits: usize,
+    /// Everything the session has billed, input and output and both cache
+    /// figures. Zero where the log carries no usage at all -- a Codex session,
+    /// or a Claude one that has not answered yet -- which a reader must show as
+    /// an empty column rather than as `0`, because "nothing recorded" and "no
+    /// tokens spent" are different facts about a row.
+    pub tokens: i64,
     pub name: String,
     /// Why this row wants a human: the error or block reason where there is
     /// one, otherwise the prompt that started the turn.
@@ -271,11 +287,11 @@ fn render(board: &Board) -> String {
     // board shares the same map by construction.
     let map = crate::route::for_repo(board.repo_root());
     let attention = board.rows.iter().filter(|r| wants_human(r.status)).count();
-    let working = board
-        .rows
-        .iter()
-        .filter(|r| matches!(r.status, Status::Working | Status::Delegated))
-        .count();
+    // `Board::working_count` rather than a second filter here, because it is the
+    // one that already decided where `Stalled` belongs. A stalled row is not a
+    // demand on a human, so it is in neither `attention` nor `clear`; counting
+    // it anywhere but here would drop it out of the header arithmetic entirely.
+    let working = board.working_count();
 
     out.push_str(&format!("sauron-beacon\t{VERSION}\n"));
     out.push_str(&format!("repo\t{}\n", esc(&board.repo_root().to_string_lossy())));
@@ -289,7 +305,7 @@ fn render(board: &Board) -> String {
 
     for r in &board.rows {
         out.push_str(&format!(
-            "row\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "row\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             status_token(r.status),
             esc(&r.id_short),
             esc(&r.id),
@@ -297,6 +313,7 @@ fn render(board: &Board) -> String {
             r.last_activity,
             if r.is_orc { 1 } else { 0 },
             r.total_edits,
+            r.tokens,
             esc(&collapse_ws(&r.name)),
         ));
         let detail = detail_for(r);
@@ -444,7 +461,7 @@ pub fn parse(text: &str) -> Option<Beacon> {
             }
             "row" => {
                 let f: Vec<&str> = rest.split('\t').collect();
-                if f.len() < 8 {
+                if f.len() < 9 {
                     continue;
                 }
                 b.rows.push(BeaconRow {
@@ -455,7 +472,8 @@ pub fn parse(text: &str) -> Option<Beacon> {
                     last_activity: f[4].parse().unwrap_or(0),
                     is_orc: f[5] == "1",
                     total_edits: f[6].parse().unwrap_or(0),
-                    name: unesc(f[7]),
+                    tokens: f[7].parse().unwrap_or(0),
+                    name: unesc(f[8]),
                     detail: String::new(),
                     files: Vec::new(),
                     steps: Vec::new(),
@@ -533,13 +551,17 @@ mod tests {
         s.push_str("pid\t99\n");
         s.push_str("written\t1700000000000\n");
         s.push_str("counts\t2\t1\t5\t3\n");
-        s.push_str("row\terrored\tabc12345\tabc12345-full-id\t1700000000000\t1700000001000\t0\t7\ta\\tname\n");
+        s.push_str("row\terrored\tabc12345\tabc12345-full-id\t1700000000000\t1700000001000\t0\t7\t12400\ta\\tname\n");
         s.push_str("detail\tAPI error — retry\n");
         s.push_str("file\tsrc/a.rs\n");
         s.push_str("step\txray\tColony\t1\tverified\tPress E.\n");
         s.push_str("need\ta station selected\n");
         s.push_str("route\t2\t1\n");
-        s.push_str("row\tworking\tdef67890\tdef67890-full-id\t0\t1700000002000\t1\t0\torc: shrink b.rs\n");
+        s.push_str("row\tworking\tdef67890\tdef67890-full-id\t0\t1700000002000\t1\t0\t0\torc: shrink b.rs\n");
+        // The status the split added, on the wire beside the two that predate
+        // it: a reader built before v4 must refuse the whole file rather than
+        // meet this word in a column it does not know.
+        s.push_str("row\tstalled\tfed09876\tfed09876-full-id\t0\t1700000003000\t0\t2\t1200000\tslow build\n");
         s.push_str("end\n");
         s
     }
@@ -551,7 +573,7 @@ mod tests {
         assert_eq!(b.label, "demo");
         assert_eq!(b.pid, 99);
         assert_eq!((b.attention, b.working, b.clear, b.hidden_stale), (2, 1, 5, 3));
-        assert_eq!(b.rows.len(), 2);
+        assert_eq!(b.rows.len(), 3);
         // The escaped tab must survive the round trip as a real tab, or a name
         // containing one would silently split into extra columns on re-read.
         assert_eq!(b.rows[0].name, "a\tname");
@@ -560,6 +582,45 @@ mod tests {
         assert_eq!(b.rows[0].files, vec!["src/a.rs".to_string()]);
         assert!(b.rows[1].is_orc);
         assert!(b.rows[1].files.is_empty());
+    }
+
+    #[test]
+    fn tokens_land_in_their_own_column() {
+        // The name sits after the token count, so a mis-parsed token field
+        // shows up as a name that is a number -- which is the failure this
+        // pins, not the arithmetic.
+        let b = parse(&sample()).expect("parses");
+        assert_eq!(b.rows[0].tokens, 12_400);
+        assert_eq!(b.rows[0].name, "a\tname");
+        // Nothing recorded is zero on the wire, and every reader shows it as an
+        // empty column rather than as a spend of none.
+        assert_eq!(b.rows[1].tokens, 0);
+        assert_eq!(b.rows[2].tokens, 1_200_000);
+        assert_eq!(b.rows[2].name, "slow build");
+    }
+
+    #[test]
+    fn stalled_survives_the_wire() {
+        let b = parse(&sample()).expect("parses");
+        assert_eq!(b.rows[2].status, "stalled");
+        // Hedged, and so not a demand on anybody: the panel groups it with the
+        // running rows and gives it no reply box.
+        assert!(!wants_human(Status::Stalled));
+        assert_eq!(status_token(Status::Stalled), "stalled");
+    }
+
+    #[test]
+    fn a_row_short_of_its_columns_is_dropped() {
+        // A v3 row reaching a v4 parser: eight fields, no tokens. The version
+        // gate rejects the file first, so this is the belt to that brace -- a
+        // short row must never be read with the name column shifted left.
+        let short = sample().replace(
+            "row\tworking\tdef67890\tdef67890-full-id\t0\t1700000002000\t1\t0\t0\torc: shrink b.rs\n",
+            "row\tworking\tdef67890\tdef67890-full-id\t0\t1700000002000\t1\t0\n",
+        );
+        let b = parse(&short).expect("parses");
+        assert_eq!(b.rows.len(), 2);
+        assert_eq!(b.rows[1].name, "slow build");
     }
 
     #[test]
@@ -615,7 +676,7 @@ mod tests {
         let b = parse(&hand_edited).expect("still parses");
         // Attached to the previous row's last step if there is one; the point
         // is that the snapshot survives rather than blanking the pane.
-        assert_eq!(b.rows.len(), 2);
+        assert_eq!(b.rows.len(), 3);
     }
 
     #[test]

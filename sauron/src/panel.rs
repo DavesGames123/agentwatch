@@ -320,7 +320,16 @@ fn status(args: &[String]) -> std::io::Result<()> {
     }
     for r in &b.rows {
         let mark = if r.is_orc { "orc " } else { "" };
-        println!("  [{:<12}] {}{}", r.status, mark, r.name);
+        // The token figure trails the name rather than sitting in a column of
+        // its own: this is the text mirror of the pane, and a row whose log
+        // carries no usage at all prints nothing there, the same way the pane
+        // leaves the column empty instead of claiming a spend of zero.
+        let tokens = if r.tokens > 0 {
+            format!("  ·  {}", crate::model::fmt_count(r.tokens))
+        } else {
+            String::new()
+        };
+        println!("  [{:<12}] {}{}{}", r.status, mark, r.name, tokens);
         if !r.detail.is_empty() {
             println!("      {}", r.detail);
         }
@@ -419,6 +428,60 @@ mod tests {
         assert!(
             !filled.contains("{{"),
             "template still has an unsubstituted hole after install"
+        );
+    }
+
+    #[test]
+    fn both_parsers_want_the_same_row_width() {
+        // The panel ships its own copy of the beacon reader, and drift between
+        // the two is silent in the worst way: a column added here and not there
+        // mis-columns every card in a host process no test suite is watching.
+        // The width is discovered from this crate's parser rather than written
+        // down, so adding a field cannot leave the number here stale.
+        let mut want = 0usize;
+        for width in 1..=16 {
+            let fields: Vec<String> = (0..width).map(|i| i.to_string()).collect();
+            let text = format!(
+                "sauron-beacon\t{}\nrow\t{}\nend\n",
+                beacon::VERSION,
+                fields.join("\t")
+            );
+            if beacon::parse(&text).is_some_and(|b| !b.rows.is_empty()) {
+                want = width;
+                break;
+            }
+        }
+        assert!(want > 0, "this crate's parser accepted no row at all");
+        assert!(
+            TEMPLATE.contains(&format!("if f.len() < {want} {{")),
+            "the installed panel's parser does not require {want} row fields"
+        );
+    }
+
+    #[test]
+    fn the_template_knows_every_status_word() {
+        use crate::model::Status;
+        for s in [
+            Status::Errored,
+            Status::Blocked,
+            Status::AwaitingAck,
+            Status::NeedsTest,
+            Status::Stalled,
+            Status::Working,
+            Status::Delegated,
+        ] {
+            let tok = beacon::status_token(s);
+            assert!(
+                TEMPLATE.contains(&format!("(\"{tok}\",")),
+                "the panel's GROUPS table has no entry for `{tok}` -- a row in \
+                 that status would draw with no word and no colour"
+            );
+        }
+        // `clear` is deliberately not in it. It is the footer's count, and a
+        // table of rows nobody has a reason to open would be most of the pane.
+        assert!(
+            !TEMPLATE.contains(&format!("(\"{}\",", beacon::status_token(Status::Clear))),
+            "the panel lists `clear` as a group; it belongs in the footer count"
         );
     }
 

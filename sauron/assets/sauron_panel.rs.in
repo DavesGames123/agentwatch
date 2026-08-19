@@ -26,8 +26,17 @@
 //  COST
 //  ----
 //  Collapsed: one `stat` at most twice a second plus a single header strip.
-//  Expanded: one text layout per visible row. Nothing is allocated on frames
-//  where the beacon has not changed.
+//  Expanded: a handful of text layouts per row -- one per line, plus the binary
+//  search `fit_line` runs when a title is too long for its column, which is a
+//  few more on the rows that need it and none on the rows that do not. egui
+//  caches a galley by its text, font and width, so a board that has not changed
+//  re-lays out nothing after the first frame.
+//
+//  Every row on the board is laid out, not only the rows the scroll area has in
+//  view. Windowing them would mean `show_rows`, which needs one height for every
+//  row, and rows here are not one height -- a row waiting on a person carries a
+//  reply box and a row someone clicked carries a file list. A board is tens of
+//  rows, so the whole list is cheaper than the machinery to avoid it.
 //
 //  WIRING
 //  ------
@@ -56,13 +65,22 @@
 //  the strip alone, which stays draggable. Neither survives a relaunch, on
 //  purpose: a debug pane that remembers being hidden is one you forget exists.
 //
+//  The board between the header and the footer scrolls, and how much of it is
+//  shown depends on where the pane has been dragged to -- the list is given the
+//  room left below it, so a pane parked low is short rather than running off the
+//  bottom of the window.
+//
 //  grep targets:
 //    fn render          -- the once-per-frame entry point
 //    fn poll            -- mtime-gated re-read
 //    fn beacon_path     -- $SAURON_BEACON, else git root -> encoded path
 //    fn parse           -- the v{{VERSION}} wire format reader
 //    fn draw_header     -- fold control and drag handle, one surface
-//    fn draw_row        -- one session card
+//    const TABLES       -- the three groups, and which statuses are in each
+//    fn draw_table_header -- one group's word, count and rule
+//    fn draw_board_row  -- one session row, columns and all
+//    fn fit_line        -- one line, cut to a column, never wrapped
+//    fn body_max        -- how tall the scrolling list may be
 //    fn route_anchors   -- controls the host should highlight, for `needs_test`
 //    fn route_steps     -- the same routes, with their instructions
 //    const DEFAULT_POS  -- where it docks before anyone moves it
@@ -276,32 +294,56 @@ impl Palette {
     fn ROUTE_DIM() -> egui::Color32 { skin().route_dim }
 }
 
-/// The wire status token -> how it is grouped, coloured and titled.
+/// The wire status token -> the word one row shows for it, in sauron's own
+/// rank order.
 ///
-/// The order of this table is the order the groups appear, and it is sauron's
-/// own ranking: an errored agent is dead until rescued, a blocked one resumes
-/// the moment you answer, and unverified edits merely wait. Reordering these
-/// reorders the pane.
-/// The wire status token -> how it is grouped and titled.
+/// This is the status vocabulary, not the drawing order: `TABLES` decides what
+/// is drawn where. The order here is still load-bearing in two places -- the
+/// index is the rank `worst_colour` compares, and it must stay the order
+/// `Status::rank` uses in the sauron crate, or a folded pane wears the colour of
+/// the second-worst thing on the board.
 ///
-/// The order of this table is the order the groups appear, and it is sauron's
-/// own ranking: an errored agent is dead until rescued, a blocked one resumes
-/// the moment you answer, and unverified edits merely wait. Reordering these
-/// reorders the pane.
+/// The words are the ones every sauron surface uses for the same state. A pane
+/// that invents its own reads as a different tool describing a different board.
 ///
 /// The colour is looked up separately rather than stored here, because a skin
 /// is resolved at draw time and this table is a `const`.
 const GROUPS: &[(&str, &str)] = &[
-    ("errored", "ERRORED"),
-    ("blocked", "WAITING ON YOU"),
-    ("awaiting_ack", "AWAITING ACK"),
-    ("needs_test", "AWAITING TEST"),
-    ("working", "RUNNING"),
-    ("delegated", "DELEGATED"),
+    ("errored", "errored"),
+    ("blocked", "waiting"),
+    ("awaiting_ack", "your move"),
+    ("needs_test", "needs test"),
+    ("stalled", "stalled"),
+    ("working", "working"),
+    ("delegated", "delegated"),
+];
+
+/// The three tables, top to bottom, and which statuses belong to each.
+///
+/// WHY THREE, AND WHY NOT ONE PER STATUS
+/// -------------------------------------
+/// A header per status made seven one-row headings on a busy board, which is
+/// more chrome than board. These three are the only distinctions that change
+/// what you do next: answer it, look at it, or leave it alone. An errored agent
+/// and a blocked one both want you now and belong under one word.
+///
+/// A table with no rows is not drawn at all, header included. `clear` is in no
+/// table on purpose -- it is the footer's count, and a row nobody has any reason
+/// to open would be the majority of the pane if it were listed.
+const TABLES: &[(&str, &[&str])] = &[
+    ("YOUR MOVE", &["errored", "blocked", "awaiting_ack"]),
+    ("AWAITING TESTING", &["needs_test"]),
+    ("WORKING", &["working", "delegated", "stalled"]),
 ];
 
 /// Whether a status is one that is waiting on a person, and so worth a reply
 /// box. Mirrors sauron's own `wants_human`.
+///
+/// `stalled` is deliberately absent. It is a guess about a quiet tool call --
+/// most often a slow build, sometimes an unanswered permission prompt -- and the
+/// log cannot tell those apart. A reply box under it would state as a fact that
+/// the agent is waiting for you, which is the over-reporting that splitting it
+/// out of `blocked` removed.
 fn wants_human(status: &str) -> bool {
     matches!(status, "errored" | "blocked" | "awaiting_ack" | "needs_test")
 }
@@ -312,6 +354,11 @@ fn group_colour(token: &str) -> egui::Color32 {
         "blocked" => Palette::BLOCKED(),
         "awaiting_ack" => Palette::AWAITING_ACK(),
         "needs_test" => Palette::NEEDS_TEST(),
+        // Named rather than left to the arm below, because the tempting choice
+        // is the amber `blocked` wears and that would be a claim the status does
+        // not make. A stalled row is a running row that has gone quiet, so it
+        // wears the running colour and says so in words.
+        "stalled" => Palette::RUNNING(),
         _ => Palette::RUNNING(),
     }
 }
@@ -338,6 +385,10 @@ struct Row {
     last_activity: i64,
     is_orc: bool,
     total_edits: usize,
+    /// Everything this session has billed, as the raw figure. Zero means no
+    /// usage was recorded rather than none spent, so the column is left empty
+    /// rather than printing `0` -- see `fmt_count` and its one call site.
+    tokens: i64,
     name: String,
     detail: String,
     files: Vec<String>,
@@ -872,8 +923,12 @@ fn parse(text: &str) -> Option<Beacon> {
                 b.hidden_stale = f.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
             }
             "row" => {
+                // Nine fields since v4, the token total second from last. A row
+                // with fewer is dropped rather than read short: the name is the
+                // last column, so a missing field would put a number where the
+                // task title goes and the pane would look right while lying.
                 let f: Vec<&str> = rest.split('\t').collect();
-                if f.len() < 8 {
+                if f.len() < 9 {
                     continue;
                 }
                 b.rows.push(Row {
@@ -884,7 +939,8 @@ fn parse(text: &str) -> Option<Beacon> {
                     last_activity: f[4].parse().unwrap_or(0),
                     is_orc: f[5] == "1",
                     total_edits: f[6].parse().unwrap_or(0),
-                    name: unesc(f[7]),
+                    tokens: f[7].parse().unwrap_or(0),
+                    name: unesc(f[8]),
                     ..Row::default()
                 });
             }
@@ -1009,28 +1065,55 @@ pub fn render(ctx: &egui::Context) {
                     }
                     ui.add_space(2.0);
 
+                    // The list scrolls; the header above it and the footer below
+                    // it do not. One scroll area and not one per table: three
+                    // independently scrolling panes would each need a height
+                    // decided before anyone knew how many rows they held, so a
+                    // board with nine rows waiting on you and one running would
+                    // give the same room to both. As one list they share the
+                    // space in the order the contract ranks them, and the tables
+                    // stay what they are -- headings, not viewports.
+                    let max_h = body_max(ui);
                     let mut drew_any = false;
-                    let mut n = 0usize;
-                    for (token, _title) in GROUPS {
-                        let rows: Vec<&Row> =
-                            beacon.rows.iter().filter(|r| r.status == *token).collect();
-                        if rows.is_empty() {
-                            continue;
-                        }
-                        drew_any = true;
-                        let colour = group_colour(token);
-                        for r in rows {
-                            let open = expanded.contains(&r.id_short);
-                            if draw_board_row(ui, r, colour, open, n % 2 == 1) {
-                                toggled = Some(r.id_short.clone());
+                    egui::ScrollArea::vertical()
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            // Whatever the scrollbar left, not `panel_w()`. Rows
+                            // drawn at the full width would have their right-hand
+                            // columns -- the two this layout is about -- slide
+                            // under the bar the moment the board is long enough
+                            // to need one.
+                            let w = ui.available_width();
+                            for (word, members) in TABLES {
+                                // Filtered out of the wire's own order rather
+                                // than gathered per status: that order is
+                                // sauron's rank, then blocked reason, then most
+                                // recent first, and re-sorting per table would
+                                // put a row in a different place here than in
+                                // the TUI showing the same board.
+                                let rows: Vec<&Row> = beacon
+                                    .rows
+                                    .iter()
+                                    .filter(|r| members.contains(&r.status.as_str()))
+                                    .collect();
+                                if rows.is_empty() {
+                                    continue;
+                                }
+                                drew_any = true;
+                                draw_table_header(ui, w, word, rows.len());
+                                for r in rows {
+                                    let open = expanded.contains(&r.id_short);
+                                    if draw_board_row(ui, w, r, group_colour(&r.status), open) {
+                                        toggled = Some(r.id_short.clone());
+                                    }
+                                }
                             }
-                            n += 1;
-                        }
-                    }
-
-                    if !drew_any {
-                        draw_all_clear(ui);
-                    }
+                            if !drew_any {
+                                draw_all_clear(ui, w);
+                            }
+                        });
                     draw_footer(ui, &beacon);
                 });
         });
@@ -1066,24 +1149,53 @@ pub fn render(ctx: &egui::Context) {
 //  Board layout
 // ───────────────────────────────────────────────────────────────────────────
 //
-//  ONE COLUMN, NOT FOUR
-//  --------------------
-//  This was a four-column table twice, and both times the columns were the
-//  problem rather than the styling. A task name is 40-60 characters; a route is
-//  a panel name; a reply is a sentence. Giving each a fixed slice of a pane that
-//  has to sit over a game means every one of them is too narrow, and the longest
-//  -- the title -- broke one word per line while a "WHERE TO LOOK" column sat
-//  empty showing an em dash.
+//  THREE TABLES, AND TWO NUMERIC COLUMNS THAT CANNOT BREAK
+//  -------------------------------------------------------
+//  WHAT WAS HERE BEFORE, AND WHY IT WENT
 //
-//  So each row is now full width and stacked, like a message in an inbox:
+//  This was a four-column table twice and was reverted both times, and the note
+//  that stood here said the columns were the problem rather than the styling.
+//  That was true of those columns. A task name is 40-60 characters; a route is a
+//  panel name; a reply is a sentence. At W_BASE = 430 over a running game, each
+//  got a slice too narrow to hold it, and the longest -- the title -- broke one
+//  word per line while a "WHERE TO LOOK" column sat empty showing an em dash. So
+//  the pane became one full-width stacked row per agent, like a message in an
+//  inbox, and nothing competed for horizontal space because nothing shared it.
 //
-//      ● AWAITING ACK · 11m02s · 0 files · Interplanetary
-//      Build Sauron GUI navigation guide system
-//      [ reply to this agent…                  ] [send][shot][ack]
+//  WHAT CHANGED
 //
-//  The metadata is one dim line, the title gets the whole width at the largest
-//  size in the pane, and the reply spans the row. Nothing competes for
-//  horizontal space, so nothing has to be cramped to fit.
+//  Two things, and neither was true of the reverted attempts. The route column
+//  is gone -- routes live in the dim note line and in `route_steps`, so there is
+//  no wide text column left to sit empty. And the columns beside the title are
+//  now `waited`/`elapsed` and `tokens`: five characters at their widest,
+//  monospaced, right-aligned, incapable of wrapping whatever lands in them.
+//  The title keeps first claim on the width and takes everything the two
+//  numerics do not, with a floor under it.
+//
+//  The other half of the old failure was that the title was laid out with a wrap
+//  width. It is not any more: `fit_line` cuts it to one line with an ellipsis
+//  before it is painted, so a long name cannot stack, and cannot drag the row's
+//  height around with it. That is what makes the columns line up at all -- a row
+//  whose height depends on its text has no straight edge to align to.
+//
+//      YOUR MOVE  (2) ─────────────────────────────────────
+//      ▏● Build Sauron GUI navigation guide sys…   11m02s   12.4k
+//         your move  ·  2 files  ·  Colony / X-ray
+//      ▏● Fix the hull plate scale…                  4m12s    934
+//         errored  ·  API error — retry  ·  1 file
+//         [ reply to this agent…              ] [send][shot][ack]
+//
+//  Rows are grouped into the three tables of the board contract -- YOUR MOVE,
+//  AWAITING TESTING, WORKING -- in the wire's own order, which is sauron's rank.
+//  The header carries the count, and a table with no rows is not drawn at all.
+//
+//  THE FIXED HEIGHT IS THE COLUMN LINE, NOT THE WHOLE ROW
+//
+//  Every row's first two lines are the same height in every table: one title
+//  line and one dim note line, both cut to one line. A row waiting on a person
+//  still grows below that for its reply box, and a row someone clicked grows for
+//  its file list. Those are under the columns, not in them, so the numeric edge
+//  down the right of the pane stays straight either way.
 //
 //  EVERY INTERACTIVE RECT IS PLACED, NOT REQUESTED
 //  ----------------------------------------------
@@ -1094,12 +1206,40 @@ pub fn render(ctx: &egui::Context) {
 //  now `ui.put` into rects this file computes, so their size is a fact of the
 //  layout rather than a property of whatever style happens to be in scope.
 
-/// Base width of the pane, before scale. One column, sized for a task title.
+/// Base width of the pane, before scale. Sized for a task title first: the two
+/// numeric columns are subtracted from it, not added to it.
 const W_BASE: f32 = 430.0;
 
 fn panel_w() -> f32 {
     W_BASE * sc()
 }
+
+/// The footer strip's height. A constant because `body_max` has to subtract it
+/// before the footer has been drawn.
+const FOOTER_H: f32 = 20.0;
+
+/// Bounds on the scrolling list. The floor keeps a row and a bit visible when
+/// the pane is parked near the bottom edge; the ceiling stops a tall window
+/// turning a long board into a full-height wall over whatever it floats on.
+const BODY_MIN: f32 = 96.0;
+const BODY_MAX: f32 = 560.0;
+
+/// The gutter the severity bar and the status pip share, then the two numeric
+/// columns and the gap in front of them.
+///
+/// Five characters is the widest either numeric produces -- `1h04m`, `12.4k` --
+/// and both are painted right-aligned in a monospace face, so the digits line up
+/// down the pane and neither column can be made to wrap by its content.
+fn col_glyph_w() -> f32 { 13.0 * sc() }
+fn col_time_w() -> f32 { 44.0 * sc() }
+fn col_tokens_w() -> f32 { 40.0 * sc() }
+fn col_gap() -> f32 { 8.0 * sc() }
+
+/// Narrowest the title column may be squeezed to: roughly the twelve characters
+/// the board contract puts under every name column. The pane's width is fixed,
+/// so this floor is unreachable today -- it exists so that a host running at the
+/// top of the scale clamp cannot silently lose the title to the numerics.
+fn title_min_w() -> f32 { 90.0 * sc() }
 
 /// A small action button, painted rather than added.
 ///
@@ -1191,46 +1331,40 @@ fn field_h_for(ui: &egui::Ui, text: &str, width: f32) -> f32 {
 /// One row of the board. Returns whether it was clicked, which folds its file
 /// list.
 ///
+/// `w` is the width the caller has, which is the scroll area's and not the
+/// pane's -- see the call site.
+///
 ///   grep -n "fn draw_board_row"  sauron_panel.rs
 fn draw_board_row(
     ui: &mut egui::Ui,
+    w: f32,
     r: &Row,
     colour: egui::Color32,
     expanded: bool,
-    _stripe: bool,
 ) -> bool {
     let sk = skin();
     let k = sc();
     let waiting = wants_human(&r.status);
-    let inner = panel_w() - pad() * 2.0;
+    let inner = w - pad() * 2.0;
+
+    // ── columns, solved from the right ──────────────────────────────────
+    // The numerics are fixed and come out of the width first; the title takes
+    // what is left. Doing it the other way -- title first, numbers in the
+    // remainder -- is how a column ends up too narrow for the five characters
+    // it always holds.
+    let title_font = egui::FontId::proportional(12.0 * k);
+    let note_font = egui::FontId::proportional(9.5 * k);
+    let num_font = egui::FontId::monospace(9.5 * k);
+    let title_h = ui.fonts(|f| f.row_height(&title_font));
+    let note_h = ui.fonts(|f| f.row_height(&note_font));
+    let nums_w = col_time_w() + col_gap() + col_tokens_w();
+    let title_w = (inner - col_glyph_w() - col_gap() - nums_w).max(title_min_w());
 
     // ── measure first, allocate second ──────────────────────────────────
     // A row measured after it is allocated is the classic source of a
     // half-clipped last line, and of content overrunning into the footer.
-    let stamp = if r.turn_started > 0 { r.turn_started } else { r.last_activity };
-    let mut bits: Vec<String> = vec![status_label(&r.status).to_string()];
-    if stamp > 0 {
-        bits.push(elapsed(now_ms().saturating_sub(stamp)));
-    }
-    bits.push(format!("{} file{}", r.files.len(), plural(r.files.len())));
-    if let Some(first) = r.steps.first() {
-        bits.push(first.title.clone());
-        if r.steps.len() > 1 {
-            bits.push(format!("+{}", r.steps.len() - 1));
-        }
-    }
-    let meta = ui.painter().layout(
-        bits.join("  ·  "),
-        egui::FontId::proportional(9.5 * k),
-        sk.faint,
-        inner - 14.0 * k,
-    );
-    let title = ui.painter().layout(
-        display_name(r),
-        egui::FontId::proportional(12.0 * k),
-        sk.title,
-        inner,
-    );
+    let title = fit_line(ui, &display_name(r), &title_font, title_w);
+    let note = fit_line(ui, &row_note(r), &note_font, inner - col_glyph_w());
     let files: Vec<_> = if expanded {
         r.files
             .iter()
@@ -1271,8 +1405,6 @@ fn draw_board_row(
         })
         .collect();
 
-    let meta_h = meta.size().y;
-    let title_h = title.size().y;
     let files_h: f32 = files.iter().map(|g| g.size().y + 2.0 * k).sum();
     let sent_h: f32 = sent.iter().map(|g| g.size().y + 2.0 * k).sum();
     // Measured from the text the box currently holds, so a row grows as its
@@ -1283,7 +1415,11 @@ fn draw_board_row(
         0.0
     };
 
-    let mut h = 7.0 * k + meta_h + 3.0 * k + title_h + 7.0 * k;
+    // Fixed by construction: two lines whose height comes from the font rather
+    // than from the text, neither of which can wrap. What a row shows varies;
+    // how tall its column line is does not, and that is the only reason the
+    // numeric columns have a straight edge to sit on.
+    let mut h = 6.0 * k + title_h + 2.0 * k + note_h + 6.0 * k;
     if waiting {
         h += field_h + 5.0 * k;
     }
@@ -1294,7 +1430,7 @@ fn draw_board_row(
         h += files_h + 4.0 * k;
     }
 
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(panel_w(), h), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
 
     // Publish what this row points at, so a host can draw a line from it to the
     // control in question. Only anchors that name something: a surface with no
@@ -1334,15 +1470,54 @@ fn draw_board_row(
         );
 
         let x = rect.left() + pad();
-        let mut y = rect.top() + 7.0 * k;
+        let mut y = rect.top() + 6.0 * k;
 
-        // status pip, then the whole metadata line
-        p.circle_filled(egui::pos2(x + 3.0 * k, y + meta_h * 0.5), 3.0 * k, colour);
-        p.galley(egui::pos2(x + 11.0 * k, y), meta);
-        y += meta_h + 3.0 * k;
+        // ── the column line ─────────────────────────────────────────────
+        // Painted, not laid out: `Painter::text` cannot wrap, so nothing here
+        // can grow a second line after the row was measured for one.
+        p.circle_filled(egui::pos2(x + 3.5 * k, y + title_h * 0.5), 3.0 * k, colour);
+        p.text(
+            egui::pos2(x + col_glyph_w(), y),
+            egui::Align2::LEFT_TOP,
+            &title,
+            title_font,
+            sk.title,
+        );
 
-        p.galley(egui::pos2(x, y), title);
-        y += title_h;
+        let tokens_right = rect.right() - pad();
+        let time_right = tokens_right - col_tokens_w() - col_gap();
+        let mid = y + title_h * 0.5;
+        if let Some(t) = row_age(r) {
+            p.text(
+                egui::pos2(time_right, mid),
+                egui::Align2::RIGHT_CENTER,
+                t,
+                num_font.clone(),
+                sk.dim,
+            );
+        }
+        // Empty, not `0`. A Codex session and a Claude one that has not answered
+        // yet both report nothing here, and printing a zero would claim the
+        // board knows a figure it was never given.
+        if r.tokens > 0 {
+            p.text(
+                egui::pos2(tokens_right, mid),
+                egui::Align2::RIGHT_CENTER,
+                fmt_count(r.tokens),
+                num_font,
+                sk.faint,
+            );
+        }
+        y += title_h + 2.0 * k;
+
+        p.text(
+            egui::pos2(x + col_glyph_w(), y),
+            egui::Align2::LEFT_TOP,
+            &note,
+            note_font,
+            sk.faint,
+        );
+        y += note_h;
 
         if !files.is_empty() {
             y += 4.0 * k;
@@ -1492,13 +1667,150 @@ fn draw_reply_row(ui: &mut egui::Ui, r: &Row, strip: egui::Rect) {
     }
 }
 
-/// The short status word shown at the head of the metadata line.
+/// The short status word shown at the head of the note line.
 fn status_label(status: &str) -> &'static str {
     GROUPS
         .iter()
         .find(|(tok, _)| *tok == status)
         .map(|(_, title)| *title)
         .unwrap_or("—")
+}
+
+/// `text` cut to one line no wider than `max_w`, with an ellipsis where it was
+/// cut.
+///
+/// This is what makes the columns possible. Painted text cannot wrap, so a title
+/// that is too long is shortened here instead of stacking one word per line and
+/// dragging the row's height -- and the columns' alignment -- with it. That
+/// wrapping is the failure that reverted this layout twice; it cannot recur,
+/// because no wrap width is handed to the layout engine at all.
+///
+/// The search walks characters, not bytes: task names carry multi-byte
+/// characters, and slicing one in half panics.
+fn fit_line(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> String {
+    let width = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut fits = 0usize;
+    let mut over = chars.len();
+    while over - fits > 1 {
+        let mid = (fits + over) / 2;
+        let mut cand: String = chars[..mid].iter().collect();
+        cand.push('…');
+        if width(&cand) <= max_w {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    let mut cut: String = chars[..fits].iter().collect();
+    cut.push('…');
+    cut
+}
+
+/// The time column: how long a running row has been on this turn, and how long a
+/// settled one has been waiting. `None` when the wire carried no stamp at all.
+///
+/// Two questions, one column, and which one is being asked depends on the
+/// status. Measuring a stopped row from its turn start would show a timer
+/// climbing while nothing whatever is happening, which is the reading a board
+/// exists to prevent.
+fn row_age(r: &Row) -> Option<String> {
+    let running = matches!(r.status.as_str(), "working" | "delegated" | "stalled");
+    let stamp = if running && r.turn_started > 0 {
+        r.turn_started
+    } else {
+        r.last_activity
+    };
+    if stamp <= 0 {
+        return None;
+    }
+    Some(elapsed(now_ms().saturating_sub(stamp)))
+}
+
+/// The dim note under the title: why the row is where it is, then what it has
+/// touched.
+///
+/// One line, cut to fit, and ordered so that the tail is what can be lost.
+/// Everything here is recoverable elsewhere -- the file list unfolds on a click,
+/// the routes are in `route_steps` -- so a narrow pane losing the end of it
+/// costs nothing, while a line that wrapped would cost the row its fixed height.
+fn row_note(r: &Row) -> String {
+    let mut bits: Vec<String> = vec![status_label(&r.status).to_string()];
+    match status_phrase(&r.status) {
+        Some(phrase) => bits.push(phrase.to_string()),
+        None => {
+            if !r.detail.is_empty() {
+                bits.push(r.detail.clone());
+            }
+        }
+    }
+    if !r.files.is_empty() {
+        bits.push(format!("{} file{}", r.files.len(), plural(r.files.len())));
+    }
+    if r.total_edits > 0 {
+        bits.push(format!("{} edit{}", r.total_edits, plural(r.total_edits)));
+    }
+    if let Some(first) = r.steps.first() {
+        bits.push(first.title.clone());
+        if r.steps.len() > 1 {
+            bits.push(format!("+{}", r.steps.len() - 1));
+        }
+    }
+    bits.join("  ·  ")
+}
+
+/// What a row says when the wire gives it no reason of its own.
+///
+/// Both of these are guesses about a session nobody is waiting on, and both are
+/// worded as guesses on every sauron surface. Sharpening either here would make
+/// this pane the one claiming an agent is stuck while the others say it might
+/// be -- and for `stalled`, the usual truth is a slow build.
+fn status_phrase(status: &str) -> Option<&'static str> {
+    match status {
+        "delegated" => Some("background agent running — resumes on its own"),
+        "stalled" => Some("quiet a while — may need approval"),
+        _ => None,
+    }
+}
+
+/// A token total, compacted. `934`, `12.4k`, `1.2M`.
+///
+/// MUST MATCH `fmt_count` in the sauron crate's `model.rs`. The wire carries the
+/// raw figure precisely so each reader can fit it to its own column, and two
+/// readers that round it differently make one session look like two boards
+/// disagreeing. Truncates rather than rounds, so the figure never overstates and
+/// never rolls a unit -- `999k`, never `1000k`.
+///
+///   grep -n "fn fmt_count"  src/model.rs
+fn fmt_count(n: i64) -> String {
+    const K: i64 = 1_000;
+    const M: i64 = 1_000_000;
+    if n <= 0 {
+        return "0".to_string();
+    }
+    if n < K {
+        return n.to_string();
+    }
+    if n < M {
+        let whole = n / K;
+        if whole >= 100 {
+            return format!("{}k", whole);
+        }
+        return format!("{}.{}k", whole, (n % K) / 100);
+    }
+    let whole = n / M;
+    if whole >= 100 {
+        return format!("{}M", whole);
+    }
+    format!("{}.{}M", whole, (n % M) / 100_000)
 }
 
 /// Just the file name -- the temp directory prefix is noise in a narrow pane.
@@ -1645,17 +1957,64 @@ fn worst_colour(b: &Beacon) -> egui::Color32 {
 /// What the card calls this session. Orcs get a marker: they are sauron's own
 /// single-shot maintenance agents, and mistaking one for a task you started is
 /// how a clean file ends up looking like unexplained churn.
+///
+/// The edit count used to be appended here and is now in `row_note`. The title
+/// is a column, and a count on the end of it is the part that gets cut when a
+/// name is long -- so it was the one piece of the line that could vanish without
+/// anything showing that it had.
 fn display_name(r: &Row) -> String {
-    let edits = if r.total_edits > 0 {
-        format!("  ·  {} edit{}", r.total_edits, plural(r.total_edits))
-    } else {
-        String::new()
-    };
     if r.is_orc {
-        format!("orc  {}{}", r.name, edits)
+        format!("orc  {}", r.name)
     } else {
-        format!("{}{}", r.name, edits)
+        r.name.clone()
     }
+}
+
+/// One table's heading: the word, its count, and a rule out to the margin.
+///
+/// The count is on the header rather than left to be counted by eye, because it
+/// is the part you read first -- "three want me" is the decision, and the rows
+/// under it are the detail behind it.
+fn draw_table_header(ui: &mut egui::Ui, w: f32, word: &str, n: usize) {
+    let k = sc();
+    let sk = skin();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 19.0 * k), egui::Sense::hover());
+    let p = ui.painter();
+    let label = p.text(
+        egui::pos2(rect.left() + pad(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{word}  ({n})"),
+        egui::FontId::proportional(9.5 * k),
+        sk.dim,
+    );
+    // The rule starts where the words end, measured from what was actually
+    // painted. A fixed offset here would run the line through the header the
+    // first time a host's font was wider than the number picked for it.
+    let x0 = label.right() + 6.0 * k;
+    let x1 = rect.right() - pad();
+    if x1 > x0 {
+        p.line_segment(
+            [
+                egui::pos2(x0, rect.center().y),
+                egui::pos2(x1, rect.center().y),
+            ],
+            egui::Stroke::new(1.0, sk.rule),
+        );
+    }
+}
+
+/// How tall the scrolling list may be: what is left between the top of the list
+/// and the bottom of the window, less the footer.
+///
+/// Measured every frame rather than fixed, because the pane is draggable. A
+/// constant would be right in the default corner and wrong everywhere else --
+/// park the pane low and its last rows would sit below the window edge,
+/// unreachable, while the scrollbar reported that everything was visible.
+fn body_max(ui: &egui::Ui) -> f32 {
+    let k = sc();
+    let top = ui.cursor().top();
+    let room = ui.ctx().screen_rect().bottom() - top - FOOTER_H * k - pad();
+    room.clamp(BODY_MIN * k, BODY_MAX * k)
 }
 
 fn plural(n: usize) -> &'static str {
@@ -1666,8 +2025,8 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-fn draw_all_clear(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 34.0), egui::Sense::hover());
+fn draw_all_clear(ui: &mut egui::Ui, w: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::hover());
     ui.painter().text(
         egui::pos2(rect.left() + pad(), rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1688,7 +2047,8 @@ fn draw_footer(ui: &mut egui::Ui, b: &Beacon) {
     bits.push(b.label.clone());
     let line = bits.join("  ·  ");
 
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(panel_w(), 20.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(panel_w(), FOOTER_H * sc()), egui::Sense::hover());
     let p = ui.painter();
     p.line_segment(
         [

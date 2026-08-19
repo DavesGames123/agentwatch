@@ -751,7 +751,14 @@ fn board_routes(dir: &Path) -> std::io::Result<()> {
         println!("  board clear -- nothing to test");
     }
     for r in &b.rows {
-        println!("\n  [{}] {}", r.status, r.name);
+        // Same suffix rule as `panel::status`: a row with no usage recorded
+        // prints no figure, so an absent number never reads as a spend of zero.
+        let tokens = if r.tokens > 0 {
+            format!("  ·  {}", crate::model::fmt_count(r.tokens))
+        } else {
+            String::new()
+        };
+        println!("\n  [{}] {}{}", r.status, r.name, tokens);
         if r.files.is_empty() {
             println!("      no files written -- nothing to look at yet");
             continue;
