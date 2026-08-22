@@ -30,7 +30,15 @@ pub const DORMANT_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 /// listed. Without it the first launch shows every session ever run against the
 /// repo -- 44 of them here -- which reproduces the overload this tool exists to
 /// remove. Toggle with `o`, clear permanently with `--baseline`.
-pub const STALE_HORIZON_MS: i64 = 12 * 60 * 60 * 1000;
+///
+/// 36 hours, up from 12. Twelve is shorter than the gap between writing code at
+/// night and testing it the next day: a session that stopped editing at 03:28
+/// had every path dropped by `Session::pending` before 16:00, so the row fell
+/// out of `NeedsTest` and read as "stopped -- your move" with nothing under it.
+/// The horizon exists to bound a backlog, and a backlog you never got to see
+/// once is not one it was meant to bound. 36 hours clears yesterday morning's
+/// work but keeps last night's, which is the span a person actually works over.
+pub const STALE_HORIZON_MS: i64 = 36 * 60 * 60 * 1000;
 
 /// A session with an unresolved tool call and no log activity for this long is
 /// treated as possibly waiting on a human.
@@ -59,8 +67,9 @@ pub const STALL_AFTER_MS: i64 = 300_000;
 /// timestamp on it, but nothing bounded how long that evidence stayed valid: one
 /// bad classification sat at the top of the board until a human dismissed it,
 /// which is the same permanent-backlog failure [`STALE_HORIZON_MS`] removes for
-/// untested writes. Same span, separate constant -- the two age out for
-/// different reasons and want tuning apart.
+/// untested writes. Separate constants, and they now hold different spans: an
+/// untested write is work you still owe, so it waits 36 hours, while a guess
+/// about what an agent was doing is only as good as the hour it was made in.
 pub const ATTENTION_HORIZON_MS: i64 = 12 * 60 * 60 * 1000;
 
 /// A turn that ended this recently is treated as "the agent just handed the
