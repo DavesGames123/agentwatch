@@ -327,6 +327,17 @@ pub struct Session {
     pub counted_messages: BTreeSet<String>,
     /// Repo-relative path -> epoch millis of its most recent write by this session.
     pub edits: BTreeMap<String, i64>,
+    /// tool_use id -> the repo-relative paths that `Bash` call looks set to
+    /// write, held until its tool_result arrives.
+    ///
+    /// A shell write has no `file-history-delta` behind it, so the only evidence
+    /// is the command text -- and the command text is logged one record before
+    /// the result that says whether it worked. The paths wait here across that
+    /// gap and move into `edits` only when the result comes back clean, so a
+    /// command that failed does not put a file on the test list. An id still
+    /// sitting here is a call with no result yet, which is the same "still
+    /// running" fact `pending_tools` carries.
+    pub shell_writes: BTreeMap<String, Vec<String>>,
     /// Repo-relative path -> `(timestamp, lines)` of the most recent text an
     /// Edit/Write wrote to it, harvested from the tool result. The timestamp
     /// lets a newer edit supersede an older preview; the lines are what the

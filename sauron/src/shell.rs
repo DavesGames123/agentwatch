@@ -30,6 +30,12 @@
 //! name, because "this command probably wrote something somewhere" cannot be
 //! turned into a row.
 //!
+//! `touch` is excluded on purpose, and it was in this file for one measured
+//! board before it came out. It changes an mtime, not content, and its common
+//! use is `touch build.rs && cargo test` to force a rebuild -- which put
+//! `build.rs` on two test lists in `barnes-hut` as a file nobody had edited. A
+//! path is worth listing only when something wrote bytes to it.
+//!
 //! grep targets:
 //!   fn writes            -- the whole command -> candidate paths
 //!   fn split_heredocs    -- shell text and heredoc bodies, separated
@@ -361,13 +367,6 @@ fn segment_targets(seg: &[Tok]) -> Vec<String> {
                 }
             }
         }
-        "touch" | "truncate" => {
-            for a in args.iter().filter(|a| !a.starts_with('-')) {
-                if pathlike(a) {
-                    push_all(&mut out, vec![a.to_string()]);
-                }
-            }
-        }
         // `-c` and `-e` carry the whole program in one argument. Every argument
         // is offered to the script reader rather than only the one after the
         // flag, because the flag's spelling differs per interpreter and a plain
@@ -395,10 +394,12 @@ fn basename(cmd: &str) -> &str {
 /// Line-scanned, in two passes, and the second pass is the one that matters. A
 /// literal-only reader finds nothing in the shape every sampled session used:
 ///
-///     path = 'lang/tutorial/en.toml'
-///     src = open(path, encoding='utf-8').read()
-///     ...
-///     open(path, 'w', encoding='utf-8').write(src)
+/// ```text
+/// path = 'lang/tutorial/en.toml'
+/// src = open(path, encoding='utf-8').read()
+/// ...
+/// open(path, 'w', encoding='utf-8').write(src)
+/// ```
 ///
 /// The path literal and the write are three lines apart. So pass one records
 /// every `name = 'pathlike'` assignment, and pass two harvests, from each line
@@ -674,6 +675,12 @@ mod tests {
     fn a_pipeline_reports_every_stage() {
         let got = w("grep -rn foo src | tee hits.txt | sed -i '' 's/a/b/' src/c.rs");
         assert_eq!(got, vec!["hits.txt", "src/c.rs"]);
+    }
+
+    #[test]
+    fn touch_is_not_a_write() {
+        // `touch build.rs && cargo test` is a rebuild trick, not an edit.
+        assert!(w("touch build.rs && cargo test --lib").is_empty());
     }
 
     #[test]

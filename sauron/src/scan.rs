@@ -14,13 +14,15 @@
 //!   fn is_human_prompt      -- a user record a person typed, vs a tool result
 //!   fn advances_activity    -- which records are evidence a session is alive
 //!   fn fold_usage           -- message.usage -> the session's token counters
+//!   fn fold_shell_writes    -- a Bash call's files, once its result lands
+//!   fn shell_relative       -- a guessed path -> a repo path that exists
 //!   fn claude_session_files -- the jsonl for a repo under ~/.claude/projects
 //!   fn project_dir_for      -- /a/b/c -> ~/.claude/projects/-a-b-c
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
@@ -277,6 +279,7 @@ pub(crate) fn fold_record(session: &mut Session, v: &Value, repo_root: &Path) {
     }
 
     fold_questions(session, v);
+    fold_shell_writes(session, v, repo_root);
 
     match kind {
         "ai-title" => {
@@ -536,6 +539,148 @@ fn fold_questions(session: &mut Session, v: &Value) {
     }
 }
 
+/// Fold the files a `Bash` call wrote into the write-set.
+///
+/// The second source of `Session::edits`, beside `file-history-delta`. That
+/// record type follows the Edit and Write tools and nothing else, so a session
+/// that edits through heredocs and `sed` -- which is every session run under an
+/// auto mode that prefers Bash -- settles with an empty write-set and reads as
+/// "stopped, your move" rather than as work you have not tested. Three settled
+/// `barnes-hut` sessions measured 93, 50 and 50 shell calls against zero
+/// deltas while `lang/en.toml` sat rewritten on disk.
+///
+/// TWO RECORDS, NOT ONE
+/// --------------------
+/// The command text is on an `assistant` record and its outcome is on the
+/// `user` record that follows, so the candidate paths are parked on the session
+/// under the tool_use id and collected when the result arrives. A result flagged
+/// `is_error` drops them: a command that failed did not write, and a phantom
+/// path on a test list is the failure mode this whole guess has to stay under.
+///
+///   grep -n "fn fold_shell_writes"  src/scan.rs
+fn fold_shell_writes(session: &mut Session, v: &Value, repo_root: &Path) {
+    let Some(content) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    let cwd = v.get("cwd").and_then(|c| c.as_str()).filter(|c| !c.is_empty());
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(parse_rfc3339_ms)
+        .unwrap_or(session.last_activity);
+
+    for block in content {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("tool_use") => {
+                if block.get("name").and_then(|n| n.as_str()) != Some("Bash") {
+                    continue;
+                }
+                let Some(id) = block.get("id").and_then(|i| i.as_str()) else {
+                    continue;
+                };
+                let cmd = block
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let paths: Vec<String> = crate::shell::writes(cmd)
+                    .iter()
+                    .filter_map(|p| shell_relative(p, cwd, repo_root))
+                    .collect();
+                if !paths.is_empty() {
+                    session.shell_writes.insert(id.to_string(), paths);
+                }
+            }
+            Some("tool_result") => {
+                let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
+                    continue;
+                };
+                let Some(paths) = session.shell_writes.remove(id) else {
+                    continue;
+                };
+                if block.get("is_error").and_then(|b| b.as_bool()) == Some(true) {
+                    continue;
+                }
+                for rel in paths {
+                    let slot = session.edits.entry(rel).or_insert(ts);
+                    if ts > *slot {
+                        *slot = ts;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A path guessed off a shell command -> the repo-relative path to test, or
+/// `None` if it is not one.
+///
+/// Three gates, and the last one carries the module. A guessed path is resolved
+/// against the directory the command ran in (the record's own `cwd`, because an
+/// agent that ran `cd` into a subdirectory writes `en.toml`, not `lang/en.toml`),
+/// then kept only if it is inside the repo AND EXISTS ON DISK. Existence is what
+/// makes `shell.rs` safe to be wrong: `/dev/null`, `/tmp` scratch files, a glob
+/// fragment and any literal the parser mis-harvested all fail it, because
+/// nothing of that name is in the working tree.
+///
+/// Generated directories are dropped on top of that. A shell command reaches
+/// `target/` and `node_modules/` constantly -- `cargo build 2> target/err` is an
+/// ordinary line -- and none of it is a testable software change. The delta path
+/// needs no such filter: the Edit tool rarely goes there.
+///
+///   grep -n "fn shell_relative"  src/scan.rs
+pub(crate) fn shell_relative(raw: &str, cwd: Option<&str>, repo_root: &Path) -> Option<String> {
+    const GENERATED: [&str; 6] = [".git", "target", "node_modules", "__pycache__", ".venv", "dist"];
+
+    let candidate = Path::new(raw);
+    let base = cwd.map(Path::new).unwrap_or(repo_root);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    let abs = lexical(&joined);
+
+    let rel = abs.strip_prefix(repo_root).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    if rel
+        .components()
+        .any(|c| GENERATED.contains(&c.as_os_str().to_string_lossy().as_ref()))
+    {
+        return None;
+    }
+    if !abs.is_file() {
+        return None;
+    }
+    Some(rel.to_string_lossy().into_owned())
+}
+
+/// Resolve `.` and `..` without touching the disk.
+///
+/// Not `canonicalize`: that resolves symlinks, and a repo reached through one
+/// would then fail to `strip_prefix` its own root. Lexical is also the same
+/// answer every time, which a test can assert.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Keep only writes that landed inside the repo.
 ///
 /// Sessions also log writes to scratchpad scripts and `~/.claude` memory files.
@@ -675,6 +820,121 @@ mod tests {
         assert_eq!(
             encode_path(Path::new("/Users/you/code/my-repo")),
             "-Users-you-code-my-repo"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  Shell writes
+    // ───────────────────────────────────────────────────────────────────
+
+    /// A repo holding `files`, in a fresh temp dir.
+    ///
+    /// Pid-scoped: several `cargo test` runs share this checkout, and a fixed
+    /// path means one run deletes the tree another is reading.
+    fn shell_repo(tag: &str, files: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("sauron-shell-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x\n").unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn bash_call(id: &str, cwd: &str, cmd: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "cwd": cwd,
+            "timestamp": "2026-08-22T03:00:00.000Z",
+            "message": {
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": id, "name": "Bash",
+                             "input": {"command": cmd}}]
+            }
+        })
+    }
+
+    fn bash_result(id: &str, failed: bool) -> Value {
+        json!({
+            "type": "user",
+            "timestamp": "2026-08-22T03:00:05.000Z",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": id,
+                             "is_error": failed, "content": "ok"}]
+            }
+        })
+    }
+
+    #[test]
+    fn a_python_heredoc_write_reaches_the_write_set() {
+        // The exact shape measured in barnes-hut session a0cfb7f7: 93 Bash
+        // calls, zero file-history-delta records, and `lang/tutorial/en.toml`
+        // rewritten on disk. Before this fold the session settled with an empty
+        // write-set and the board said "stopped -- your move".
+        let repo = shell_repo("heredoc", &["lang/tutorial/en.toml"]);
+        let cmd = "python3 - <<'PYEOF'\n\
+                   import re, sys\n\
+                   path='lang/tutorial/en.toml'\n\
+                   src=open(path,encoding='utf-8').read()\n\
+                   open(path,'w',encoding='utf-8').write(src)\n\
+                   PYEOF";
+        let mut s = Session::default();
+        fold_record(&mut s, &bash_call("t1", repo.to_str().unwrap(), cmd), &repo);
+        assert!(s.edits.is_empty(), "nothing lands before the result");
+        assert_eq!(s.shell_writes.len(), 1, "the paths wait on the tool_use id");
+
+        fold_record(&mut s, &bash_result("t1", false), &repo);
+        assert_eq!(s.edits.keys().collect::<Vec<_>>(), vec!["lang/tutorial/en.toml"]);
+        assert!(s.shell_writes.is_empty(), "the result consumes them");
+    }
+
+    #[test]
+    fn a_failed_command_writes_nothing() {
+        let repo = shell_repo("failed", &["src/a.rs"]);
+        let mut s = Session::default();
+        let cmd = "sed -i '' 's/a/b/' src/a.rs";
+        fold_record(&mut s, &bash_call("t1", repo.to_str().unwrap(), cmd), &repo);
+        fold_record(&mut s, &bash_result("t1", true), &repo);
+        assert!(s.edits.is_empty());
+        assert!(s.shell_writes.is_empty());
+    }
+
+    #[test]
+    fn a_path_that_is_not_on_disk_is_not_a_file_to_test() {
+        // The gate that makes a wrong guess harmless.
+        let repo = shell_repo("absent", &["src/a.rs"]);
+        let mut s = Session::default();
+        let cmd = "echo x > src/never_written.rs";
+        fold_record(&mut s, &bash_call("t1", repo.to_str().unwrap(), cmd), &repo);
+        fold_record(&mut s, &bash_result("t1", false), &repo);
+        assert!(s.edits.is_empty());
+    }
+
+    #[test]
+    fn a_relative_path_resolves_against_the_records_own_cwd() {
+        // The agent ran `cd lang` first, so the command says `en.toml` and the
+        // write-set must still say `lang/en.toml`.
+        let repo = shell_repo("cwd", &["lang/en.toml"]);
+        let sub = repo.join("lang");
+        let mut s = Session::default();
+        let cmd = "sed -i '' 's/a/b/' en.toml";
+        fold_record(&mut s, &bash_call("t1", sub.to_str().unwrap(), cmd), &repo);
+        fold_record(&mut s, &bash_result("t1", false), &repo);
+        assert_eq!(s.edits.keys().collect::<Vec<_>>(), vec!["lang/en.toml"]);
+    }
+
+    #[test]
+    fn writes_outside_the_repo_and_into_generated_dirs_are_dropped() {
+        let repo = shell_repo("noise", &["target/debug/build.log", "src/a.rs"]);
+        let root = repo.to_str().unwrap();
+        assert_eq!(shell_relative("/dev/null", Some(root), &repo), None);
+        assert_eq!(shell_relative("target/debug/build.log", Some(root), &repo), None);
+        assert_eq!(
+            shell_relative("./src/../src/a.rs", Some(root), &repo).as_deref(),
+            Some("src/a.rs")
         );
     }
 
