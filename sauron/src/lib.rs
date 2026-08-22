@@ -45,6 +45,7 @@
 //!   mod plat        -- the host OS, behind one surface: home, clipboard, panes
 //!   mod scan        -- incremental log tailer
 //!   mod servant     -- which servant a session is: its name and its colour
+//!   mod shell       -- which files a Bash command wrote, read off the command
 //!   mod store       -- ack persistence, safe against concurrent writers
 //!   mod web         -- the board as a web app, with the agents running inside it
 //!   mod gui         -- docking a project's own app window into the workspace [macOS]
@@ -70,6 +71,7 @@ pub mod route;
 pub mod scan;
 pub mod servant;
 pub mod scene;
+pub mod shell;
 pub mod store;
 pub mod ui;
 pub mod web;
