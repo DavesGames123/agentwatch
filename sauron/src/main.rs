@@ -675,6 +675,10 @@ fn main() -> std::io::Result<()> {
 
     let once = args.iter().any(|a| a == "--once");
     let baseline = args.iter().any(|a| a == "--baseline");
+    // Age-scoped baseline: ack only untested work older than N hours, keeping
+    // recent work. Draws a fresh line without eating the night's edits.
+    let baseline_older_h: Option<i64> = take_flag(&mut args, "--baseline-older")
+        .and_then(|v| v.parse::<i64>().ok());
     let list_working = args.iter().any(|a| a == "--list-working");
     let restore_dismissed = args.iter().any(|a| a == "--restore-dismissed");
     let repo_root = match args.iter().find(|a| !a.starts_with("--")) {
@@ -722,6 +726,14 @@ fn main() -> std::io::Result<()> {
         println!(
             "baselined: {} session(s) marked tested. Only new agent work will appear from here.",
             app.board.store_len()
+        );
+        return Ok(());
+    }
+
+    if let Some(hours) = baseline_older_h {
+        let n = app.board.baseline_older(hours * 60 * 60 * 1000);
+        println!(
+            "baselined {n} session(s) older than {hours}h as tested. Newer untested work is kept."
         );
         return Ok(());
     }

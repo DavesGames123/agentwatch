@@ -434,6 +434,38 @@ impl Board {
         self.refresh();
     }
 
+    /// Ack every untested session whose last edit is older than `older_than_ms`,
+    /// leaving newer work untouched. Returns how many were acked.
+    ///
+    /// The scoped cousin of `baseline`. `baseline` acks the whole outstanding
+    /// set to start the queue empty; this draws the line at an age instead, so a
+    /// backlog that built up while the board was silently reaping it can be put
+    /// away in one gesture without also acking the night's work you actually
+    /// want to keep. Runs under `show_all`, so it reaches the rows a horizon
+    /// would otherwise hide -- which, after the reaper was removed, is nothing,
+    /// but keeping it here means the gesture does not depend on that staying true.
+    pub fn baseline_older(&mut self, older_than_ms: i64) -> usize {
+        let now = now_ms();
+        let saved = self.show_all;
+        self.show_all = true;
+        self.refresh();
+        let targets: Vec<(String, BTreeMap<String, i64>)> = self
+            .rows
+            .iter()
+            .filter(|r| r.status == Status::NeedsTest)
+            .filter(|r| now.saturating_sub(r.last_activity) >= older_than_ms)
+            .map(|r| (r.id.clone(), r.edits.clone()))
+            .collect();
+        let n = targets.len();
+        for (id, edits) in targets {
+            self.store.ack(&id, &edits);
+        }
+        self.persist();
+        self.show_all = saved;
+        self.refresh();
+        n
+    }
+
     pub fn ack_all(&mut self) {
         let all: Vec<(String, BTreeMap<String, i64>)> = self
             .rows
