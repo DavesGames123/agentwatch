@@ -151,7 +151,7 @@
   }
 
   /* ---------- one table ---------- */
-  .tbl { margin-bottom: 22px; min-width: 520px; }
+  .tbl { margin-bottom: 22px; min-width: 300px; }
   .tbl > h2 {
     display: flex; align-items: center; gap: 10px;
     margin: 0 0 6px; font: 600 11px/1 var(--ui);
@@ -175,26 +175,24 @@
   .row.on { background: var(--panel-2); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 40%, var(--line)); }
   .row > *, .hd > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) minmax(0, 22ch) 6ch 6ch; }
-  .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 2fr) 4ch minmax(8ch, 1fr) 6ch 6ch; }
-  .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch 6ch minmax(10ch, 1fr); }
-  .tbl.clear            .row, .tbl.clear            .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch 6ch; }
+  /* One flat spreadsheet: # · status · task · started · running · ~fin · tokens.
+     The same template on every row, so the whole board is one aligned table. */
+  .row, .hd { grid-template-columns: 2.5ch 8ch minmax(12ch, 1fr) 7ch 7ch 3.5ch 6ch; }
 
-  /* Columns drop from the right as the pane narrows -- tokens first, then the
-     wide reason column -- exactly as the contract orders it. The name and the
-     state mark never drop. */
-  @container (max-width: 620px) {
-    .tokens { display: none; }
-    .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) minmax(0, 22ch) 6ch; }
-    .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 2fr) 4ch minmax(8ch, 1fr) 6ch; }
-    .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch minmax(10ch, 1fr); }
-    .tbl.clear            .row, .tbl.clear            .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch; }
+  /* Columns drop from the right as the pane narrows -- the estimate first, then
+     tokens, then a clock -- exactly as the other surfaces order it. The number,
+     the status word and the task never drop. */
+  @container (max-width: 640px) {
+    .fin { display: none; }
+    .row, .hd { grid-template-columns: 2.5ch 8ch minmax(12ch, 1fr) 7ch 7ch 6ch; }
   }
-  @container (max-width: 460px) {
-    .sec { display: none; }
-    .tbl.your-move        .row, .tbl.your-move        .hd { grid-template-columns: 10px minmax(12ch, 1fr) 6ch; }
-    .tbl.awaiting-testing .row, .tbl.awaiting-testing .hd { grid-template-columns: 10px minmax(12ch, 1fr) 4ch 6ch; }
-    .tbl.working          .row, .tbl.working          .hd { grid-template-columns: 10px minmax(12ch, 1fr) 7ch; }
+  @container (max-width: 540px) {
+    .tokens { display: none; }
+    .row, .hd { grid-template-columns: 2.5ch 8ch minmax(12ch, 1fr) 7ch 7ch; }
+  }
+  @container (max-width: 440px) {
+    .started { display: none; }
+    .row, .hd { grid-template-columns: 2.5ch 8ch minmax(12ch, 1fr) 7ch; }
   }
 
   /* The state mark. The terminal board draws a glyph here; the page draws its
@@ -215,10 +213,16 @@
   }
   .row .sec { font: 12.5px var(--ui); color: var(--c); }
   .row .file { font: 11.5px var(--mono); color: #cfd6e2; }
-  .row .num, .row .t { font: 11.5px var(--mono); color: var(--faint); text-align: right; }
-  .hd .num, .hd .t { text-align: right; }
+  .row .num, .row .t, .row .idx, .row .fin { font: 11.5px var(--mono); color: var(--faint); text-align: right; }
+  .hd .num, .hd .t, .hd .idx, .hd .fin { text-align: right; }
   .row .t.live { color: var(--working); }
   .row .quiet { color: var(--faint); }
+  /* The status word is the only coloured cell on the row -- the state reads off
+     it without leaning on a legend. */
+  .row .stat {
+    font: 600 11px var(--ui); color: var(--c);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
   /* ---------- the detail of the selected row ---------- */
   .detail .top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
@@ -389,17 +393,14 @@
   // Each entry is [group, header word, header hue, columns]. A column is
   // [class, label]: the same classes go on the row cells, so the header and the
   // rows share one grid template and drop the same columns together.
-  const TABLES = [
-    ["your-move", "YOUR MOVE", "blocked",
-      [["g", ""], ["nm", "agent"], ["sec", "why"], ["t", "waited"], ["num tokens", "tokens"]]],
-    ["awaiting-testing", "AWAITING TESTING", "needs-test",
-      [["g", ""], ["nm", "agent"], ["num", "files"], ["file sec", "top file"], ["t", "since"], ["num tokens", "tokens"]]],
-    ["working", "WORKING", "working",
-      [["g", ""], ["nm", "agent"], ["t", "elapsed"], ["num tokens", "tokens"], ["sec", "now doing"]]],
-    // Not one of the three: `clear` is collapsed to the count in the footer and
-    // only ever drawn when the toggle asks sauron to send those rows.
-    ["clear", "CLEAR", "clear",
-      [["g", ""], ["nm", "agent"], ["t", "since"], ["num tokens", "tokens"]]],
+  // The flat spreadsheet's columns, left to right. Each is [class, label]; the
+  // same classes go on the row cells, so the header and every row share one grid
+  // and drop the same columns together. Status is a column now, not a section
+  // header -- the whole board is one sorted list, ranked worst-first by sauron.
+  const COLS = [
+    ["idx", "#"], ["stat", "status"], ["nm", "task"],
+    ["t started", "started"], ["t running", "running"],
+    ["fin", "~fin"], ["num tokens", "tokens"],
   ];
 
   // The id of the row the detail pane is showing. Kept as a session id and not
@@ -463,37 +464,28 @@
     if (!bar.children.length) add("clear", 1, "all caught up");
   }
 
-  // The cells of one row, in its table's column order, after the state mark and
-  // the name. Every string here was formatted by sauron; the page prints them.
-  function cells(r) {
-    const files = r.pending || [];
-    switch (r.group) {
-      case "your-move":
-        return [["sec", r.why], ["t", r.ago], ["num tokens", r.tokensText]];
-      case "awaiting-testing":
-        return [["num", files.length ? String(files.length) : ""],
-                ["file sec", files[0] || ""], ["t", r.ago], ["num tokens", r.tokensText]];
-      case "working":
-        return [["t" + (r.status === "working" ? " live" : ""), r.elapsed || ""],
-                ["num tokens", r.tokensText], ["sec", r.doing]];
-      default:
-        return [["t", r.ago], ["num tokens", r.tokensText]];
-    }
-  }
-
-  // One agent, one line. Nothing in here may wrap or grow: the columns line up
-  // down the table only because every row is the same height, and the detail
-  // that used to swell a card is in the detail pane now.
-  function row(r) {
+  // One agent, one line, in the flat column order. `num` is the row's 1-based
+  // place on the board -- the `#` column. Nothing here may wrap or grow: the
+  // columns line up down the table only because every row is the same height,
+  // and the detail that used to swell a card is in the detail pane now. Every
+  // string was formatted by sauron; the page prints them. `~fin` is the one it
+  // derives, and there is no honest source -- a running row shows "~", a settled
+  // one a dash -- so it never reads as a real estimate.
+  function row(r, num) {
+    const running = r.status === "working" || r.status === "delegated" || r.status === "stalled";
     const n = el("div", "row" + (r.id === selected ? " on" : ""));
     n.dataset.id = r.id;
     n.style.setProperty("--c", `var(--${r.status})`);
     n.style.setProperty("--servant", rgb(r.color));
-    const mark = el("span", "g");
-    mark.title = r.statusLabel;
-    n.append(mark);
+    n.append(el("span", "idx", String(num)));
+    const stat = el("span", "stat", r.tag);
+    stat.title = r.statusLabel;
+    n.append(stat);
     n.append(el("span", "nm", r.orc ? `orc · ${r.name}` : r.name));
-    for (const [cls, text] of cells(r)) n.append(el("span", cls, text));
+    n.append(el("span", "t started", r.startedAt || "—"));
+    n.append(el("span", "t running" + (r.status === "working" ? " live" : ""), r.elapsed || "—"));
+    n.append(el("span", "fin", running ? "~" : "—"));
+    n.append(el("span", "num tokens", r.tokensText || ""));
     n.onclick = () => select(r.id);
     return n;
   }
@@ -567,7 +559,7 @@
   // The rows in the order they are drawn: table by table, and within a table in
   // the order sauron sorted them. This is the order the arrow keys walk, so it
   // has to be the order on the screen and not the order of the message.
-  const drawn = () => (board ? TABLES.flatMap(([key]) => board.rows.filter((r) => r.group === key)) : []);
+  const drawn = () => (board ? board.rows.slice() : []);
 
   function select(id) {
     selected = id;
@@ -603,17 +595,13 @@
       tables.append(e);
     }
 
-    for (const [key, word, hue, cols] of TABLES) {
-      const mine = board.rows.filter((r) => r.group === key);
-      if (!mine.length) continue;
-      const tbl = el("section", "tbl " + key);
-      tbl.style.setProperty("--c", `var(--${hue})`);
-      tbl.append(el("h2", null, `${word} (${mine.length})`));
+    if (board.rows.length) {
+      const tbl = el("section", "tbl");
       const hd = el("div", "hd");
-      for (const [cls, label] of cols) hd.append(el("span", cls, label));
+      for (const [cls, label] of COLS) hd.append(el("span", cls, label));
       tbl.append(hd);
       const body = el("div", "rows");
-      mine.forEach((r) => body.append(row(r)));
+      board.rows.forEach((r, i) => body.append(row(r, i + 1)));
       tbl.append(body);
       tables.append(tbl);
     }
