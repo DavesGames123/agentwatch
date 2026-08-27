@@ -76,9 +76,11 @@
 //    fn beacon_path     -- $SAURON_BEACON, else git root -> encoded path
 //    fn parse           -- the v{{VERSION}} wire format reader
 //    fn draw_header     -- fold control and drag handle, one surface
-//    const TABLES       -- the three groups, and which statuses are in each
-//    fn draw_table_header -- one group's word, count and rule
-//    fn draw_board_row  -- one session row, columns and all
+//    fn draw_flat_header -- the spreadsheet's column labels
+//    fn draw_flat_row   -- one session as one spreadsheet line, detail on select
+//    fn flat_cols       -- the column x-layout, shared by header and rows
+//    fn started_clock / run_time / fin_est -- the three time-ish columns
+//    fn local_offset    -- the machine's UTC offset, for the start clock
 //    fn fit_line        -- one line, cut to a column, never wrapped
 //    fn body_max        -- how tall the scrolling list may be
 //    fn route_anchors   -- controls the host should highlight, for `needs_test`
@@ -93,7 +95,7 @@
 
 {{EGUI_IMPORT}}
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -604,8 +606,12 @@ struct State {
     last_poll: Option<Instant>,
     last_mtime: Option<SystemTime>,
     beacon: Option<Beacon>,
-    /// `id_short` of rows whose file list is unfolded.
-    expanded: BTreeSet<String>,
+    /// Full id of the one selected row, if any. Clicking a row selects it and
+    /// unfolds its detail -- the note, the file list and, on a waiting row, the
+    /// reply box -- while every other row stays a single spreadsheet line. One
+    /// selection, not a set: the flat board reads like a table, and a table with
+    /// several rows expanded at once stops being one.
+    selected: Option<String>,
     /// Top-left of the pane. `None` until the first frame resolves it to
     /// `DEFAULT_POS`.
     ///
@@ -625,7 +631,7 @@ fn state() -> &'static Mutex<State> {
             last_poll: None,
             last_mtime: None,
             beacon: None,
-            expanded: BTreeSet::new(),
+            selected: None,
             pos: None,
         })
     })
@@ -820,6 +826,46 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The machine's local UTC offset in seconds, read once from `date +%z`.
+///
+/// The panel has no timezone of its own -- std exposes none and this file takes
+/// no dependencies -- so the one datum a wall clock needs is lifted from `date`,
+/// exactly as the sauron crate's `local_offset_secs` does. Cached in a
+/// `OnceLock`: a DST flip mid-session would shift a start time by an hour, which
+/// is not worth re-shelling a twice-a-second pane to catch. Anything
+/// unparseable, or a missing `date`, degrades to 0 (UTC) rather than breaking
+/// the clock.
+fn local_offset() -> i64 {
+    static OFF: OnceLock<i64> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let out = match std::process::Command::new("date").arg("+%z").output() {
+            Ok(o) => o,
+            Err(_) => return 0,
+        };
+        parse_offset(String::from_utf8_lossy(&out.stdout).trim())
+    })
+}
+
+/// Parse a `±HHMM` UTC offset to signed seconds. Non-conforming input -> 0.
+fn parse_offset(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() < 5 {
+        return 0;
+    }
+    let sign = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return 0,
+    };
+    let (Some(h), Some(m)) = (
+        s.get(1..3).and_then(|x| x.parse::<i64>().ok()),
+        s.get(3..5).and_then(|x| x.parse::<i64>().ok()),
+    ) else {
+        return 0;
+    };
+    sign * (h * 3600 + m * 60)
 }
 
 /// Re-read the beacon if it is time to look and the file has actually moved.
@@ -1018,7 +1064,7 @@ pub fn render(ctx: &egui::Context) {
     // starts. egui callbacks are the classic place to re-enter a lock you are
     // still holding; copying first makes that impossible by construction, and
     // the snapshot is a few hundred bytes.
-    let (beacon, expanded, pos) = {
+    let (beacon, selected, pos) = {
         let Ok(mut st) = state().lock() else {
             return;
         };
@@ -1027,7 +1073,7 @@ pub fn render(ctx: &egui::Context) {
             .pos
             .get_or_insert(egui::pos2(DEFAULT_POS[0], DEFAULT_POS[1]));
         match &st.beacon {
-            Some(b) => (b.clone(), st.expanded.clone(), pos),
+            Some(b) => (b.clone(), st.selected.clone(), pos),
             None => return,
         }
     };
@@ -1038,7 +1084,7 @@ pub fn render(ctx: &egui::Context) {
         return;
     }
 
-    let mut toggled: Option<String> = None;
+    let mut clicked: Option<String> = None;
     let mut drag = egui::Vec2::ZERO;
 
     // `fixed_pos` and not `anchor`: an anchored area is re-pinned to its corner
@@ -1065,16 +1111,14 @@ pub fn render(ctx: &egui::Context) {
                     }
                     ui.add_space(2.0);
 
-                    // The list scrolls; the header above it and the footer below
-                    // it do not. One scroll area and not one per table: three
-                    // independently scrolling panes would each need a height
-                    // decided before anyone knew how many rows they held, so a
-                    // board with nine rows waiting on you and one running would
-                    // give the same room to both. As one list they share the
-                    // space in the order the contract ranks them, and the tables
-                    // stay what they are -- headings, not viewports.
+                    // The list scrolls; the column header above it and the footer
+                    // below it do not. One flat spreadsheet, not three tables:
+                    // status is a column now, and the rows are drawn in the
+                    // wire's own order -- sauron's rank, then blocked reason, then
+                    // most recent -- so a row sits where it does in the TUI
+                    // showing the same board. The selected row unfolds its detail
+                    // in place; every other row stays a single line.
                     let max_h = body_max(ui);
-                    let mut drew_any = false;
                     egui::ScrollArea::vertical()
                         .max_height(max_h)
                         .auto_shrink([false, true])
@@ -1082,46 +1126,33 @@ pub fn render(ctx: &egui::Context) {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             // Whatever the scrollbar left, not `panel_w()`. Rows
                             // drawn at the full width would have their right-hand
-                            // columns -- the two this layout is about -- slide
-                            // under the bar the moment the board is long enough
-                            // to need one.
+                            // columns slide under the bar the moment the board is
+                            // long enough to need one.
                             let w = ui.available_width();
-                            for (word, members) in TABLES {
-                                // Filtered out of the wire's own order rather
-                                // than gathered per status: that order is
-                                // sauron's rank, then blocked reason, then most
-                                // recent first, and re-sorting per table would
-                                // put a row in a different place here than in
-                                // the TUI showing the same board.
-                                let rows: Vec<&Row> = beacon
-                                    .rows
-                                    .iter()
-                                    .filter(|r| members.contains(&r.status.as_str()))
-                                    .collect();
-                                if rows.is_empty() {
-                                    continue;
-                                }
-                                drew_any = true;
-                                draw_table_header(ui, w, word, rows.len());
-                                for r in rows {
-                                    let open = expanded.contains(&r.id_short);
-                                    if draw_board_row(ui, w, r, group_colour(&r.status), open) {
-                                        toggled = Some(r.id_short.clone());
+                            if beacon.rows.is_empty() {
+                                draw_all_clear(ui, w);
+                            } else {
+                                draw_flat_header(ui, w);
+                                for (i, r) in beacon.rows.iter().enumerate() {
+                                    let sel = selected.as_deref() == Some(r.id.as_str());
+                                    if draw_flat_row(ui, w, i + 1, r, sel) {
+                                        clicked = Some(r.id.clone());
                                     }
                                 }
-                            }
-                            if !drew_any {
-                                draw_all_clear(ui, w);
                             }
                         });
                     draw_footer(ui, &beacon);
                 });
         });
 
-    if let Some(id) = toggled {
+    if let Some(id) = clicked {
         if let Ok(mut st) = state().lock() {
-            if !st.expanded.remove(&id) {
-                st.expanded.insert(id);
+            // Click the selected row again to deselect it and fold its detail;
+            // click another to move the selection there.
+            if st.selected.as_deref() == Some(id.as_str()) {
+                st.selected = None;
+            } else {
+                st.selected = Some(id);
             }
         }
     }
@@ -1234,6 +1265,13 @@ fn col_glyph_w() -> f32 { 13.0 * sc() }
 fn col_time_w() -> f32 { 44.0 * sc() }
 fn col_tokens_w() -> f32 { 40.0 * sc() }
 fn col_gap() -> f32 { 8.0 * sc() }
+/// The flat spreadsheet's own fixed columns: the row number, the status word,
+/// the local start clock, and the estimate. `task` is the flex column between
+/// the two groups and takes what these leave -- see `draw_flat_row`.
+fn col_num_w() -> f32 { 16.0 * sc() }
+fn col_status_w() -> f32 { 58.0 * sc() }
+fn col_start_w() -> f32 { 50.0 * sc() }
+fn col_fin_w() -> f32 { 18.0 * sc() }
 
 /// Narrowest the title column may be squeezed to: roughly the twelve characters
 /// the board contract puts under every name column. The pane's width is fixed,
@@ -1328,53 +1366,153 @@ fn field_h_for(ui: &egui::Ui, text: &str, width: f32) -> f32 {
     galley.size().y.max(row_h * 2.0) + margin.y * 2.0
 }
 
-/// One row of the board. Returns whether it was clicked, which folds its file
-/// list.
-///
-/// `w` is the width the caller has, which is the scroll area's and not the
-/// pane's -- see the call site.
-///
-///   grep -n "fn draw_board_row"  sauron_panel.rs
-fn draw_board_row(
-    ui: &mut egui::Ui,
-    w: f32,
-    r: &Row,
-    colour: egui::Color32,
-    expanded: bool,
-) -> bool {
+/// The column x-layout for one pane width, solved once so the header and every
+/// row line up. Fixed columns are met from both ends -- `#` and `status` on the
+/// left, the two clocks, the estimate and the token count on the right -- and
+/// `task` takes the slack in the middle with a floor under it.
+struct FlatCols {
+    num_r: f32,
+    status_l: f32,
+    task_l: f32,
+    task_w: f32,
+    start_r: f32,
+    run_r: f32,
+    fin_r: f32,
+    tokens_r: f32,
+}
+
+fn flat_cols(rect: egui::Rect) -> FlatCols {
+    let x = rect.left() + pad();
+    let num_r = x + col_glyph_w() + col_num_w();
+    let status_l = num_r + col_gap();
+    let task_l = status_l + col_status_w() + col_gap();
+
+    let tokens_r = rect.right() - pad();
+    let fin_r = tokens_r - col_tokens_w() - col_gap();
+    let run_r = fin_r - col_fin_w() - col_gap();
+    let start_r = run_r - col_time_w() - col_gap();
+    let start_l = start_r - col_start_w();
+    let task_w = (start_l - col_gap() - task_l).max(title_min_w());
+    FlatCols {
+        num_r,
+        status_l,
+        task_l,
+        task_w,
+        start_r,
+        run_r,
+        fin_r,
+        tokens_r,
+    }
+}
+
+/// The local start clock, `3:42PM`, or a dash when the wire carried no turn
+/// stamp. The panel has no timezone of its own, so `local_offset` lifts one from
+/// `date` the way the sauron crate does -- see that function.
+fn started_clock(r: &Row) -> String {
+    if r.turn_started <= 0 {
+        return "—".to_string();
+    }
+    let total = r.turn_started.div_euclid(1000) + local_offset();
+    let sod = total.rem_euclid(86_400);
+    let (h24, m) = (sod / 3600, (sod % 3600) / 60);
+    let (h12, ap) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    format!("{h12}:{m:02}{ap}")
+}
+
+/// How long the turn has run: to now while it is running, to its last activity
+/// once it has settled -- the length of the task, not the age of the board. A
+/// dash when there is no turn stamp to measure from.
+fn run_time(r: &Row) -> String {
+    if r.turn_started <= 0 {
+        return "—".to_string();
+    }
+    let running = matches!(r.status.as_str(), "working" | "delegated" | "stalled");
+    let end = if running { now_ms() } else { r.last_activity };
+    let ms = end.saturating_sub(r.turn_started);
+    if ms <= 0 {
+        "—".to_string()
+    } else {
+        elapsed(ms)
+    }
+}
+
+/// The estimate column. The log carries turns, not plans, so there is no honest
+/// figure: a running row shows a bare `~` that reads as "ongoing, no estimate",
+/// a settled one a dash. It is a column the board was asked for, kept truthful.
+fn fin_est(r: &Row) -> &'static str {
+    if matches!(r.status.as_str(), "working" | "delegated" | "stalled") {
+        "~"
+    } else {
+        "—"
+    }
+}
+
+/// The column-label row above the list. Solved to the same x-layout as the rows,
+/// so a label sits over the column it names.
+fn draw_flat_header(ui: &mut egui::Ui, w: f32) {
     let sk = skin();
     let k = sc();
-    let waiting = wants_human(&r.status);
+    let font = egui::FontId::proportional(9.0 * k);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 15.0 * k), egui::Sense::hover());
+    let c = flat_cols(rect);
+    let p = ui.painter();
+    let mid = rect.center().y;
+    let lbl = |p: &egui::Painter, x: f32, a: egui::Align2, s: &str| {
+        p.text(egui::pos2(x, mid), a, s, font.clone(), sk.faint);
+    };
+    lbl(p, c.num_r, egui::Align2::RIGHT_CENTER, "#");
+    lbl(p, c.status_l, egui::Align2::LEFT_CENTER, "status");
+    lbl(p, c.task_l, egui::Align2::LEFT_CENTER, "task");
+    lbl(p, c.start_r, egui::Align2::RIGHT_CENTER, "started");
+    lbl(p, c.run_r, egui::Align2::RIGHT_CENTER, "running");
+    lbl(p, c.fin_r, egui::Align2::RIGHT_CENTER, "~fin");
+    lbl(p, c.tokens_r, egui::Align2::RIGHT_CENTER, "tokens");
+    // A hairline under the labels, out to the token column's right edge.
+    p.line_segment(
+        [
+            egui::pos2(rect.left() + pad(), rect.bottom() - 1.0),
+            egui::pos2(c.tokens_r, rect.bottom() - 1.0),
+        ],
+        egui::Stroke::new(1.0, sk.rule),
+    );
+}
+
+/// One session as one spreadsheet line: `# status task started running ~fin
+/// tokens`. `num` is its 1-based place on the board. When `sel`, the row unfolds
+/// its detail below the line -- the note, the file list, and on a waiting row
+/// the reply box -- while every other row stays a single line. Returns whether
+/// it was clicked, which the caller turns into the selection.
+fn draw_flat_row(ui: &mut egui::Ui, w: f32, num: usize, r: &Row, sel: bool) -> bool {
+    let sk = skin();
+    let k = sc();
+    let colour = group_colour(&r.status);
+    let waiting = sel && wants_human(&r.status);
     let inner = w - pad() * 2.0;
 
-    // ── columns, solved from the right ──────────────────────────────────
-    // The numerics are fixed and come out of the width first; the title takes
-    // what is left. Doing it the other way -- title first, numbers in the
-    // remainder -- is how a column ends up too narrow for the five characters
-    // it always holds.
     let title_font = egui::FontId::proportional(12.0 * k);
     let note_font = egui::FontId::proportional(9.5 * k);
     let num_font = egui::FontId::monospace(9.5 * k);
+    let word_font = egui::FontId::proportional(10.0 * k);
     let title_h = ui.fonts(|f| f.row_height(&title_font));
     let note_h = ui.fonts(|f| f.row_height(&note_font));
-    let nums_w = col_time_w() + col_gap() + col_tokens_w();
-    let title_w = (inner - col_glyph_w() - col_gap() - nums_w).max(title_min_w());
 
-    // ── measure first, allocate second ──────────────────────────────────
-    // A row measured after it is allocated is the classic source of a
-    // half-clipped last line, and of content overrunning into the footer.
-    let title = fit_line(ui, &display_name(r), &title_font, title_w);
-    let note = fit_line(ui, &row_note(r), &note_font, inner - col_glyph_w());
-    let files: Vec<_> = if expanded {
+    // Detail is measured only for the selected row; every other row is one line.
+    let note = if sel {
+        fit_line(ui, &row_note(r), &note_font, inner - col_glyph_w())
+    } else {
+        String::new()
+    };
+    let files: Vec<_> = if sel {
         r.files
             .iter()
             .map(|f| {
-                ui.painter().layout(
-                    f.clone(),
-                    egui::FontId::monospace(8.5 * k),
-                    sk.file,
-                    inner - 12.0 * k,
-                )
+                ui.painter()
+                    .layout(f.clone(), egui::FontId::monospace(8.5 * k), sk.file, inner - 12.0 * k)
             })
             .collect()
     } else {
@@ -1407,39 +1545,34 @@ fn draw_board_row(
 
     let files_h: f32 = files.iter().map(|g| g.size().y + 2.0 * k).sum();
     let sent_h: f32 = sent.iter().map(|g| g.size().y + 2.0 * k).sum();
-    // Measured from the text the box currently holds, so a row grows as its
-    // draft wraps instead of being overrun by it.
     let field_h = if waiting {
         field_h_for(ui, &draft_text, inner - action_w() * 3.0 - 12.0 * k)
     } else {
         0.0
     };
 
-    // Fixed by construction: two lines whose height comes from the font rather
-    // than from the text, neither of which can wrap. What a row shows varies;
-    // how tall its column line is does not, and that is the only reason the
-    // numeric columns have a straight edge to sit on.
-    let mut h = 6.0 * k + title_h + 2.0 * k + note_h + 6.0 * k;
-    if waiting {
-        h += field_h + 5.0 * k;
-    }
-    if !sent.is_empty() {
-        h += sent_h + 3.0 * k;
-    }
-    if !files.is_empty() {
-        h += files_h + 4.0 * k;
+    // One line always; the selected row grows for its detail. The column line's
+    // height comes from the font, not the text, so the numeric columns keep a
+    // straight edge whatever a row is showing under them.
+    let mut h = 6.0 * k + title_h + 6.0 * k;
+    if sel {
+        h += 2.0 * k + note_h;
+        if !files.is_empty() {
+            h += files_h + 4.0 * k;
+        }
+        if waiting {
+            h += field_h + 5.0 * k;
+            if !sent.is_empty() {
+                h += sent_h + 3.0 * k;
+            }
+        }
     }
 
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
 
     // Publish what this row points at, so a host can draw a line from it to the
-    // control in question. Only anchors that name something: a surface with no
-    // button has nothing to run a cable to, and a cable into empty screen is
-    // worse than no cable.
-    //
-    // Done here, beside the row's own rect, because that rect IS the source of
-    // the line -- and losing this one statement in a layout rewrite silently
-    // turns the whole feature off, which is exactly what happened.
+    // control in question. Losing this in a layout rewrite silently turns the
+    // whole route-highlight feature off.
     if resp.hovered() {
         if let Ok(mut hv) = hover_state().lock() {
             *hv = Some((
@@ -1453,101 +1586,124 @@ fn draw_board_row(
         }
     }
 
+    // Measured before the painter is borrowed: the task column's width comes
+    // from the allocated rect, and cutting the name to it here means the paint
+    // pass below only lays down text that already fits.
+    let c = flat_cols(rect);
+    let task = fit_line(ui, &display_name(r), &title_font, c.task_w);
+
     {
         let p = ui.painter();
-        if resp.hovered() {
+        if sel {
             p.rect_filled(rect, egui::Rounding::same(4.0 * k), sk.row_hover);
+        } else if resp.hovered() {
+            p.rect_filled(
+                rect,
+                egui::Rounding::same(4.0 * k),
+                egui::Color32::from_rgba_premultiplied(
+                    sk.row_hover.r(),
+                    sk.row_hover.g(),
+                    sk.row_hover.b(),
+                    (sk.row_hover.a() as f32 * 0.6) as u8,
+                ),
+            );
         }
-        // Severity bar: what makes the board readable at a glance without
-        // reading any of the words.
+        // Severity bar: the board reads at a glance without reading any words.
         p.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(rect.left() + 2.0 * k, rect.top() + 3.0 * k),
-                egui::pos2(rect.left() + 4.5 * k, rect.bottom() - 3.0 * k),
+                egui::pos2(rect.left() + 4.5 * k, rect.top() + 6.0 * k + title_h - 3.0 * k),
             ),
             egui::Rounding::same(1.5 * k),
             colour,
         );
 
-        let x = rect.left() + pad();
-        let mut y = rect.top() + 6.0 * k;
+        let top = rect.top() + 6.0 * k;
+        let mid = top + title_h * 0.5;
 
         // ── the column line ─────────────────────────────────────────────
-        // Painted, not laid out: `Painter::text` cannot wrap, so nothing here
-        // can grow a second line after the row was measured for one.
-        p.circle_filled(egui::pos2(x + 3.5 * k, y + title_h * 0.5), 3.0 * k, colour);
         p.text(
-            egui::pos2(x + col_glyph_w(), y),
-            egui::Align2::LEFT_TOP,
-            &title,
-            title_font,
-            sk.title,
+            egui::pos2(c.num_r, mid),
+            egui::Align2::RIGHT_CENTER,
+            num.to_string(),
+            num_font.clone(),
+            sk.faint,
         );
-
-        let tokens_right = rect.right() - pad();
-        let time_right = tokens_right - col_tokens_w() - col_gap();
-        let mid = y + title_h * 0.5;
-        if let Some(t) = row_age(r) {
-            p.text(
-                egui::pos2(time_right, mid),
-                egui::Align2::RIGHT_CENTER,
-                t,
-                num_font.clone(),
-                sk.dim,
-            );
-        }
-        // Empty, not `0`. A Codex session and a Claude one that has not answered
-        // yet both report nothing here, and printing a zero would claim the
-        // board knows a figure it was never given.
+        p.text(
+            egui::pos2(c.status_l, mid),
+            egui::Align2::LEFT_CENTER,
+            status_label(&r.status),
+            word_font,
+            colour,
+        );
+        p.text(egui::pos2(c.task_l, mid), egui::Align2::LEFT_CENTER, &task, title_font, sk.title);
+        p.text(
+            egui::pos2(c.start_r, mid),
+            egui::Align2::RIGHT_CENTER,
+            started_clock(r),
+            num_font.clone(),
+            sk.dim,
+        );
+        p.text(
+            egui::pos2(c.run_r, mid),
+            egui::Align2::RIGHT_CENTER,
+            run_time(r),
+            num_font.clone(),
+            if r.status == "working" { sk.route } else { sk.dim },
+        );
+        p.text(
+            egui::pos2(c.fin_r, mid),
+            egui::Align2::RIGHT_CENTER,
+            fin_est(r),
+            num_font.clone(),
+            sk.faint,
+        );
+        // Empty, not `0`: a session with no recorded usage leaves the column blank
+        // rather than claiming a figure the board was never given.
         if r.tokens > 0 {
             p.text(
-                egui::pos2(tokens_right, mid),
+                egui::pos2(c.tokens_r, mid),
                 egui::Align2::RIGHT_CENTER,
                 fmt_count(r.tokens),
                 num_font,
                 sk.faint,
             );
         }
-        y += title_h + 2.0 * k;
 
-        p.text(
-            egui::pos2(x + col_glyph_w(), y),
-            egui::Align2::LEFT_TOP,
-            &note,
-            note_font,
-            sk.faint,
-        );
-        y += note_h;
+        // ── the selected row's detail, under the line ────────────────────
+        if sel {
+            let x = rect.left() + pad();
+            let mut y = top + title_h + 2.0 * k;
+            p.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, &note, note_font, sk.faint);
+            y += note_h;
 
-        if !files.is_empty() {
-            y += 4.0 * k;
-            for g in files {
-                let gh = g.size().y;
-                p.circle_filled(egui::pos2(x + 3.0 * k, y + gh * 0.5), 1.5 * k, sk.faint);
-                p.galley(egui::pos2(x + 11.0 * k, y), g);
-                y += gh + 2.0 * k;
+            if !files.is_empty() {
+                y += 4.0 * k;
+                for g in files {
+                    let gh = g.size().y;
+                    p.circle_filled(egui::pos2(x + 3.0 * k, y + gh * 0.5), 1.5 * k, sk.faint);
+                    p.galley(egui::pos2(x + 11.0 * k, y), g);
+                    y += gh + 2.0 * k;
+                }
             }
-        }
-
-        // Your side of the conversation, newest last, directly above the box
-        // you would type the next one into.
-        if !sent.is_empty() {
-            y += 3.0 * k;
-            for g in sent {
-                let gh = g.size().y;
-                p.galley(egui::pos2(x, y), g);
-                y += gh + 2.0 * k;
+            if !sent.is_empty() {
+                y += 3.0 * k;
+                for g in sent {
+                    let gh = g.size().y;
+                    p.galley(egui::pos2(x, y), g);
+                    y += gh + 2.0 * k;
+                }
             }
         }
     }
 
     if waiting {
-        let top = rect.bottom() - pad() * 0.7 - field_h;
+        let field_top = rect.bottom() - pad() * 0.7 - field_h;
         draw_reply_row(
             ui,
             r,
             egui::Rect::from_min_size(
-                egui::pos2(rect.left() + pad(), top),
+                egui::pos2(rect.left() + pad(), field_top),
                 egui::vec2(inner, field_h),
             ),
         );
