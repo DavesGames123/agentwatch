@@ -116,27 +116,6 @@ impl Group {
         }
     }
 
-    fn word(self) -> &'static str {
-        match self {
-            Group::YourMove => "YOUR MOVE",
-            Group::AwaitingTesting => "AWAITING TESTING",
-            Group::Working => "WORKING",
-            Group::Clear => "CLEAR",
-        }
-    }
-
-    /// The header rule's hue. One colour per table, fixed, rather than the hue of
-    /// whichever row happens to be first: the header is what the eye lands on
-    /// from the next pane over, and a rule that changed colour as rows churned
-    /// would be reporting on a row rather than naming a group.
-    fn color(self) -> Color {
-        match self {
-            Group::YourMove => RED,
-            Group::AwaitingTesting => GOLD,
-            Group::Working => CYAN,
-            Group::Clear => DIM,
-        }
-    }
 }
 
 /// Everything one status contributes to the board, in one record.
@@ -153,11 +132,9 @@ struct Look {
     /// How the session name is set: white and bold while the row wants a human,
     /// quieter once it does not.
     name: Style,
-    /// The reason column's colour. Deliberately not `color`: that column runs the
-    /// whole height of the table, and a state that is not asking for anything
-    /// says so in grey rather than in a hue that would pull the eye down it.
-    reason: Color,
-    /// The table this status is listed under.
+    /// The table this status is listed under. The flat board draws no section
+    /// headers, but the grouping still drives `Tab` (jump to the next status
+    /// cluster) and the worst-status colour.
     group: Group,
 }
 
@@ -173,14 +150,12 @@ fn look(status: Status) -> Look {
             glyph: "✖",
             color: MAGENTA,
             name: wants,
-            reason: MAGENTA,
             group: Group::YourMove,
         },
         Status::Blocked => Look {
             glyph: "▲",
             color: RED,
             name: wants,
-            reason: DIM,
             group: Group::YourMove,
         },
         // A prompt chevron: the agent is idle at the prompt, awaiting your reply.
@@ -188,28 +163,24 @@ fn look(status: Status) -> Look {
             glyph: "❯",
             color: AMBER,
             name: wants,
-            reason: AMBER,
             group: Group::YourMove,
         },
         Status::NeedsTest => Look {
             glyph: "█",
             color: GOLD,
             name: wants,
-            reason: GOLD,
             group: Group::AwaitingTesting,
         },
         Status::Working => Look {
             glyph: "◐",
             color: CYAN,
             name: quiet,
-            reason: DIM,
             group: Group::Working,
         },
         Status::Delegated => Look {
             glyph: "◇",
             color: INDIGO,
             name: quiet,
-            reason: INDIGO,
             group: Group::Working,
         },
         // Amber and hedged, in WORKING rather than YOUR MOVE. A long build and an
@@ -221,14 +192,12 @@ fn look(status: Status) -> Look {
             glyph: "◔",
             color: AMBER,
             name: quiet,
-            reason: DIM,
             group: Group::Working,
         },
         Status::Clear => Look {
             glyph: "·",
             color: DIM,
             name: Style::default().fg(DIM),
-            reason: DIM,
             group: Group::Clear,
         },
     }
@@ -784,14 +753,11 @@ pub const GROUPS: usize = 4;
 /// Cells of chrome ahead of the first column on every body row: the selection
 /// marker, the status glyph, and a space either side of it. Solved columns
 /// divide up whatever is left.
+#[allow(dead_code)] // solver test fixtures
 const PREFIX: usize = 4;
 /// The name column's floor. Below this a name is not a name, so every other
 /// column drops before the name gives up its last characters.
 const NAME_MIN: usize = 12;
-/// Body rows a table keeps when the pane is too short to give every table what
-/// it wants. Two rows and a clipped marker say less than nothing; three at least
-/// show that the table has a shape.
-const BODY_MIN: usize = 3;
 /// The name column's comfort width. Above its floor a name is legible; at the
 /// floor it is a stub, and a table of stubs is a table you cannot use. Columns
 /// marked `soft` are given up to reach this even on a row that would have fitted
@@ -845,6 +811,7 @@ impl Col {
 ///   drop 2  why / top file / now doing
 ///   drop 1  the time column
 ///   drop 0  the name
+#[allow(dead_code)] // realistic multi-column fixtures for the solve() tests
 fn columns(group: Group) -> &'static [Col] {
     static YOUR_MOVE: [Col; 4] = [
         Col::flex(NAME_MIN, 2, 0),
@@ -976,8 +943,15 @@ fn name_of(cols: &[Col], keep: &[bool], width: usize) -> usize {
         .filter(|(c, &k)| k && !c.fixed)
         .map(|(c, _)| c.share)
         .sum();
-    let name = cols.first().filter(|c| !c.fixed).map(|c| c.min).unwrap_or(0);
-    if shares == 0 || !keep.first().copied().unwrap_or(false) {
+    // The name is the leftmost flex column, wherever it sits: index 0 in the
+    // grouped tables, and index 2 in the flat spreadsheet, where `#` and
+    // `status` are fixed columns ahead of it. `solve` hands the rounding
+    // remainder to this same first-flex column, so the two agree.
+    let Some(ni) = cols.iter().position(|c| !c.fixed) else {
+        return 0;
+    };
+    let name = cols[ni].min;
+    if shares == 0 || !keep.get(ni).copied().unwrap_or(false) {
         return name;
     }
     // The rounding remainder goes to the name, so it is the whole slack less
@@ -985,9 +959,9 @@ fn name_of(cols: &[Col], keep: &[bool], width: usize) -> usize {
     let others: usize = cols
         .iter()
         .zip(keep)
-        .skip(1)
-        .filter(|(c, &k)| k && !c.fixed)
-        .map(|(c, _)| slack * c.share / shares)
+        .enumerate()
+        .filter(|(i, (c, &k))| *i != ni && k && !c.fixed)
+        .map(|(_, (c, _))| slack * c.share / shares)
         .sum();
     name + slack - others
 }
@@ -1076,45 +1050,6 @@ fn tokens_cell(row: &Row) -> String {
     }
 }
 
-/// Why a YOUR MOVE row is on the board, in the short form the contract fixes.
-fn why(row: &Row) -> String {
-    match row.status {
-        Status::Errored => row
-            .error
-            .map(|e| e.short())
-            .unwrap_or("turn ended on a failure")
-            .to_string(),
-        Status::AwaitingAck => row
-            .blocked_reason
-            .map(|r| r.short())
-            .unwrap_or("stopped — your move")
-            .to_string(),
-        _ => row
-            .blocked_reason
-            .map(|r| r.short())
-            .unwrap_or("waiting on you")
-            .to_string(),
-    }
-}
-
-/// A WORKING row's last column: what the agent is on.
-///
-/// The log records no tool name on a `Row`, so a working session says the file
-/// it wrote last -- which is what a supervisor is actually asking -- and the two
-/// states that are not computing say what they are waiting on instead. The
-/// stalled phrase stays hedged: the log cannot tell a slow command from an
-/// unanswered prompt, and this column must not pretend otherwise.
-fn now_doing(row: &Row) -> String {
-    match row.status {
-        Status::Delegated => "background agent running — resumes on its own".into(),
-        Status::Stalled => "quiet a while — may need approval".into(),
-        _ => match row.pending.first() {
-            Some(p) => p.rsplit('/').next().unwrap_or(p).to_string(),
-            None => "working".into(),
-        },
-    }
-}
-
 /// A task's elapsed run: to `now` while it is genuinely running, and to its last
 /// activity once it is not. A settled session whose timer kept climbing would be
 /// reporting the age of the board rather than the length of the task.
@@ -1128,43 +1063,6 @@ fn elapsed(row: &Row, now: i64) -> String {
         row.last_activity
     };
     fmt_duration(end.saturating_sub(row.turn_started))
-}
-
-/// One row's cells, in the column order `columns` gives for its table. The name
-/// cell is index 0 and is left empty: `push_name` draws it, because it carries
-/// the orc badge and the servant underline and is not one span.
-fn row_cells(row: &Row, group: Group, now: i64) -> Vec<Cell> {
-    let l = look(row.status);
-    let dim = Style::default().fg(DIM);
-    let reason = Style::default().fg(l.reason);
-    let name = Cell::left(String::new(), Style::default());
-    let age = || Cell::right(ago(row.last_activity, now), dim);
-    let tokens = || Cell::right(tokens_cell(row), dim);
-
-    match group {
-        Group::YourMove => vec![name, Cell::left(why(row), reason), age(), tokens()],
-        Group::AwaitingTesting => vec![
-            name,
-            Cell::right(row.pending.len().to_string(), Style::default().fg(GOLD)),
-            Cell::left(dim_common(&row.pending), Style::default().fg(FILE)),
-            age(),
-            tokens(),
-        ],
-        Group::Working => vec![
-            name,
-            Cell::right(
-                elapsed(row, now),
-                if row.status == Status::Working {
-                    Style::default().fg(CYAN)
-                } else {
-                    dim
-                },
-            ),
-            tokens(),
-            Cell::left(now_doing(row), reason),
-        ],
-        Group::Clear => vec![name, age(), tokens()],
-    }
 }
 
 /// The name cell: the orc badge, the name, and the servant underline.
@@ -1202,19 +1100,102 @@ fn push_name(spans: &mut Vec<Span<'static>>, row: &Row, style: Style, w: usize) 
     }
 }
 
-/// One session, one line, columns solved for this pane's width.
-fn table_row(row: &Row, group: Group, selected: bool, now: i64, width: usize) -> Line<'static> {
+/// The flat spreadsheet's columns, one set for every row on the board.
+///
+///   # · status · task · started · running · ~fin · tokens
+///
+/// Status is a column here, not a section header: the whole board is one sorted
+/// list, ranked worst-first, so the groups still cluster without three loud
+/// headings between them. `task` is the one flex column and never drops; the
+/// rest give way from the least useful in a narrow pane -- the estimate first,
+/// then tokens, the two clocks, the status word, the number -- exactly as their
+/// `drop` order says. The name floor is `NAME_MIN`, same as the old tables, so
+/// the 52-column pane still shows a name you can read.
+static FLAT: [Col; 7] = [
+    Col::fixed(3, 1),          // #        the row's number
+    Col::fixed(10, 2),         // status   the state word, the only coloured cell
+    Col::flex(NAME_MIN, 2, 0), // task     the description, never dropped
+    Col::fixed(7, 4),          // started  local wall-clock the turn began at
+    Col::fixed(7, 3),          // running  how long it has run / took
+    Col::fixed(4, 6).soft(),   // ~fin     estimate, working rows only
+    Col::fixed(6, 5).soft(),   // tokens   billed total, or blank
+];
+
+/// Which column holds the name, for `flat_row` and the solver's floor.
+const FLAT_NAME: usize = 2;
+
+/// The selection bar plus its one space; the status word carries the colour, so
+/// the glyph the grouped board drew here is gone.
+const FLAT_PREFIX: usize = 2;
+
+const FLAT_LABELS: [&str; 7] = ["#", "status", "task", "started", "running", "~fin", "tokens"];
+
+/// Whether a column's cell (and its header label) hugs the right edge -- the
+/// number, the two clocks, the estimate and the token count all do, because a
+/// column of ragged figures is a column nobody reads down.
+fn flat_right(i: usize) -> bool {
+    matches!(i, 0 | 3 | 4 | 5 | 6)
+}
+
+/// One row's cells, in `FLAT` order. The task cell is left empty: `push_name`
+/// draws it, because it carries the orc badge and the servant underline and is
+/// not one span.
+fn flat_cells(row: &Row, num: usize, now: i64, offset: i64) -> Vec<Cell> {
     let l = look(row.status);
-    let widths = solve(columns(group), width.saturating_sub(PREFIX));
-    let cells = row_cells(row, group, now);
+    let dim = Style::default().fg(DIM);
+    let running = matches!(
+        row.status,
+        Status::Working | Status::Delegated | Status::Stalled
+    );
+    let started = if row.turn_started > 0 {
+        fmt_clock(local_time(row.turn_started, offset))
+    } else {
+        "—".into()
+    };
+    let run = elapsed(row, now);
+    let run = if run.is_empty() { "—".to_string() } else { run };
+    // The estimate has no honest source -- the log carries turns, not plans --
+    // so a running row gets a bare "~" that reads as "ongoing, no estimate" and
+    // a settled one gets a dash. It is a column the board was asked for, kept
+    // truthful rather than filled with a guessed clock.
+    let fin = if running { "~".to_string() } else { "—".to_string() };
+    vec![
+        Cell::right(num.to_string(), dim),
+        Cell::left(row.status.tag().to_string(), Style::default().fg(l.color)),
+        Cell::left(String::new(), Style::default()),
+        Cell::right(started, dim),
+        Cell::right(
+            run,
+            if row.status == Status::Working {
+                Style::default().fg(CYAN)
+            } else {
+                dim
+            },
+        ),
+        Cell::right(fin, dim),
+        Cell::right(tokens_cell(row), dim),
+    ]
+}
+
+/// One session, one line, the flat columns solved for this pane's width. `num`
+/// is the row's 1-based place on the board -- the `#` column.
+fn flat_row(
+    row: &Row,
+    num: usize,
+    selected: bool,
+    now: i64,
+    offset: i64,
+    width: usize,
+) -> Line<'static> {
+    let l = look(row.status);
+    let widths = solve(&FLAT, width.saturating_sub(FLAT_PREFIX));
+    let cells = flat_cells(row, num, now, offset);
 
     let mut spans = vec![
         Span::styled(
             if selected { "▎" } else { " " },
             Style::default().fg(l.color),
         ),
-        Span::raw(" "),
-        Span::styled(l.glyph, Style::default().fg(l.color)),
         Span::raw(" "),
     ];
     let mut drawn = 0usize;
@@ -1226,7 +1207,7 @@ fn table_row(row: &Row, group: Group, selected: bool, now: i64, width: usize) ->
             spans.push(Span::raw(" "));
         }
         drawn += 1;
-        if i == 0 {
+        if i == FLAT_NAME {
             push_name(&mut spans, row, l.name, w);
         } else {
             spans.push(cell_span(c, w));
@@ -1235,113 +1216,33 @@ fn table_row(row: &Row, group: Group, selected: bool, now: i64, width: usize) ->
     Line::from(spans)
 }
 
-/// A coloured rule naming the table, so the eye lands on the boundary between
-/// "needs me" and "does not" without reading any labels.
-///
-/// `shown` is the window of rows on screen, and is `Some` only while the table
-/// is clipped. A table quietly showing four of eleven rows is the one failure
-/// this layout could have that the previous one could not, so it says so on the
-/// header rather than leaving the count in the parens to be believed.
-fn table_header(group: Group, count: usize, shown: Option<(usize, usize)>, width: usize) -> Line<'static> {
-    let text = format!(" {} ({}) ", group.word(), count);
-    let mark = match shown {
-        Some((first, last)) => format!(" {}–{} of {} ", first, last, count),
-        None => String::new(),
-    };
-    let fill = width
-        .saturating_sub(width_of(&text) + width_of(&mark))
-        .max(1);
-    let mut spans = vec![
-        Span::styled(
-            text,
-            Style::default()
-                .fg(group.color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("─".repeat(fill), Style::default().fg(DIM)),
-    ];
-    if !mark.is_empty() {
-        spans.push(Span::styled(mark, Style::default().fg(DIM)));
+/// The column-label row above the list, solved to the same widths so a label
+/// sits over the column it names. The clip count rides on top of this row's
+/// right edge (see `board`), painted after the columns so it never has to fight
+/// them for width.
+fn flat_header(width: usize) -> Line<'static> {
+    let widths = solve(&FLAT, width.saturating_sub(FLAT_PREFIX));
+    let label_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ".repeat(FLAT_PREFIX))];
+    let mut drawn = 0usize;
+    for (i, (label, w)) in FLAT_LABELS.iter().zip(&widths).enumerate() {
+        if *w == 0 {
+            continue;
+        }
+        if drawn > 0 {
+            spans.push(Span::raw(" "));
+        }
+        drawn += 1;
+        let c = if flat_right(i) {
+            Cell::right(label.to_string(), label_style)
+        } else {
+            Cell::left(label.to_string(), label_style)
+        };
+        spans.push(cell_span(&c, *w));
     }
     Line::from(spans)
 }
 
-/// The rows of each table, in render order. A table with no rows is not here at
-/// all, which is what keeps an empty header off the board.
-fn tables_of(rows: &[Row]) -> Vec<(Group, Vec<usize>)> {
-    Group::ALL
-        .iter()
-        .filter_map(|&g| {
-            let idx: Vec<usize> = rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| look(r.status).group == g)
-                .map(|(i, _)| i)
-                .collect();
-            (!idx.is_empty()).then_some((g, idx))
-        })
-        .collect()
-}
-
-/// Divide the pane's body rows between the tables.
-///
-/// Each table gets a share proportional to what it wants, floored at `BODY_MIN`
-/// so a table can never be reduced to a header and a stub, and capped at what it
-/// actually has so a short table never holds rows it cannot fill. Whatever the
-/// floors and the integer division leave over goes to the tables still short of
-/// what they asked for, hungriest first -- and if the floors themselves overrun
-/// a very short pane, the largest table gives the excess back.
-fn share_rows(desired: &[usize], budget: usize) -> Vec<usize> {
-    let total: usize = desired.iter().sum();
-    if total <= budget {
-        return desired.to_vec();
-    }
-    let n = desired.len();
-    if budget < n {
-        // Not even a row each. The tables are in urgency order, so what rows
-        // there are go to the top of the board and the tables that get none are
-        // not drawn at all: a header with nothing under it says less than the
-        // tally in the window header already does.
-        let mut left = budget;
-        return desired
-            .iter()
-            .map(|&d| {
-                let take = d.min(left);
-                left -= take;
-                take
-            })
-            .collect();
-    }
-    // The floor never overruns the budget: `BODY_MIN` is what a table should
-    // have, not what it may take from a pane that has not got it.
-    let floor = BODY_MIN.min(budget / n);
-    let mut out: Vec<usize> = desired
-        .iter()
-        .map(|&d| d.min(floor.max(budget * d / total.max(1))))
-        .collect();
-    let mut sum: usize = out.iter().sum();
-    while sum < budget {
-        // Ties go to the table nearest the top of the board, which is the most
-        // urgent one -- `max_by_key` would otherwise hand the spare row to the
-        // last of the equals.
-        let Some(i) = (0..n)
-            .filter(|&i| out[i] < desired[i])
-            .max_by_key(|&i| (desired[i] - out[i], std::cmp::Reverse(i)))
-        else {
-            break;
-        };
-        out[i] += 1;
-        sum += 1;
-    }
-    while sum > budget {
-        let Some(i) = (0..n).filter(|&i| out[i] > 1).max_by_key(|&i| out[i]) else {
-            break;
-        };
-        out[i] -= 1;
-        sum -= 1;
-    }
-    out
-}
 
 /// Where a table's body window starts.
 ///
@@ -1401,82 +1302,67 @@ fn board(f: &mut Frame, area: Rect, v: &View, geo: &mut FrameGeometry) {
     let collapse = !v.show_clear && v.clear_count > 0 && area.height > 1;
     let avail = (area.height as usize).saturating_sub(collapse as usize);
 
-    let tables = tables_of(v.rows);
-    let mut n = tables.len();
-    // The blank row between two tables is the first thing to go on a short pane:
-    // a row of board is worth more than the gap that separates two of them. Kept
-    // only while every table could still have a header and two rows beside it.
-    let spaced = avail >= 3 * n + n.saturating_sub(1);
-    // How many tables the pane can carry at all: each needs its header and one
-    // row under it. What will not fit is left off from the bottom, which is the
-    // least urgent end -- and the window header's tally still counts it.
-    while n > 1 && 2 * n + if spaced { n - 1 } else { 0 } > avail {
-        n -= 1;
+    // One flat list: a column-label header, then every row in rank order. The
+    // header takes the top line of the budget; the rows scroll under it. The
+    // cursor is already a flat index into `rows`, so `j`/`k` cross the whole
+    // board without any table boundaries to step over.
+    let body_h = avail.saturating_sub(1);
+    let len = v.rows.len();
+    let off = scroll_to(
+        v.scroll[0],
+        len,
+        body_h,
+        if v.follow { Some(v.selected) } else { None },
+    );
+    geo.scroll[0] = off;
+    let shown = body_h.min(len.saturating_sub(off));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(shown + 1);
+    lines.push(flat_header(width));
+    for i in off..off + shown {
+        lines.push(flat_row(
+            &v.rows[i],
+            i + 1,
+            i == v.selected,
+            v.now,
+            v.local_offset,
+            width,
+        ));
     }
-    // …and the window slides to keep the cursor's table in it. The board is
-    // where the cursor lives, so a `j` into a table the pane decided not to draw
-    // would be a keypress into nothing.
-    let at = tables
-        .iter()
-        .position(|(_, idx)| idx.contains(&v.selected))
-        .unwrap_or(0);
-    let tables: Vec<(Group, Vec<usize>)> = tables
-        .into_iter()
-        .skip(at.saturating_sub(n.saturating_sub(1)))
-        .take(n)
-        .collect();
-    // One header per table, plus the gaps if they survived.
-    let overhead = n + if spaced { n.saturating_sub(1) } else { 0 };
-    let desired: Vec<usize> = tables.iter().map(|(_, idx)| idx.len()).collect();
-    let bodies = share_rows(&desired, avail.saturating_sub(overhead));
-
-    let mut lines: Vec<Line> = Vec::new();
-    let mut y = area.y;
-    let bottom = area.y + avail as u16;
-    for (i, (group, idx)) in tables.iter().enumerate() {
-        // A header is only worth its row while a row of the table can follow it.
-        // Below that the table is left off the board entirely, which is why the
-        // tables are drawn in urgency order.
-        if bodies[i] == 0 || y + 1 >= bottom {
-            break;
-        }
-        if i > 0 && spaced {
-            lines.push(Line::raw(""));
-            y += 1;
-            if y + 1 >= bottom {
-                break;
-            }
-        }
-        // The body gets what the budget allowed, less anything the bottom of the
-        // pane takes back.
-        let h = bodies[i].min(bottom.saturating_sub(y + 1) as usize);
-        let sel = idx.iter().position(|&r| r == v.selected);
-        let off = scroll_to(
-            v.scroll[group.index()],
-            idx.len(),
-            h,
-            if v.follow { sel } else { None },
-        );
-        geo.scroll[group.index()] = off;
-
-        let clipped = (h < idx.len()).then(|| (off + 1, (off + h).min(idx.len())));
-        lines.push(table_header(*group, idx.len(), clipped, width));
-        y += 1;
-
-        for &r in idx.iter().skip(off).take(h) {
-            lines.push(table_row(&v.rows[r], *group, r == v.selected, v.now, width));
-        }
-        geo.tables.push(TableGeometry {
-            group: *group,
-            body_top: y,
-            body_height: h as u16,
-            rows: idx.clone(),
-            offset: off,
-        });
-        y += h as u16;
-    }
-
     f.render_widget(Paragraph::new(lines), area);
+
+    // The clip count, painted over the header row's right edge whenever a row is
+    // scrolled off either end -- so a row never vanishes without a count saying
+    // so. Overlaid as its own widget rather than appended to the header line,
+    // which is why it never has to fight the columns for width.
+    if shown < len {
+        let mark = format!(" {}–{} of {} ", off + 1, off + shown, len);
+        let mw = width_of(&mark) as u16;
+        if area.width > mw {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(mark, Style::default().fg(DIM)))),
+                Rect {
+                    x: area.x + area.width - mw,
+                    y: area.y,
+                    width: mw,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    // One geometry record for the whole list, so a click or a wheel roll on the
+    // board resolves against `scroll[0]` -- the single offset this list keeps.
+    // The slot is `YourMove`'s index (0) only because the wheel handler reads a
+    // table's `group.index()` to pick a scroll slot, and this list lives in slot
+    // 0; there is one list, so which name it wears does not otherwise matter.
+    geo.tables.push(TableGeometry {
+        group: Group::YourMove,
+        body_top: area.y + 1,
+        body_height: shown as u16,
+        rows: (0..len).collect(),
+        offset: off,
+    });
 
     if collapse {
         let line = Line::from(vec![
@@ -1873,6 +1759,7 @@ fn footer(f: &mut Frame, area: Rect, v: &View) {
 /// Compress a path list to a shared prefix plus leaf names:
 /// `src/gui/letters/{mod.rs, render.rs}`. Long lists are the norm here and the
 /// shared prefix carries most of the meaning.
+#[allow(dead_code)] // path-prefix compressor, kept for the detail pane and its tests
 fn dim_common(paths: &[String]) -> String {
     if paths.is_empty() {
         return String::new();
@@ -2450,22 +2337,26 @@ mod tests {
         assert_eq!(fit("", 5), "");
     }
 
-    /// A table with no rows is off the board entirely -- no header, no rule, no
-    /// blank row where it would have been.
+    /// The flat board draws one row per session with its status as a column, and
+    /// none of the old three section headers.
     #[test]
-    fn an_empty_table_is_not_drawn() {
+    fn a_row_shows_its_status_word_and_no_section_headers() {
         let rows = vec![a_row("untested work", Status::NeedsTest)];
         let v = a_view(&rows);
         let screen = screen_of(&v, 80, 24).join("\n");
-        assert!(screen.contains("AWAITING TESTING (1)"), "{screen}");
-        assert!(!screen.contains("YOUR MOVE"), "an empty table drew a header: {screen}");
-        assert!(!screen.contains("WORKING ("), "an empty table drew a header: {screen}");
+        assert!(screen.contains("untested work"), "{screen}");
+        // Status is a column word now, not a loud section rule.
+        assert!(screen.contains("needs test"), "{screen}");
+        assert!(!screen.contains("AWAITING TESTING ("), "a section header survived: {screen}");
+        assert!(!screen.contains("YOUR MOVE"), "a section header survived: {screen}");
+        assert!(!screen.contains("WORKING ("), "a section header survived: {screen}");
     }
 
-    /// The point of the redesign: one line per session, and the columns of one
-    /// table start at the same cell on every row of it.
+    /// One line per session, and the columns line up down the list: a fixed
+    /// column starts at the same cell on every row, whatever the task name's
+    /// length, because the task column absorbs the slack and the rest are fixed.
     #[test]
-    fn every_row_of_a_table_starts_its_columns_in_the_same_place() {
+    fn every_row_starts_its_columns_in_the_same_place() {
         let rows = vec![
             a_row("a short name", Status::Blocked),
             a_row("a considerably longer session name than the one above", Status::AwaitingAck),
@@ -2477,52 +2368,32 @@ mod tests {
             .filter(|l| l.contains("a short name") || l.contains("a considerably longer"))
             .collect();
         assert_eq!(body.len(), 2, "expected one line each:\n{}", lines.join("\n"));
-        // The clock column is the same column on both rows. Measured in cells:
-        // one of the two rows carries an em dash, so a byte offset would report
-        // the columns two apart when they are drawn in the same place.
-        let at = |l: &str| l[..l.rfind("0s").unwrap()].chars().count();
-        assert_eq!(at(body[0]), at(body[1]), "columns did not line up:\n{body:?}");
+        // Both rows are settled with no turn stamp, so the `started` column is an
+        // em dash on each. Its position is the start of the fixed columns; if the
+        // columns line up, the first dash sits at the same cell on both rows.
+        // Measured in cells, not bytes -- the dash is multi-byte.
+        let dash = |l: &str| l.chars().position(|c| c == '—');
+        assert!(dash(body[0]).is_some(), "no fixed column drawn:\n{body:?}");
+        assert_eq!(dash(body[0]), dash(body[1]), "columns did not line up:\n{body:?}");
     }
 
-    /// A table showing four of eleven rows has to say so. This is the one failure
-    /// the old single list could not have: it scrolled past the end of a group,
-    /// so nothing was ever silently held back.
+    /// A board showing some of eleven rows says how many, so a row never scrolls
+    /// off the list without a count admitting it.
     #[test]
-    fn a_clipped_table_says_how_much_it_is_showing() {
+    fn a_clipped_list_says_how_much_it_is_showing() {
         let rows: Vec<Row> = (0..11)
             .map(|i| a_row(&format!("working session {i}"), Status::Working))
             .collect();
         let v = a_view(&rows);
         let screen = screen_of(&v, 80, 24).join("\n");
-        assert!(screen.contains("WORKING (11)"), "{screen}");
-        assert!(screen.contains(" of 11 "), "a clipped table hid the clipping: {screen}");
+        assert!(screen.contains("of 11"), "a clipped list hid the clipping: {screen}");
     }
 
-    /// Every table keeps a workable body when the pane is too short for all of
-    /// them, and the pane's rows are never overspent.
-    #[test]
-    fn a_short_pane_is_divided_between_the_tables() {
-        // Plenty of room: everyone gets what they asked for.
-        assert_eq!(share_rows(&[2, 3, 4], 20), vec![2, 3, 4]);
-        // Squeezed: proportional, floored at BODY_MIN, and adding up to the
-        // budget exactly.
-        let got = share_rows(&[10, 2, 8], 12);
-        assert_eq!(got.iter().sum::<usize>(), 12, "{got:?}");
-        assert!(got.iter().all(|&r| r >= BODY_MIN.min(2)), "{got:?}");
-        assert!(got[0] > got[2], "the biggest table got the biggest share: {got:?}");
-        // A table wanting less than its share never holds rows it cannot fill.
-        assert_eq!(got[1], 2, "{got:?}");
-        // Hopeless: the floors overrun the pane, so the largest gives back first
-        // and nothing overspends.
-        let tiny = share_rows(&[9, 9, 9], 4);
-        assert!(tiny.iter().sum::<usize>() <= 4, "{tiny:?}");
-    }
-
-    /// Per-table scrolling: the window clamps to the table, follows the cursor
+    /// The list scrolls as one window: it clamps to the rows, follows the cursor
     /// while it is being followed, and holds still when it is not.
     #[test]
-    fn a_table_scrolls_within_itself_and_clamps_to_its_rows() {
-        // Never past the last row: a table of 10 showing 4 stops at offset 6.
+    fn the_list_scrolls_and_clamps_to_its_rows() {
+        // Never past the last row: a list of 10 showing 4 stops at offset 6.
         assert_eq!(scroll_to(99, 10, 4, None), 6);
         // Shorter than its window: there is nothing to scroll.
         assert_eq!(scroll_to(3, 2, 4, None), 0);
@@ -2537,36 +2408,25 @@ mod tests {
         assert_eq!(scroll_to(4, 10, 4, None), 4);
     }
 
-    /// Sessions are partitioned into the contract's tables, in the contract's
-    /// order, and `Clear` is in none of the three.
+    /// Every status maps to the group that drives Tab and the worst-status
+    /// colour, and its tag is the word the flat board prints in the status
+    /// column. Rows arrive ranked, so the board draws them in this order without
+    /// any re-sort.
     #[test]
-    fn statuses_land_in_the_table_the_contract_names() {
-        let rows = vec![
-            a_row("e", Status::Errored),
-            a_row("b", Status::Blocked),
-            a_row("k", Status::AwaitingAck),
-            a_row("t", Status::NeedsTest),
-            a_row("s", Status::Stalled),
-            a_row("w", Status::Working),
-            a_row("d", Status::Delegated),
-        ];
-        let tables = tables_of(&rows);
-        assert_eq!(
-            tables.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
-            vec![Group::YourMove, Group::AwaitingTesting, Group::Working]
-        );
-        assert_eq!(tables[0].1, vec![0, 1, 2]);
-        assert_eq!(tables[1].1, vec![3]);
-        assert_eq!(tables[2].1, vec![4, 5, 6]);
-        // The cursor is one index over this list, so the last row of a table and
-        // the first row of the next are one step apart: that is what lets `j`
-        // and `k` cross every table without either key knowing about tables.
-        let flat: Vec<usize> = tables.iter().flat_map(|(_, i)| i.clone()).collect();
-        assert_eq!(flat, (0..rows.len()).collect::<Vec<_>>());
-        // Stalled is in WORKING and its wording stays hedged -- a slow command
-        // and an unanswered prompt are the same shape in the log.
-        assert_eq!(look(Status::Stalled).group, Group::Working);
-        assert!(now_doing(&a_row("s", Status::Stalled)).contains("may need approval"));
+    fn every_status_has_a_group_and_a_status_word() {
+        for (status, group) in [
+            (Status::Errored, Group::YourMove),
+            (Status::Blocked, Group::YourMove),
+            (Status::AwaitingAck, Group::YourMove),
+            (Status::NeedsTest, Group::AwaitingTesting),
+            (Status::Stalled, Group::Working),
+            (Status::Working, Group::Working),
+            (Status::Delegated, Group::Working),
+            (Status::Clear, Group::Clear),
+        ] {
+            assert_eq!(look(status).group, group, "{status:?}");
+            assert!(!status.tag().is_empty(), "{status:?} has no status word");
+        }
     }
 
     /// A token total of zero is the absence of a measurement -- a Codex session,
@@ -2580,8 +2440,9 @@ mod tests {
     }
 
     /// The 52-column workspace pane is a design target, not a courtesy: this is
-    /// the width sauron runs at beside four agents. Every table must still say
-    /// which session it is and why the session is listed.
+    /// the width sauron runs at beside four agents. The name and the status word
+    /// survive, and nothing overruns the pane -- the estimate and token columns
+    /// give way first, exactly as the drop order says.
     #[test]
     fn the_board_survives_a_fifty_two_column_pane() {
         let mut blocked = a_row("wire up the token store", Status::Blocked);
@@ -2592,22 +2453,20 @@ mod tests {
         let v = a_view(&rows);
         let lines = screen_of(&v, 52, 24);
         let screen = lines.join("\n");
-        assert!(screen.contains("YOUR MOVE (1)"), "{screen}");
-        assert!(screen.contains("AWAITING TESTING (1)"), "{screen}");
-        assert!(screen.contains("WORKING (1)"), "{screen}");
-        // The name survives, and so does the reason it is on the board.
+        // The name survives, and so does the status word beside it.
         assert!(screen.contains("wire up"), "{screen}");
-        assert!(screen.contains("asked you a question"), "{screen}");
+        assert!(screen.contains("rebuild"), "{screen}");
+        assert!(screen.contains("waiting"), "{screen}");
+        assert!(screen.contains("needs test"), "{screen}");
         // Nothing overran the pane.
         assert!(lines.iter().all(|l| l.chars().count() == 52));
     }
 
-
-    /// A board of nothing but idle sessions still draws: no tables, and the
-    /// collapsed count on the last row. The early empty state does not cover
-    /// this one -- there are rows, they are simply all in no table.
+    /// A board of nothing but idle sessions still draws: no rows, and the
+    /// collapsed count on the last line. The early empty state does not cover
+    /// this one -- there are idle sessions, they are simply collapsed to a count.
     #[test]
-    fn a_board_of_only_clear_sessions_draws_its_count_and_no_tables() {
+    fn a_board_of_only_clear_sessions_draws_its_count() {
         let mut v = a_view(&[]);
         v.clear_count = 4;
         let lines = screen_of(&v, 80, 24);
@@ -2616,40 +2475,10 @@ mod tests {
         assert!(screen.contains("press c to show"), "{screen}");
     }
 
-    /// A pane too short for three tables drops whole tables rather than leaving
-    /// headers with nothing under them -- and it keeps the one the cursor is in,
-    /// because a board that hid the selected row would make `j` a key that does
-    /// nothing you can see.
+    /// `c` reveals the idle sessions: they join the flat list with a `clear`
+    /// status word rather than being counted and drawn nowhere.
     #[test]
-    fn a_pane_too_short_for_every_table_keeps_the_one_the_cursor_is_in() {
-        let rows = vec![
-            a_row("blocked on a question", Status::Blocked),
-            a_row("untested writes", Status::NeedsTest),
-            a_row("still going", Status::Working),
-        ];
-        let mut v = a_view(&rows);
-        v.selected = 2; // the WORKING table, last of the three
-        let screen = screen_of(&v, 80, 20).join("\n");
-        assert!(screen.contains("WORKING (1)"), "the cursor's table was dropped: {screen}");
-        assert!(screen.contains("still going"), "{screen}");
-        // Whatever was drawn, no header was left standing over an empty body.
-        for (i, l) in screen.lines().enumerate() {
-            if l.contains("YOUR MOVE (") || l.contains("AWAITING TESTING (") {
-                let next = screen.lines().nth(i + 1).unwrap_or("");
-                assert!(
-                    next.contains('▲') || next.contains('█'),
-                    "a header drew with no row under it:\n{screen}"
-                );
-            }
-        }
-    }
-
-    /// `c` still reveals the idle sessions. They are in none of the contract's
-    /// three tables, so they get a fourth of their own rather than being counted
-    /// in the header and then rendered nowhere -- which is what a board with
-    /// three tables and a `c` key would otherwise do.
-    #[test]
-    fn showing_the_clear_sessions_gives_them_a_table_of_their_own() {
+    fn showing_the_clear_sessions_adds_them_to_the_list() {
         let rows = vec![
             a_row("still going", Status::Working),
             a_row("nothing outstanding", Status::Clear),
@@ -2658,31 +2487,29 @@ mod tests {
         v.clear_count = 1;
         v.show_clear = true;
         let screen = screen_of(&v, 100, 30).join("\n");
-        assert!(screen.contains("CLEAR (1)"), "{screen}");
         assert!(screen.contains("nothing outstanding"), "{screen}");
-        // …and the collapsed count is gone, rather than sitting under the table
-        // it was replaced by.
+        assert!(screen.contains("clear"), "{screen}");
+        // …and the collapsed count is gone, rather than sitting under the rows it
+        // was replaced by.
         assert!(!screen.contains("press c to show"), "{screen}");
     }
 
-    /// A YOUR MOVE row says why it is there, on the row, in the words the
-    /// contract fixes. The old board carried a status tag on every card; the
-    /// tables carry the group in the header and the reason in a column, which is
-    /// the same fact told once each rather than twice.
+    /// Every row carries its own status word, so what kind of attention it wants
+    /// reads off the row itself -- the loud detail (the failure, the files) moved
+    /// to the detail pane under the selected row.
     #[test]
-    fn every_row_says_why_it_is_on_the_board() {
+    fn every_row_carries_its_status_word() {
         let mut errored = a_row("wire up the token store", Status::Errored);
         errored.error = Some(crate::model::ErrorKind::Truncated);
-        let mut needs = a_row("rebuild the ack store", Status::NeedsTest);
-        needs.pending = vec!["src/a.rs".into()];
+        let needs = a_row("rebuild the ack store", Status::NeedsTest);
         let rows = vec![errored, needs];
         let v = a_view(&rows);
         let screen = screen_of(&v, 100, 30).join("\n");
-        // Errored: the failure, not a file count.
-        assert!(screen.contains("cut off (max_tokens)"), "{screen}");
-        // Untested: the count and the file, under the header that names the group.
-        assert!(screen.contains("AWAITING TESTING (1)"), "{screen}");
-        assert!(screen.contains("src/a.rs"), "{screen}");
+        // The status words are on the rows.
+        assert!(screen.contains("errored"), "{screen}");
+        assert!(screen.contains("needs test"), "{screen}");
+        // And the selected (errored) row's failure shows in the detail pane below.
+        assert!(screen.contains("cut off"), "{screen}");
     }
 
     #[test]
