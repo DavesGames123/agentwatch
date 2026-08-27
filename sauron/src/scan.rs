@@ -353,8 +353,8 @@ fn is_human_prompt(v: &Value) -> bool {
 /// Everything is, except a `system` record of an unrecognised subtype. Those are
 /// harness events with no agent behind them: a `local_command` was observed at
 /// 23:15:46 on a session whose last real activity was 21:15:05, two hours dead,
-/// and advancing the clock from it pulled the session back inside RECENT_STOP_MS
-/// and relit it as "AWAITING ACK -- your move". `away_summary` does the same.
+/// and advancing the clock from it kept the session's activity time fresh, which
+/// is what the awaiting-ack window reads. `away_summary` does the same.
 ///
 /// The two turn-end subtypes are exempt because they are not independent events:
 /// every one sampled follows an `end_turn` within 60ms, so the clock they set is
@@ -1546,8 +1546,8 @@ mod tests {
     fn an_unrecognised_system_subtype_does_not_resurrect_a_dead_session() {
         // Observed: a `local_command` at 23:15:46 on a session whose last real
         // activity was 21:15:05. Two hours dead, and the record pulled it back
-        // inside RECENT_STOP_MS and relit it as "AWAITING ACK -- your move".
-        use crate::model::Status;
+        // inside the awaiting-ack window and relit it as "AWAITING ACK".
+        use crate::model::{Status, DORMANT_AFTER_MS};
         let root = Path::new("/repo");
         let mut s = Session::default();
 
@@ -1570,8 +1570,12 @@ mod tests {
             assert_eq!(s.last_activity, last_real, "{sub} moved the session's clock");
         }
 
-        // Two hours after the real end, it is history -- not something waiting.
-        let now = parse_rfc3339_ms("2026-07-21T23:15:50.000Z").unwrap();
+        // The clock stays put, which is the whole fix: the system record did not
+        // advance it. A day and a half after the real end, the handback has aged
+        // past the awaiting-ack window and is history -- Clear, not waiting.
+        // (Nearer the end it now reads as AwaitingAck for a full day, which is
+        // correct: an idle finished turn is "your move" until you clear it.)
+        let now = last_real + DORMANT_AFTER_MS + 60_000;
         assert_eq!(s.status(now, None), Status::Clear);
 
         // The two turn-end subtypes still carry the clock: each follows an

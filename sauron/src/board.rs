@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use crate::agent::Agent;
 use crate::model::{
     now_ms, BlockedReason, ErrorKind, Session, Status, ATTENTION_HORIZON_MS, DORMANT_AFTER_MS,
-    STALE_HORIZON_MS,
 };
 use crate::scan::Scanner;
 use crate::store::AckStore;
@@ -110,16 +109,21 @@ pub fn dismissable(status: Status) -> bool {
 
 /// Whether a row of this status, this old, still belongs on the board.
 ///
-/// Two horizons, one rule. Untested writes age out because whatever process
-/// preceded this tool already tested or abandoned them, and listing yesterday's
-/// buries today's. The attention states -- `Errored`, `Blocked`, `Stalled` --
-/// age out because each is read off a timestamped observation and nothing else
-/// bounded how long that observation stayed true: one misclassification sat
-/// first on the board until a human dismissed it by hand.
+/// One rule now, and it is a rule about ownership rather than age. Work a human
+/// owes does not age out at all: an untested write (`NeedsTest`), an unanswered
+/// question (`Blocked`), a dead turn (`Errored`). None of the three stops being
+/// owed because time passed, and an earlier build that aged them out silently
+/// reaped a night's untested edits before their author woke -- which is the bug
+/// this removes. They leave the board only when a human clears them (ack, defer
+/// or dismiss), never on a clock.
 ///
-/// Everything else is unbounded on purpose. `Working` and `Delegated` are claims
-/// about right now and are re-derived every tick; `AwaitingAck` and `Clear` have
-/// their own exits (`RECENT_STOP_MS`, `DORMANT_AFTER_MS`) inside the classifier.
+/// `Stalled` is the one attention state that still ages, because nobody owes it
+/// anything: it is a guess about a quiet tool call, most often a slow build, and
+/// a guess is only as good as the hour it was made in.
+///
+/// Everything else is unbounded here on purpose. `Working` and `Delegated` are
+/// claims about right now and are re-derived every tick; `AwaitingAck` and
+/// `Clear` have their own exit (`DORMANT_AFTER_MS`) inside the classifier.
 ///
 /// A free function, and the reason is that it is the rule this file exists to
 /// get right: `Board::refresh` needs a whole scanner and a `~/.claude` full of
@@ -127,8 +131,8 @@ pub fn dismissable(status: Status) -> bool {
 /// the program and squinting.
 pub fn within_horizon(status: Status, age_ms: i64) -> bool {
     match status {
-        Status::NeedsTest => age_ms <= STALE_HORIZON_MS,
-        Status::Errored | Status::Blocked | Status::Stalled => age_ms <= ATTENTION_HORIZON_MS,
+        Status::NeedsTest | Status::Errored | Status::Blocked => true,
+        Status::Stalled => age_ms <= ATTENTION_HORIZON_MS,
         _ => true,
     }
 }
@@ -140,9 +144,9 @@ pub struct Board {
     /// The rows to show, ranked. Rows filtered out by the horizon or the clear
     /// collapse are counted below rather than kept here.
     pub rows: Vec<Row>,
-    /// Rows past a horizon -- untested work past `STALE_HORIZON_MS`, or an
-    /// attention state past `ATTENTION_HORIZON_MS` -- kept out of `rows` but
-    /// counted. See `within_horizon`.
+    /// Rows past their horizon, kept out of `rows` but counted. Only `Stalled`
+    /// reaches here now -- a guess past `ATTENTION_HORIZON_MS` -- because owed
+    /// work no longer ages out. See `within_horizon`.
     pub hidden_stale: usize,
     /// Clear sessions are counted but kept out of `rows` unless `show_clear`.
     pub clear_count: usize,
@@ -227,16 +231,14 @@ impl Board {
                 .then(b.last_activity.cmp(&a.last_activity))
         });
 
-        // Collapse the historical backlog. Sessions from days ago were tested
-        // (or abandoned) by whatever process preceded this tool; listing them as
-        // outstanding buries today's actual work.
-        //
-        // The attention states age out the same way, and for a sharper reason:
-        // `Errored`, `Blocked` and `Stalled` are read off evidence with a
-        // timestamp on it, but nothing bounded how long that evidence stayed
-        // good. One misclassification held the top of the board until a human
-        // dismissed it by hand -- permanent, and permanently first. Both horizons
-        // are lifted by `show_all`, so nothing is destroyed, only put away.
+        // Collapse what has genuinely gone stale. Only a `Stalled` guess ages
+        // out here now: it is a quiet tool call the log cannot read, and one
+        // that has sat for half a day is almost certainly a build that finished
+        // unobserved rather than a prompt still waiting. Owed work -- untested
+        // edits, a blocked question, an errored turn -- is deliberately NOT
+        // collapsed: it stays until a human clears it, which is the whole point
+        // of the change. The horizon is lifted by `show_all`, so even the guess
+        // is only put away, never destroyed.
         let before = rows.len();
         if !self.show_all {
             rows.retain(|r| within_horizon(r.status, now.saturating_sub(r.last_activity)));
@@ -636,26 +638,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bug: nothing bounded how long a classification stayed on the board.
-    /// A session misread as blocked at 9am was still first on the list at
-    /// midnight, and only a keypress could remove it.
+    /// Owed work never ages out here, and a guess still does.
+    ///
+    /// This inverts the old test. The bug it names was real -- a misclassified
+    /// row sat first on the board until a keypress removed it -- but the fix for
+    /// it aged out the states a human genuinely owes as well, so a night's
+    /// untested edits vanished before their author woke. Only `Stalled`, the one
+    /// guess nobody owes anything on, ages out now; the owed states stay until a
+    /// human clears them.
     #[test]
-    fn an_attention_state_stops_demanding_attention_once_its_evidence_is_old() {
-        for s in [Status::Errored, Status::Blocked, Status::Stalled] {
-            assert!(within_horizon(s, ATTENTION_HORIZON_MS - 1), "{s:?} is fresh");
-            assert!(
-                !within_horizon(s, ATTENTION_HORIZON_MS + 1),
-                "{s:?} outlived its evidence"
-            );
-        }
-        // Untested writes keep their own, older horizon.
-        assert!(within_horizon(Status::NeedsTest, STALE_HORIZON_MS - 1));
-        assert!(!within_horizon(Status::NeedsTest, STALE_HORIZON_MS + 1));
+    fn only_a_stalled_guess_ages_out_and_owed_work_never_does() {
+        // The guess still ages: a quiet tool call half a day old is almost
+        // certainly a build that finished unobserved, not a prompt still waiting.
+        assert!(within_horizon(Status::Stalled, ATTENTION_HORIZON_MS - 1), "fresh guess");
+        assert!(
+            !within_horizon(Status::Stalled, ATTENTION_HORIZON_MS + 1),
+            "a stale guess outlived its evidence"
+        );
 
-        // The rest are unbounded on purpose: two are claims about right now and
-        // are re-derived every tick, and two have their own exits inside the
-        // classifier (RECENT_STOP_MS, DORMANT_AFTER_MS).
+        // Everything else is unbounded here. The owed states -- NeedsTest,
+        // Blocked, Errored -- never age out at all, which is the fix; the live
+        // states are re-derived every tick; AwaitingAck and Clear have their own
+        // exit (DORMANT_AFTER_MS) inside the classifier.
         for s in [
+            Status::NeedsTest,
+            Status::Blocked,
+            Status::Errored,
             Status::Working,
             Status::Delegated,
             Status::AwaitingAck,

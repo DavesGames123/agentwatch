@@ -23,22 +23,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// assume the turn will never finish.
 pub const STUCK_AFTER_MS: i64 = 30 * 60 * 1000;
 
-/// Sessions quieter than this with nothing pending are hidden entirely.
-pub const DORMANT_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// Untested writes older than this are collapsed behind a counter rather than
-/// listed. Without it the first launch shows every session ever run against the
-/// repo -- 44 of them here -- which reproduces the overload this tool exists to
-/// remove. Toggle with `o`, clear permanently with `--baseline`.
+/// A session this quiet, with nothing owed, is dormant and hidden entirely.
 ///
-/// 36 hours, up from 12. Twelve is shorter than the gap between writing code at
-/// night and testing it the next day: a session that stopped editing at 03:28
-/// had every path dropped by `Session::pending` before 16:00, so the row fell
-/// out of `NeedsTest` and read as "stopped -- your move" with nothing under it.
-/// The horizon exists to bound a backlog, and a backlog you never got to see
-/// once is not one it was meant to bound. 36 hours clears yesterday morning's
-/// work but keeps last night's, which is the span a person actually works over.
-pub const STALE_HORIZON_MS: i64 = 36 * 60 * 60 * 1000;
+/// This one span now bounds two things, and they are the same idea. A `Clear`
+/// session past it is dropped from the board (`board::to_row`). And an idle
+/// finished turn -- a handback, "your move" -- stays surfaced only until this
+/// much silence has passed with nothing to test, then falls through to `Clear`
+/// itself (`Session::blocked_reason`). A day is the span a person works over: it
+/// carries a late-night handback across a night's sleep, and still lets a week
+/// of finished chats settle instead of piling up on the board forever.
+pub const DORMANT_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// A session with an unresolved tool call and no log activity for this long is
 /// treated as possibly waiting on a human.
@@ -61,22 +55,19 @@ pub const STALE_HORIZON_MS: i64 = 36 * 60 * 60 * 1000;
 /// persists" state that no longer shares the red band with a certain question.
 pub const STALL_AFTER_MS: i64 = 300_000;
 
-/// A demand for attention older than this is history, not a demand.
+/// A `Stalled` guess older than this is stale and drops off the board.
 ///
-/// `Errored`, `Blocked` and `Stalled` are all derived from evidence with a
-/// timestamp on it, but nothing bounded how long that evidence stayed valid: one
-/// bad classification sat at the top of the board until a human dismissed it,
-/// which is the same permanent-backlog failure [`STALE_HORIZON_MS`] removes for
-/// untested writes. Separate constants, and they now hold different spans: an
-/// untested write is work you still owe, so it waits 36 hours, while a guess
-/// about what an agent was doing is only as good as the hour it was made in.
+/// `Stalled` is the one attention state read off a timestamp that nobody owes
+/// anything on: it is a guess about a quiet tool call, most often a slow build,
+/// sometimes an unanswered permission prompt, and the log cannot tell the two
+/// apart. A guess is only as good as the hour it was made in, so it ages out.
+///
+/// The states a human genuinely owes -- `Errored`, `Blocked`, `NeedsTest` --
+/// used to age out here too, and that was the bug: an untested edit or an
+/// unanswered question does not stop being owed because time passed. Those now
+/// stay until a human clears them (see `board::within_horizon`); only this
+/// guess still ages.
 pub const ATTENTION_HORIZON_MS: i64 = 12 * 60 * 60 * 1000;
-
-/// A turn that ended this recently is treated as "the agent just handed the
-/// conversation back and is idle at the prompt". Past this, a finished session
-/// is old news, not something waiting on you -- which is what keeps yesterday's
-/// completed sessions out of the attention band.
-pub const RECENT_STOP_MS: i64 = 20 * 60 * 1000;
 
 /// A phrase every orc's launch prompt carries, so sauron can recognise its own
 /// maintenance agents in the session list and mark them distinct. Both the orc
@@ -389,21 +380,26 @@ impl Session {
     /// Edits whose current timestamp is newer than what was acked for that path.
     /// A path acked and then re-edited reappears here -- that is the whole point.
     ///
-    /// Writes older than `STALE_HORIZON_MS` drop out on their own. Acking must
-    /// stay optional: if the only way to clear the board were to press `a` on
-    /// every session, the tool would replace "remember what to test" with
-    /// "remember to file paperwork", which is the same overhead wearing a
-    /// different hat. Ack is for saying "checked this one now"; anything you
-    /// never got to simply ages out.
+    /// Nothing ages out. Untested work is owed until a human clears it -- `ack`
+    /// says "I tested this", `dismiss` says "this is over" -- and neither is the
+    /// clock. An earlier build dropped edits older than a fixed horizon so a
+    /// backlog could not grow without bound, but that horizon reaped work a
+    /// person wrote at night and meant to test the next day: the row was gone
+    /// before they woke up, and the write it named was never surfaced again. The
+    /// backlog is bounded by the one-time `--baseline` instead, which acks
+    /// everything outstanding at a chosen moment; past that line an untested
+    /// edit stays until it is acked, however old it gets.
+    ///
+    /// `_now` is unused now that no edit expires, and is kept only so the call
+    /// sites -- `status`, `blocked_reason`, the board -- do not all have to drop
+    /// an argument for a horizon that no longer exists.
     pub fn pending<'a>(
         &'a self,
         acked: Option<&BTreeMap<String, i64>>,
-        now: i64,
+        _now: i64,
     ) -> Vec<&'a str> {
-        let cutoff = now.saturating_sub(STALE_HORIZON_MS);
         self.edits
             .iter()
-            .filter(|(_, ts)| **ts >= cutoff)
             .filter(|(path, ts)| match acked.and_then(|a| a.get(path.as_str())) {
                 Some(acked_ts) => *ts > acked_ts,
                 None => true,
@@ -469,10 +465,15 @@ impl Session {
         if !self.pending(acked, now).is_empty() {
             return None;
         }
-        // Settled, nothing to test, and the agent stopped recently -- it is
-        // sitting idle at the prompt. Old finished sessions fall through to
-        // Clear so they do not clutter the attention band forever.
-        if self.turn_complete && quiet <= RECENT_STOP_MS {
+        // Settled, nothing to test: the agent handed the conversation back and
+        // is idle at the prompt. This is "your move", and it stays that way
+        // until you clear it (defer) or the agent does something new -- not on a
+        // short clock. Only once a full day of silence has passed with nothing
+        // to test does it stop being an open handback and fall through to Clear,
+        // so a week of finished chats does not pile up on the board. The old
+        // bound here was twenty minutes, which dropped a handback before its
+        // author was back from a coffee, let alone the next morning.
+        if self.turn_complete && quiet <= DORMANT_AFTER_MS {
             return Some(BlockedReason::AwaitingInput);
         }
         None
@@ -875,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn unacked_writes_expire_without_any_keypress() {
+    fn unacked_writes_never_expire_on_their_own() {
         let now = 1_000_000_000i64;
         let mut s = Session::default();
         s.turn_complete = true;
@@ -884,12 +885,22 @@ mod tests {
         s.edits.insert("src/a.rs".into(), now - 1000);
         assert_eq!(s.status(now, None), Status::NeedsTest);
 
-        // Same write, once it is older than the horizon: clears itself. Acking
-        // is for "I checked this"; it must never be the only way off the list,
-        // or the tool just trades one bookkeeping chore for another.
-        let later = now + STALE_HORIZON_MS + 1;
-        assert!(s.pending(None, later).is_empty());
-        assert_eq!(s.status(later, None), Status::Clear);
+        // A month later, still never acked: still outstanding. This is the fix.
+        // An untested edit does not stop being untested because a person slept,
+        // and an earlier build that aged it out reaped a night's work before its
+        // author woke. Only `ack` or `dismiss` -- a human -- takes it off.
+        let much_later = now + 30 * DORMANT_AFTER_MS;
+        assert_eq!(
+            s.pending(None, much_later),
+            vec!["src/a.rs"],
+            "an unacked write aged out on a clock"
+        );
+        assert_eq!(s.status(much_later, None), Status::NeedsTest);
+
+        // And acking it -- at its current timestamp -- is what clears it.
+        let mut acked = BTreeMap::new();
+        acked.insert("src/a.rs".to_string(), now - 1000);
+        assert_eq!(s.status(much_later, Some(&acked)), Status::Clear);
     }
 
     #[test]
@@ -1058,9 +1069,16 @@ mod tests {
         );
         assert_eq!(s.status(now, None), Status::AwaitingAck);
 
-        // But an ancient finished session is not "waiting" -- it is history, and
-        // must fall through to Clear so it does not clog the attention band.
-        let stale = now + RECENT_STOP_MS + 1;
+        // A handback stays "your move" across a night's sleep -- hours later,
+        // still surfaced -- rather than dropping after twenty minutes as it once
+        // did. It is a real handback the person has not answered yet.
+        let overnight = now + 8 * 60 * 60 * 1000;
+        assert_eq!(s.status(overnight, None), Status::AwaitingAck);
+
+        // Only once a full day of silence has passed with nothing to test does
+        // it become history and fall through to Clear, so a week of finished
+        // chats does not clog the attention band.
+        let stale = now + DORMANT_AFTER_MS + 1;
         assert_eq!(s.blocked_reason(stale, None), None);
         assert_eq!(s.status(stale, None), Status::Clear);
     }
@@ -1118,9 +1136,9 @@ mod tests {
         assert_eq!(s.status(now, None), Status::NeedsTest);
         s.edits.clear();
 
-        // And once it goes quiet past the attention window it ages out to Clear,
-        // rather than claiming to be delegated forever.
-        assert_eq!(s.status(now + RECENT_STOP_MS + 1, None), Status::Clear);
+        // And once it goes quiet past a full day of silence it ages out to
+        // Clear, rather than claiming to be delegated forever.
+        assert_eq!(s.status(now + DORMANT_AFTER_MS + 1, None), Status::Clear);
     }
 
     #[test]
